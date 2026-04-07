@@ -2248,16 +2248,13 @@ async def get_deployment_trades(
     _: str = Depends(verify_api_key),
 ):
     """Get all trades for a deployment."""
-    from starlette.responses import JSONResponse
-    # Redirect to /trades with filters
-    params = {"source_id": deploy_id, "source_type": "deployment"}
-    if symbol: params["symbol"] = symbol
-    if action: params["action"] = action
-    if date_from: params["date_from"] = date_from
-    if date_to: params["date_to"] = date_to
-    params["limit"] = limit
-    params["offset"] = offset
-    return await list_trades(**params, _=_)
+    return await list_trades(
+        source_type="deployment", source_id=deploy_id,
+        deployment_type=None, sleeve_label=None,
+        symbol=symbol, action=action,
+        date_from=date_from, date_to=date_to,
+        limit=limit, offset=offset, _=_,
+    )
 
 
 @app.get("/backtests/{run_id}/trades", tags=["Trades"])
@@ -2270,12 +2267,13 @@ async def get_backtest_trades(
     _: str = Depends(verify_api_key),
 ):
     """Get all trades for a backtest run."""
-    params = {"source_id": run_id, "source_type": "backtest"}
-    if symbol: params["symbol"] = symbol
-    if action: params["action"] = action
-    params["limit"] = limit
-    params["offset"] = offset
-    return await list_trades(**params, _=_)
+    return await list_trades(
+        source_type="backtest", source_id=run_id,
+        deployment_type=None, sleeve_label=None,
+        symbol=symbol, action=action,
+        date_from=None, date_to=None,
+        limit=limit, offset=offset, _=_,
+    )
 
 
 # ---------------------------------------------------------------------------
