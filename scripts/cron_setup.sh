@@ -37,7 +37,7 @@ CRON=$(cat <<'CRONTAB'
 @reboot cd SERVER_DIR && bash start.sh >> LOGS_DIR/api_watchdog.log 2>&1
 
 # Every 5 min — restart API if it's down (silent when healthy)
-*/5 * * * * curl -sf http://localhost:8080/health > /dev/null 2>&1 || (cd SERVER_DIR && bash start.sh >> LOGS_DIR/api_watchdog.log 2>&1)
+*/5 * * * * curl -sf http://localhost:8090/health > /dev/null 2>&1 || (cd SERVER_DIR && bash start.sh >> LOGS_DIR/api_watchdog.log 2>&1)
 
 # --- Daily Data Refresh ---
 

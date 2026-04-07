@@ -29,6 +29,6 @@ EOF
 fi
 
 # Start API server
-echo "Starting AlphaScout API on port 8080..."
+echo "Starting AlphaScout API on port 8090..."
 cd /app/server
 exec python3 -u api.py
