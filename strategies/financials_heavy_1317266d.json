@@ -1,0 +1,67 @@
+{
+  "name": "Financials Heavy",
+  "version": "v1",
+  "author": {
+    "id": "owner",
+    "name": "Omar"
+  },
+  "universe": {
+    "type": "symbols",
+    "symbols": [
+      "JPM",
+      "GS",
+      "MS",
+      "BRK-B",
+      "BX",
+      "KKR",
+      "APO",
+      "COIN",
+      "HOOD",
+      "SCHW",
+      "BAC",
+      "C"
+    ]
+  },
+  "entry": {
+    "conditions": [
+      {
+        "type": "current_drop",
+        "window_days": 120,
+        "threshold": -15
+      },
+      {
+        "type": "earnings_momentum",
+        "lookback_quarters": 4,
+        "min_beats": 2
+      }
+    ],
+    "logic": "all",
+    "priority": "worst_drawdown"
+  },
+  "sizing": {
+    "type": "equal_weight",
+    "max_positions": 12,
+    "initial_allocation": 1000000
+  },
+  "stop_loss": {
+    "type": "drawdown_from_entry",
+    "value": -25,
+    "cooldown_days": 60
+  },
+  "take_profit": {
+    "type": "gain_from_entry",
+    "value": 80
+  },
+  "backtest": {
+    "start": "2015-01-01",
+    "end": "2024-12-31",
+    "entry_price": "next_close",
+    "slippage_bps": 10
+  },
+  "strategy_id": "1317266d9f71",
+  "time_stop": null,
+  "rebalancing": {
+    "frequency": "none",
+    "rules": {}
+  }
+}

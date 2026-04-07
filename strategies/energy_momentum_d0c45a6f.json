@@ -1,0 +1,55 @@
+{
+  "name": "Energy Momentum",
+  "universe": {
+    "type": "symbols",
+    "symbols": [
+      "XOM",
+      "CVX",
+      "COP",
+      "EOG",
+      "MPC",
+      "OXY",
+      "VLO",
+      "PSX"
+    ]
+  },
+  "entry": {
+    "conditions": [
+      {
+        "type": "current_drop",
+        "window_days": 90,
+        "threshold": -10
+      }
+    ],
+    "logic": "all",
+    "priority": "worst_drawdown"
+  },
+  "sizing": {
+    "type": "equal_weight",
+    "max_positions": 8,
+    "initial_allocation": 250000
+  },
+  "stop_loss": {
+    "type": "drawdown_from_entry",
+    "value": -15,
+    "cooldown_days": 90
+  },
+  "take_profit": {
+    "type": "gain_from_entry",
+    "value": 30
+  },
+  "time_stop": {
+    "max_days": 120
+  },
+  "backtest": {
+    "start": "2020-01-01",
+    "end": "2026-03-28",
+    "entry_price": "next_close",
+    "slippage_bps": 10
+  },
+  "strategy_id": "d0c45a6fb2d9",
+  "rebalancing": {
+    "frequency": "none",
+    "rules": {}
+  }
+}

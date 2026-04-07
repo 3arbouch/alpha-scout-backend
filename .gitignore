@@ -1,0 +1,16 @@
+# Runtime data (volume-mounted, not in git)
+data/
+deployments/
+backtest/
+logs/
+
+# Environment (contains secrets)
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+.DS_Store

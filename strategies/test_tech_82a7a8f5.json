@@ -1,0 +1,38 @@
+{
+  "name": "Test Tech",
+  "universe": {
+    "type": "symbols",
+    "symbols": [
+      "AAPL",
+      "MSFT",
+      "NVDA"
+    ]
+  },
+  "entry": {
+    "conditions": [
+      {
+        "type": "always"
+      }
+    ],
+    "logic": "all"
+  },
+  "sizing": {
+    "type": "equal_weight",
+    "max_positions": 3,
+    "initial_allocation": 100000
+  },
+  "backtest": {
+    "start": "2024-01-01",
+    "end": "2024-12-31",
+    "entry_price": "next_close",
+    "slippage_bps": 10
+  },
+  "strategy_id": "82a7a8f55a16",
+  "stop_loss": null,
+  "take_profit": null,
+  "time_stop": null,
+  "rebalancing": {
+    "frequency": "none",
+    "rules": {}
+  }
+}

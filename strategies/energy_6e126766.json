@@ -1,0 +1,40 @@
+{
+  "name": "Energy",
+  "universe": {
+    "type": "symbols",
+    "symbols": [
+      "XOM",
+      "CVX",
+      "COP",
+      "SLB",
+      "EOG"
+    ]
+  },
+  "entry": {
+    "conditions": [
+      {
+        "type": "always"
+      }
+    ],
+    "logic": "all"
+  },
+  "sizing": {
+    "type": "equal_weight",
+    "max_positions": 5,
+    "initial_allocation": 100000
+  },
+  "backtest": {
+    "start": "2024-01-01",
+    "end": "2025-12-31",
+    "entry_price": "next_close",
+    "slippage_bps": 10
+  },
+  "strategy_id": "6e1267669936",
+  "stop_loss": null,
+  "take_profit": null,
+  "time_stop": null,
+  "rebalancing": {
+    "frequency": "none",
+    "rules": {}
+  }
+}

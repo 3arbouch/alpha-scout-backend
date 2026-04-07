@@ -1,0 +1,37 @@
+{
+  "name": "DB Test Tech",
+  "universe": {
+    "type": "symbols",
+    "symbols": [
+      "AAPL",
+      "MSFT"
+    ]
+  },
+  "entry": {
+    "conditions": [
+      {
+        "type": "always"
+      }
+    ],
+    "logic": "all"
+  },
+  "sizing": {
+    "type": "equal_weight",
+    "max_positions": 2,
+    "initial_allocation": 50000
+  },
+  "backtest": {
+    "start": "2024-06-01",
+    "end": "2024-09-30",
+    "entry_price": "next_close",
+    "slippage_bps": 10
+  },
+  "strategy_id": "ecc8f16fbe9d",
+  "stop_loss": null,
+  "take_profit": null,
+  "time_stop": null,
+  "rebalancing": {
+    "frequency": "none",
+    "rules": {}
+  }
+}

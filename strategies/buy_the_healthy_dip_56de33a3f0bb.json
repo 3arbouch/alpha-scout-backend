@@ -1,0 +1,58 @@
+{
+  "name": "Buy the healthy dip",
+  "version": 1,
+  "author": {
+    "id": "owner",
+    "name": "Omar"
+  },
+  "universe": {
+    "type": "sector",
+    "sector": "Technology",
+    "tickers": null,
+    "exclude": []
+  },
+  "entry": {
+    "conditions": [
+      {
+        "type": "current_drop",
+        "threshold": -25.0,
+        "window_days": 90
+      },
+      {
+        "type": "earnings_momentum",
+        "lookback_quarters": 4,
+        "min_beats": 2,
+        "min_avg_surprise_pct": null,
+        "no_recent_miss": false
+      }
+    ],
+    "logic": "all",
+    "priority": "worst_drawdown"
+  },
+  "stop_loss": {
+    "type": "drawdown_from_entry",
+    "value": -35.0,
+    "cooldown_days": 90
+  },
+  "take_profit": {
+    "type": "gain_from_entry",
+    "value": 60.0
+  },
+  "time_stop": null,
+  "rebalancing": {
+    "frequency": "quarterly",
+    "rules": {
+      "max_position_pct": 25.0,
+      "on_earnings_beat": "hold",
+      "on_earnings_miss": "trim",
+      "trim_pct": 50.0
+    }
+  },
+  "sizing": {
+    "type": "equal_weight",
+    "max_positions": 25,
+    "initial_allocation": 1000000.0
+  },
+  "strategy_id": "56de33a3f0bb",
+  "created_at": "2026-03-17T15:29:33.189659+00:00"
+}

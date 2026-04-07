@@ -1,0 +1,48 @@
+{
+  "name": "T3 EW Rebalance Rotation",
+  "universe": {
+    "type": "symbols",
+    "symbols": [
+      "AAPL",
+      "MSFT",
+      "GOOGL",
+      "NVDA",
+      "META",
+      "AMZN",
+      "CRM",
+      "ADBE",
+      "ORCL",
+      "INTC"
+    ]
+  },
+  "entry": {
+    "conditions": [
+      {
+        "type": "always"
+      }
+    ],
+    "logic": "all"
+  },
+  "ranking": {
+    "by": "pe_percentile",
+    "order": "asc",
+    "top_n": 4
+  },
+  "sizing": {
+    "type": "equal_weight",
+    "max_positions": 4,
+    "initial_allocation": 100000
+  },
+  "rebalancing": {
+    "frequency": "quarterly",
+    "mode": "equal_weight",
+    "rules": {}
+  },
+  "backtest": {
+    "start": "2023-01-01",
+    "end": "2025-12-31",
+    "entry_price": "next_close",
+    "slippage_bps": 10
+  },
+  "strategy_id": "f592337b5fe8"
+}

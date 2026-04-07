@@ -1,0 +1,72 @@
+{
+  "name": "NRD Full Universe 2015-2020",
+  "version": 1,
+  "author": {
+    "id": "owner",
+    "name": "Omar"
+  },
+  "universe": {
+    "type": "all"
+  },
+  "entry": {
+    "logic": "all",
+    "conditions": [
+      {
+        "type": "revenue_growth_yoy",
+        "threshold": 50,
+        "min_quarters": 1
+      },
+      {
+        "type": "revenue_accelerating",
+        "min_quarters": 2
+      },
+      {
+        "type": "margin_expanding",
+        "metric": "net_margin",
+        "min_quarters": 2
+      }
+    ],
+    "priority": "worst_drawdown"
+  },
+  "exit_conditions": [
+    {
+      "type": "revenue_deceleration",
+      "min_quarters": 2,
+      "require_margin_compression": true,
+      "metric": "net_margin"
+    },
+    {
+      "type": "margin_collapse",
+      "metric": "net_margin",
+      "threshold_bps": -500,
+      "min_quarters": 2
+    }
+  ],
+  "stop_loss": {
+    "type": "drawdown_from_entry",
+    "value": -30,
+    "cooldown_days": 90
+  },
+  "take_profit": null,
+  "time_stop": {
+    "days": 730
+  },
+  "rebalancing": {
+    "frequency": "quarterly",
+    "rules": {
+      "max_position_pct": 25
+    }
+  },
+  "sizing": {
+    "type": "equal_weight",
+    "max_positions": 5,
+    "initial_allocation": 1000000
+  },
+  "backtest": {
+    "start": "2015-01-01",
+    "end": "2020-12-31",
+    "entry_price": "next_close",
+    "slippage_bps": 10
+  },
+  "strategy_id": "d3d8f2627ff1"
+}

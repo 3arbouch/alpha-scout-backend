@@ -1,0 +1,2756 @@
+#!/usr/bin/env python3
+"""
+AlphaScout Backtest Engine
+==========================
+Reads a strategy JSON config and simulates it over historical price data.
+
+Usage:
+    python3 backtest_engine.py strategies/defence_mean_reversion.json
+    python3 backtest_engine.py strategies/defence_mean_reversion.json --start 2020-01-01 --end 2024-12-31
+    python3 backtest_engine.py strategies/defence_mean_reversion.json --allocation 500000
+"""
+
+import os
+import sys
+import json
+import hashlib
+import argparse
+import sqlite3
+from pathlib import Path
+from datetime import datetime, timedelta
+from collections import defaultdict
+from signals import (compute_rsi, compute_momentum_rank, compute_ma_crossover,
+                     compute_volume_capitulation)
+
+
+def compute_strategy_id(config: dict) -> str:
+    """Deterministic ID from the core strategy parameters (excludes backtest dates/name)."""
+    core = {k: config[k] for k in sorted(config) if k not in ("backtest", "name", "strategy_id")}
+    return hashlib.sha256(json.dumps(core, sort_keys=True).encode()).hexdigest()[:12]
+
+
+def stamp_strategy_id(config: dict) -> dict:
+    """Ensure config has a strategy_id. Adds one if missing."""
+    if "strategy_id" not in config:
+        config["strategy_id"] = compute_strategy_id(config)
+    return config
+
+
+def _persist_strategy_config(config: dict) -> Path | None:
+    """Save strategy config to strategies/ if no file with this strategy_id exists yet.
+    Returns the path if created, None if already existed."""
+    strategies_dir = WORKSPACE / "strategies"
+    strategies_dir.mkdir(parents=True, exist_ok=True)
+    sid = config.get("strategy_id")
+    if not sid:
+        return None
+    # Check if any existing file has this strategy_id
+    for f in strategies_dir.glob("*.json"):
+        try:
+            existing = json.loads(f.read_text())
+            if existing.get("strategy_id") == sid:
+                return None  # already exists
+        except (json.JSONDecodeError, OSError):
+            continue
+    # Create new file — exclude backtest-specific overrides from the saved config
+    name_slug = (config.get("name", "strategy") or "strategy").lower().replace(" ", "_").replace("&", "and")[:40]
+    filename = f"{name_slug}_{sid[:8]}.json"
+    path = strategies_dir / filename
+    path.write_text(json.dumps(config, indent=2))
+    print(f"New strategy saved: {path}")
+    return path
+
+# Add scripts dir to path for signals import
+SCRIPT_DIR = Path(__file__).parent
+sys.path.insert(0, str(SCRIPT_DIR))
+
+from signals import (
+    get_prices, find_period_drops, find_current_drops, find_daily_drops, find_selloffs, get_connection,
+    find_revenue_breakouts, find_revenue_acceleration, find_margin_expansion,
+    find_margin_turnaround, find_relative_outperformance, find_volume_conviction,
+    find_revenue_deceleration, find_margin_collapse,
+)
+
+
+# ---------------------------------------------------------------------------
+# Earnings Data
+# ---------------------------------------------------------------------------
+def load_earnings_data(symbols: list[str], conn) -> dict:
+    """
+    Load earnings beat/miss data.
+
+    Returns:
+        {symbol: {date: {"eps_actual": float, "eps_estimated": float, "beat": bool}}}
+    """
+    cur = conn.cursor()
+    placeholders = ",".join("?" * len(symbols))
+    cur.execute(
+        f"SELECT symbol, date, eps_actual, eps_estimated "
+        f"FROM earnings WHERE symbol IN ({placeholders}) "
+        f"AND eps_actual IS NOT NULL AND eps_estimated IS NOT NULL",
+        symbols,
+    )
+
+    earnings = defaultdict(dict)
+    for sym, date, actual, estimated in cur.fetchall():
+        earnings[sym][date] = {
+            "eps_actual": actual,
+            "eps_estimated": estimated,
+            "beat": actual > estimated,
+        }
+    return dict(earnings)
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+DB_PATH = Path(os.environ.get("DB_PATH", "/app/data/alphascout.db"))
+WORKSPACE = Path(os.environ.get("WORKSPACE", "/app"))
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
+
+# ---------------------------------------------------------------------------
+# Strategy Loader & Validator
+# ---------------------------------------------------------------------------
+REQUIRED_FIELDS = ["name", "universe", "entry", "sizing", "backtest"]
+
+DEFAULTS = {
+    "stop_loss": None,
+    "take_profit": None,
+    "time_stop": None,
+    "rebalancing": {"frequency": "none", "rules": {}},
+    "sizing": {
+        "type": "equal_weight",
+        "max_positions": 10,
+        "initial_allocation": 1000000,
+    },
+    "backtest": {
+        "start": "2015-01-01",
+        "end": "2025-12-31",
+        "entry_price": "next_close",
+        "slippage_bps": 10,
+    },
+}
+
+def _calendar_to_trading_days(calendar_days: int) -> int:
+    """Convert calendar days to approximate trading days (5 trading days per 7 calendar days)."""
+    return max(1, round(calendar_days * 5 / 7))
+
+VALID_TRIGGER_TYPES = [
+    "period_drop", "current_drop", "daily_drop", "selloff", "earnings_momentum", "pe_percentile",
+    "revenue_growth_yoy", "revenue_accelerating", "margin_expanding",
+    "margin_turnaround", "relative_performance", "volume_conviction",
+    "always",
+]
+VALID_STOP_TYPES = ["drawdown_from_entry", "fundamental"]
+VALID_TP_TYPES = ["gain_from_entry", "above_peak", "target_price"]
+VALID_SIZING_TYPES = ["equal_weight", "risk_parity", "fixed_amount"]
+VALID_REBAL_FREQ = ["none", "quarterly", "monthly", "on_earnings"]
+VALID_ENTRY_PRICE = ["next_close", "next_open"]
+VALID_ENTRY_PRIORITY = ["worst_drawdown", "random"]
+VALID_REBAL_MODES = ["trim", "equal_weight"]
+
+
+def get_config_schema() -> dict:
+    """
+    Authoritative strategy config schema. Every field name, type, valid value,
+    default, and description — derived from the engine constants.
+    
+    Usage:
+        python3 -c "from backtest_engine import get_config_schema; import json; print(json.dumps(get_config_schema(), indent=2))"
+    """
+    return {
+        "name": {"type": "string", "required": True, "description": "Human-readable strategy name"},
+        "universe": {
+            "type": {"type": "string", "values": ["symbols", "sector", "all"], "default": "symbols", "description": "How to resolve the ticker universe"},
+            "symbols": {"type": "string[]", "description": "Explicit ticker list (when type=symbols)"},
+            "sector": {"type": "string", "description": "FMP sector or industry name (when type=sector). Values: Technology, Healthcare, Financial Services, Industrials, Consumer Cyclical, Consumer Defensive, Energy, Basic Materials, Real Estate, Communication Services, Utilities. Industries also work (e.g. 'Aerospace & Defense')"},
+            "exclude": {"type": "string[]", "default": [], "description": "Tickers to exclude"},
+        },
+        "entry": {
+            "conditions": {
+                "type": "array",
+                "required": True,
+                "description": "Array of condition objects. Logic combines them via AND/OR.",
+                "condition_types": {
+                    "always": {
+                        "params": {},
+                        "description": "Every ticker qualifies on every trading day. Use for buy-and-hold / equal-weight / rotation strategies.",
+                    },
+                    "current_drop": {
+                        "params": {
+                            "threshold": {"type": "float", "required": True, "description": "Negative %. e.g. -25 = 25% below window high"},
+                            "window_days": {"type": "int", "default": 90, "description": "Calendar days lookback"},
+                        },
+                        "description": "Current price vs rolling window high. Preferred for mean-reversion.",
+                    },
+                    "period_drop": {
+                        "params": {
+                            "threshold": {"type": "float", "required": True, "description": "Negative %"},
+                            "window_days": {"type": "int", "default": 90, "description": "Calendar days lookback"},
+                        },
+                        "description": "Peak-to-trough within window. Fires even after partial recovery.",
+                    },
+                    "daily_drop": {
+                        "params": {
+                            "threshold": {"type": "float", "required": True, "description": "Negative %. e.g. -5 = single-day 5% crash"},
+                        },
+                        "description": "Single-day price crash.",
+                    },
+                    "selloff": {
+                        "params": {
+                            "threshold": {"type": "float", "required": True, "description": "Negative %. e.g. -20"},
+                            "peak_window": {"type": "string", "default": "all_time", "description": "'all_time' or '52w'"},
+                        },
+                        "description": "Drawdown from ATH or 52-week peak. Remains active during entire selloff period.",
+                    },
+                    "earnings_momentum": {
+                        "params": {
+                            "min_beats": {"type": "int", "default": 2, "description": "Minimum earnings beats in lookback"},
+                            "lookback_quarters": {"type": "int", "default": 4, "description": "Quarters to look back (1-8)"},
+                            "no_recent_miss": {"type": "bool", "default": False, "description": "Require most recent quarter was a beat"},
+                            "min_avg_surprise_pct": {"type": "float", "default": None, "description": "Minimum average surprise %"},
+                        },
+                        "description": "Earnings beat/miss momentum filter. Signal active from filing date to next quarter.",
+                    },
+                    "pe_percentile": {
+                        "params": {
+                            "max_percentile": {"type": "float", "default": 30, "description": "Bottom N% = cheapest. 30 = cheapest 30% of universe."},
+                            "min_pe": {"type": "float", "default": 0, "description": "Floor PE to exclude near-zero spikes"},
+                            "max_pe": {"type": "float", "default": 500, "description": "Cap to exclude outliers"},
+                        },
+                        "description": "PE percentile ranking within universe. Bottom N% get a signal.",
+                    },
+                    "revenue_growth_yoy": {
+                        "params": {
+                            "threshold": {"type": "float", "default": 50, "description": "Minimum YoY revenue growth %"},
+                        },
+                        "description": "Quarterly revenue YoY growth >= threshold. Fires on filing date.",
+                    },
+                    "revenue_accelerating": {
+                        "params": {
+                            "min_quarters": {"type": "int", "default": 2, "description": "Consecutive quarters of acceleration"},
+                        },
+                        "description": "Revenue YoY growth increasing for N consecutive quarters.",
+                    },
+                    "margin_expanding": {
+                        "params": {
+                            "metric": {"type": "string", "default": "net_margin", "values": ["net_margin", "op_margin"]},
+                            "min_quarters": {"type": "int", "default": 2},
+                        },
+                        "description": "Margin expanding YoY AND sequentially for N consecutive quarters.",
+                    },
+                    "margin_turnaround": {
+                        "params": {
+                            "metric": {"type": "string", "default": "net_margin", "values": ["net_margin", "op_margin"]},
+                            "threshold_bps": {"type": "float", "default": 1000, "description": "Minimum margin expansion in basis points YoY"},
+                            "min_quarters": {"type": "int", "default": 2},
+                        },
+                        "description": "Margin expanded >= threshold bps YoY for N consecutive quarters.",
+                    },
+                    "relative_performance": {
+                        "params": {
+                            "threshold": {"type": "float", "default": 20, "description": "Outperformance vs SPX in percentage points"},
+                            "window_days": {"type": "int", "default": 126, "description": "Trading days lookback"},
+                        },
+                        "description": "Stock trailing return minus SPX trailing return > threshold.",
+                    },
+                    "volume_conviction": {
+                        "params": {
+                            "short_window": {"type": "int", "default": 60},
+                            "long_window": {"type": "int", "default": 252},
+                            "ratio": {"type": "float", "default": 0.8, "description": "Short avg volume < ratio × long avg volume"},
+                        },
+                        "description": "Low volume consolidation with price above long-term average. Conviction = quiet accumulation.",
+                    },
+                    "rsi": {
+                        "params": {
+                            "period": {"type": "int", "default": 14},
+                            "operator": {"type": "string", "default": "<=", "values": [">", ">=", "<", "<=", "==", "!="]},
+                            "value": {"type": "float", "default": 30, "description": "RSI threshold"},
+                        },
+                        "description": "RSI indicator condition.",
+                    },
+                    "momentum_rank": {
+                        "params": {
+                            "lookback": {"type": "int", "default": 63, "description": "Trading days for momentum calc"},
+                            "operator": {"type": "string", "default": ">="},
+                            "value": {"type": "float", "default": 75, "description": "Percentile rank threshold"},
+                        },
+                        "description": "Cross-sectional momentum percentile rank.",
+                    },
+                    "ma_crossover": {
+                        "params": {
+                            "fast": {"type": "int", "default": 50},
+                            "slow": {"type": "int", "default": 200},
+                            "operator": {"type": "string", "default": "=="},
+                            "value": {"type": "int", "default": 1, "description": "1 = fast above slow (golden cross)"},
+                        },
+                        "description": "Moving average crossover signal.",
+                    },
+                    "volume_capitulation": {
+                        "params": {
+                            "window": {"type": "int", "default": 20},
+                            "multiplier": {"type": "float", "default": 3.0, "description": "Volume must exceed multiplier × avg"},
+                        },
+                        "description": "Volume spike indicating capitulation selling.",
+                    },
+                },
+            },
+            "logic": {"type": "string", "values": ["all", "any"], "default": "all", "description": "'all' = AND (all conditions must fire), 'any' = OR (any condition fires)"},
+            "priority": {"type": "string", "values": VALID_ENTRY_PRIORITY, "default": "worst_drawdown", "description": "Candidate ordering when candidates <= max_positions and no ranking set"},
+        },
+        "ranking": {
+            "optional": True,
+            "description": "Sort qualified candidates by a metric before applying max_positions. When omitted and candidates > slots, defaults to pe_percentile asc.",
+            "by": {"type": "string", "values": VALID_RANKING_METRICS, "default": "pe_percentile", "description": "Metric to rank candidates"},
+            "order": {"type": "string", "values": ["asc", "desc"], "default": "asc", "description": "Sort direction. asc = lowest first (cheapest/most oversold). desc = highest first (strongest momentum)."},
+            "top_n": {"type": "int", "default": "max_positions", "description": "How many candidates to select after ranking"},
+        },
+        "sizing": {
+            "type": {"type": "string", "values": VALID_SIZING_TYPES, "default": "equal_weight"},
+            "max_positions": {"type": "int", "default": 10, "description": "Max concurrent positions. Omit for unlimited."},
+            "initial_allocation": {"type": "float", "default": 1000000, "description": "Starting capital $"},
+        },
+        "stop_loss": {
+            "optional": True,
+            "description": "Set to null or omit to disable.",
+            "type": {"type": "string", "values": VALID_STOP_TYPES},
+            "value": {"type": "float", "default": -35, "description": "Negative %. -35 = exit at 35% loss from entry"},
+            "cooldown_days": {"type": "int", "default": 0, "description": "Calendar days before re-entering same symbol after stop"},
+        },
+        "take_profit": {
+            "optional": True,
+            "description": "Set to null or omit to disable.",
+            "type": {"type": "string", "values": VALID_TP_TYPES},
+            "value": {"type": "float", "description": "For gain_from_entry: positive %. For above_peak: % above pre-selloff peak."},
+        },
+        "time_stop": {
+            "optional": True,
+            "description": "Set to null or omit to disable. Exits after max_days regardless of P&L.",
+            "max_days": {"type": "int", "description": "Calendar days to hold before forced exit"},
+        },
+        "exit_conditions": {
+            "optional": True,
+            "description": "Fundamental exit triggers. Logic is OR — any condition firing closes the position.",
+            "condition_types": {
+                "revenue_deceleration": {
+                    "params": {
+                        "min_quarters": {"type": "int", "default": 2},
+                        "require_margin_compression": {"type": "bool", "default": True},
+                        "metric": {"type": "string", "default": "net_margin", "values": ["net_margin", "op_margin"]},
+                    },
+                    "description": "Revenue YoY growth declining for N consecutive quarters.",
+                },
+                "margin_collapse": {
+                    "params": {
+                        "metric": {"type": "string", "default": "net_margin", "values": ["net_margin", "op_margin"]},
+                        "threshold_bps": {"type": "float", "default": -500, "description": "Negative bps. -500 = margin contracted 5pp YoY."},
+                        "min_quarters": {"type": "int", "default": 2},
+                    },
+                    "description": "Margin contracting > threshold bps YoY for N consecutive quarters.",
+                },
+            },
+        },
+        "rebalancing": {
+            "frequency": {"type": "string", "values": VALID_REBAL_FREQ, "default": "none"},
+            "mode": {"type": "string", "values": VALID_REBAL_MODES, "default": "trim", "description": "'trim' = only clip overweight positions. 'equal_weight' = reset all to 1/N weight; with ranking also rotates names in/out."},
+            "rules": {
+                "max_position_pct": {"type": "float", "default": 25, "description": "Max single position as % of NAV (trim mode)"},
+                "add_on_earnings_beat": {
+                    "optional": True,
+                    "min_gain_pct": {"type": "float", "default": 15},
+                    "max_add_multiplier": {"type": "float", "default": 1.5},
+                    "lookback_days": {"type": "int", "default": 90},
+                },
+            },
+        },
+        "backtest": {
+            "start": {"type": "string", "default": "2015-01-01", "description": "YYYY-MM-DD"},
+            "end": {"type": "string", "default": "2025-12-31", "description": "YYYY-MM-DD"},
+            "entry_price": {"type": "string", "values": VALID_ENTRY_PRICE, "default": "next_close"},
+            "slippage_bps": {"type": "int", "default": 10, "description": "Slippage in basis points per trade"},
+        },
+    }
+
+
+def load_strategy(path: str) -> dict:
+    """Load and validate a strategy config file."""
+    with open(path) as f:
+        config = json.load(f)
+
+    # Check required fields
+    for field in REQUIRED_FIELDS:
+        if field not in config:
+            raise ValueError(f"Missing required field: {field}")
+
+    # Handle backward compatibility: convert old entry format to new format
+    entry_config = config["entry"]
+    if "trigger" in entry_config and "conditions" not in entry_config:
+        # Old format - convert to new format internally
+        conditions = [entry_config["trigger"]]
+        if entry_config.get("confirm"):
+            conditions.extend(entry_config["confirm"])
+        
+        # Keep original fields for backward compatibility but add new structure
+        entry_config["conditions"] = conditions
+        entry_config["logic"] = "all"  # Old format always used AND logic
+        
+        # Validate the trigger (for backward compatibility)
+        trigger_type = entry_config["trigger"]["type"]
+        if trigger_type not in VALID_TRIGGER_TYPES:
+            raise ValueError(f"Unknown trigger type: {trigger_type}. Valid: {VALID_TRIGGER_TYPES}")
+    
+    # Validate new format conditions
+    if "conditions" in entry_config:
+        for i, condition in enumerate(entry_config["conditions"]):
+            ctype = condition.get("type")
+            if not ctype:
+                raise ValueError(f"Condition {i} missing 'type' field")
+            if ctype not in VALID_TRIGGER_TYPES:
+                raise ValueError(f"Unknown condition type: {ctype}. Valid: {VALID_TRIGGER_TYPES}")
+            
+            # Validate required parameters by condition type
+            if ctype in ("current_drop", "period_drop", "selloff"):
+                if "threshold" not in condition:
+                    raise ValueError(f"{ctype} condition missing required 'threshold' parameter")
+                if "window_days" not in condition and ctype != "selloff":
+                    condition["window_days"] = 90  # Default
+            elif ctype == "daily_drop":
+                if "threshold" not in condition:
+                    raise ValueError(f"{ctype} condition missing required 'threshold' parameter")
+            elif ctype == "earnings_momentum":
+                # Set defaults for earnings_momentum
+                condition.setdefault("lookback_quarters", 4)
+                condition.setdefault("min_beats", 2)
+                if condition.get("lookback_quarters", 0) < 1 or condition.get("lookback_quarters", 0) > 8:
+                    raise ValueError("earnings_momentum lookback_quarters must be between 1 and 8")
+                if condition.get("min_beats", 0) < 0 or condition.get("min_beats", 0) > 8:
+                    raise ValueError("earnings_momentum min_beats must be between 0 and 8")
+        
+        # Validate logic field
+        logic = entry_config.get("logic") or "all"
+        entry_config["logic"] = logic
+        if logic not in ("all", "any"):
+            raise ValueError(f"Invalid entry logic: {logic}. Must be 'all' or 'any'")
+
+    # Apply defaults for optional fields
+    for key, default in DEFAULTS.items():
+        if key not in config or config[key] is None:
+            config[key] = default
+        elif isinstance(default, dict):
+            merged = {**default, **config[key]}
+            config[key] = merged
+
+    # Validate ranking (optional)
+    if "ranking" in config:
+        rank_cfg = config["ranking"]
+        rank_by = rank_cfg.get("by", DEFAULT_RANKING_METRIC)
+        if rank_by not in VALID_RANKING_METRICS:
+            raise ValueError(f"Unknown ranking metric: {rank_by}. Valid: {VALID_RANKING_METRICS}")
+        rank_order = rank_cfg.get("order", DEFAULT_RANKING_ORDER)
+        if rank_order not in ("asc", "desc"):
+            raise ValueError(f"Invalid ranking order: {rank_order}. Must be 'asc' or 'desc'")
+
+    # Validate stop_loss
+    if config["stop_loss"]:
+        sl_type = config["stop_loss"].get("type")
+        if sl_type and sl_type not in VALID_STOP_TYPES:
+            raise ValueError(f"Unknown stop_loss type: {sl_type}")
+
+    # Validate take_profit
+    if config["take_profit"]:
+        tp_type = config["take_profit"].get("type")
+        if tp_type and tp_type not in VALID_TP_TYPES:
+            raise ValueError(f"Unknown take_profit type: {tp_type}")
+
+    return config
+
+
+# ---------------------------------------------------------------------------
+# Universe Resolution
+# ---------------------------------------------------------------------------
+def resolve_universe(config: dict, conn) -> list[str]:
+    """Resolve the universe of tickers from config."""
+    universe_cfg = config["universe"]
+    utype = universe_cfg.get("type", "symbols")
+    exclude = set(universe_cfg.get("exclude", []))
+
+    if utype == "symbols":
+        symbols = universe_cfg.get("symbols", [])
+    elif utype == "sector":
+        sector = universe_cfg["sector"]
+        symbols = _get_sector_symbols(sector)
+    elif utype == "all":
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT symbol FROM prices ORDER BY symbol")
+        symbols = [row[0] for row in cur.fetchall()]
+    else:
+        raise ValueError(f"Unknown universe type: {utype}")
+
+    return sorted([s for s in symbols if s not in exclude])
+
+
+def _get_sector_symbols(sector: str) -> list[str]:
+    """Get tickers for a sector from profile JSONs."""
+    profile_dir = DATA_DIR / "universe" / "profiles"
+    symbols = []
+    for f in profile_dir.glob("*.json"):
+        try:
+            content = json.loads(f.read_text())
+            data = content.get("data", [])
+            profile = data[0] if isinstance(data, list) and data else data
+            if profile.get("sector", "").lower() == sector.lower():
+                symbols.append(f.stem)
+            elif profile.get("industry", "").lower() == sector.lower():
+                symbols.append(f.stem)
+        except (json.JSONDecodeError, KeyError):
+            continue
+    return symbols
+
+
+# ---------------------------------------------------------------------------
+# Signal Pre-computation
+# ---------------------------------------------------------------------------
+def precompute_condition(condition_config: dict, symbols: list[str], conn, start: str, end: str,
+                         earnings_data: dict = None, price_index: dict = None) -> dict:
+    """
+    Pre-compute one entry condition for all tickers.
+    
+    Args:
+        condition_config: Single condition configuration dict
+        symbols: List of ticker symbols
+        conn: Database connection
+        start: Backtest start date
+        end: Backtest end date
+        earnings_data: Pre-loaded earnings data (for earnings_momentum condition)
+    
+    Returns:
+        {symbol: {signal_date: metadata}} where metadata varies by condition type:
+        - Price conditions: drawdown_pct (float)
+        - earnings_momentum: {"beats": int, "avg_surprise": float, "no_recent_miss": bool}
+    """
+    ctype = condition_config["type"]
+    
+    if ctype in ("current_drop", "period_drop", "daily_drop", "selloff"):
+        return _precompute_price_condition(condition_config, symbols, conn, start, end, price_index=price_index)
+    elif ctype == "earnings_momentum":
+        return _precompute_earnings_momentum(condition_config, symbols, earnings_data or {}, start, end)
+    elif ctype == "pe_percentile":
+        return _precompute_pe_percentile(condition_config, symbols, conn, start, end, price_index=price_index)
+    elif ctype in ("revenue_growth_yoy", "revenue_accelerating", "margin_expanding",
+                    "margin_turnaround", "relative_performance", "volume_conviction"):
+        return _precompute_fundamental_condition(condition_config, symbols, conn, start, end)
+    elif ctype in ("rsi", "momentum_rank", "ma_crossover", "volume_capitulation"):
+        return _precompute_technical_condition(condition_config, symbols, conn, start, end, price_index=price_index)
+    elif ctype == "always":
+        return _precompute_always_condition(symbols, conn, start, end, price_index=price_index)
+    else:
+        raise ValueError(f"Unknown condition type: {ctype}")
+
+
+def _precompute_price_condition(condition_config: dict, symbols: list[str], conn,
+                                start: str, end: str, price_index: dict = None) -> dict:
+    """Pre-compute a price-based condition (current_drop, period_drop, daily_drop, selloff).
+
+    If price_index is provided, uses it instead of querying DB per symbol.
+    """
+    ttype = condition_config["type"]
+    signals = {}
+
+    for symbol in symbols:
+        # Use pre-loaded prices if available, otherwise query DB
+        if price_index and symbol in price_index:
+            prices = sorted(price_index[symbol].items())  # [(date, close), ...]
+        else:
+            prices = get_prices(symbol, conn=conn)
+        if len(prices) < 20:
+            continue
+
+        if ttype == "period_drop":
+            window_calendar = condition_config.get("window_days", 90)
+            window_trading = _calendar_to_trading_days(window_calendar)
+            threshold = condition_config.get("threshold", -15)
+            raw = find_period_drops(prices, period_days=window_trading, threshold=threshold)
+            signal_data = {}
+            for r in raw:
+                if start and r["signal_date"] < start:
+                    continue
+                if end and r["signal_date"] > end:
+                    continue
+                signal_data[r["signal_date"]] = r["drawdown_pct"]
+            signals[symbol] = signal_data
+
+        elif ttype == "current_drop":
+            window_calendar = condition_config.get("window_days", 90)
+            window_trading = _calendar_to_trading_days(window_calendar)
+            threshold = condition_config.get("threshold", -15)
+            raw = find_current_drops(prices, period_days=window_trading, threshold=threshold)
+            signal_data = {}
+            for r in raw:
+                if start and r["signal_date"] < start:
+                    continue
+                if end and r["signal_date"] > end:
+                    continue
+                signal_data[r["signal_date"]] = r["drawdown_pct"]
+            signals[symbol] = signal_data
+
+        elif ttype == "daily_drop":
+            threshold = condition_config.get("threshold", -5)
+            events = find_daily_drops(prices, threshold=threshold)
+            signal_data = {}
+            for e in events:
+                if start and e["date"] < start:
+                    continue
+                if end and e["date"] > end:
+                    continue
+                signal_data[e["date"]] = e["change_pct"]
+            signals[symbol] = signal_data
+
+        elif ttype == "selloff":
+            threshold = condition_config.get("threshold", -20)
+            peak_window = condition_config.get("peak_window", "all_time")
+            selloffs_list = find_selloffs(prices, drop_threshold=threshold, peak_window=peak_window)
+            signal_data = {}
+            for s in selloffs_list:
+                trigger_date = s.get("trigger_date")
+                end_date = s.get("current_date", end)
+                dd = s.get("drawdown_pct", threshold)
+                if s["status"] == "recovered":
+                    end_date = s["current_date"]
+                for d, c in prices:
+                    if d < trigger_date:
+                        continue
+                    if d > end_date:
+                        break
+                    if start and d < start:
+                        continue
+                    if end and d > end:
+                        break
+                    signal_data[d] = dd
+            signals[symbol] = signal_data
+
+    return signals
+
+
+def _load_pe_timeseries(symbols: list[str]) -> dict:
+    """
+    Load quarterly PE timeseries from key-metrics JSON files.
+
+    Returns:
+        {symbol: [(date, pe), ...]}  sorted by date ascending.
+        Only includes positive PE (profitable quarters).
+    """
+    result = {}
+    for symbol in symbols:
+        fpath = DATA_DIR / "metrics" / "key-metrics" / f"{symbol}.json"
+        if not fpath.exists():
+            continue
+        try:
+            raw = json.loads(fpath.read_text())
+            records = raw.get("data", raw) if isinstance(raw, dict) else raw
+            if not isinstance(records, list):
+                continue
+            entries = []
+            for r in records:
+                ey = r.get("earningsYield")
+                d = r.get("date", "")[:10]
+                if not d or not ey or ey <= 0:
+                    continue  # skip negative/zero earnings
+                pe = 1.0 / ey
+                if pe > 0:
+                    entries.append((d, pe))
+            entries.sort(key=lambda x: x[0])
+            if entries:
+                result[symbol] = entries
+        except (json.JSONDecodeError, KeyError, ZeroDivisionError):
+            continue
+    return result
+
+
+def _precompute_always_condition(symbols: list[str], conn, start: str, end: str,
+                                 price_index: dict = None) -> dict:
+    """
+    'always' condition: every ticker in the universe qualifies on every trading day.
+    Used for buy-and-hold / equal-weight strategies where entry is unconditional.
+
+    Returns:
+        {symbol: {date: 0}} — signal value 0 (no drawdown context).
+    """
+    if price_index:
+        all_dates = set()
+        for s in symbols:
+            if s in price_index:
+                all_dates.update(d for d in price_index[s] if start <= d <= end)
+        trading_dates = sorted(all_dates)
+    else:
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT date FROM prices WHERE date >= ? AND date <= ? ORDER BY date", (start, end))
+        trading_dates = [row[0] for row in cur.fetchall()]
+
+    signals = {}
+    for symbol in symbols:
+        signals[symbol] = {d: 0 for d in trading_dates}
+
+    return signals
+
+
+# ---------------------------------------------------------------------------
+# Ranking
+# ---------------------------------------------------------------------------
+VALID_RANKING_METRICS = [
+    "pe_percentile", "current_drop", "rsi", "momentum_rank",
+    "revenue_growth_yoy", "margin_expanding",
+]
+
+DEFAULT_RANKING_METRIC = "pe_percentile"
+DEFAULT_RANKING_ORDER = "asc"
+
+
+def _compute_ranking_scores(metric: str, symbols: list[str], conn, date: str,
+                            price_index: dict, pe_series: dict = None,
+                            rsi_cache: dict = None) -> dict:
+    """
+    Compute a single ranking score per symbol for a given date.
+    
+    Returns:
+        {symbol: score} — lower score = better for asc, higher = better for desc.
+    """
+    from bisect import bisect_right
+    
+    scores = {}
+    
+    if metric == "pe_percentile":
+        if pe_series is None:
+            pe_series = _load_pe_timeseries(symbols)
+        for symbol in symbols:
+            series = pe_series.get(symbol)
+            if not series:
+                continue
+            dates_only = [s[0] for s in series]
+            idx = bisect_right(dates_only, date) - 1
+            if idx >= 0:
+                _, pe = series[idx]
+                if 0 < pe < 500:
+                    scores[symbol] = pe
+    
+    elif metric == "current_drop":
+        for symbol in symbols:
+            prices = price_index.get(symbol, {})
+            sorted_dates = sorted(d for d in prices if d <= date)
+            if len(sorted_dates) < 20:
+                continue
+            lookback = sorted_dates[-63:]  # ~3 months
+            peak = max(prices[d] for d in lookback)
+            current = prices.get(date)
+            if current and peak > 0:
+                scores[symbol] = ((current - peak) / peak) * 100  # negative = more beaten down
+    
+    elif metric == "rsi":
+        if rsi_cache:
+            for symbol in symbols:
+                rsi_val = rsi_cache.get(symbol, {}).get(date)
+                if rsi_val is not None:
+                    scores[symbol] = rsi_val
+        else:
+            for symbol in symbols:
+                try:
+                    rsi_series = compute_rsi(symbol, period=14, start=date, end=date, conn=conn)
+                    if date in rsi_series:
+                        scores[symbol] = rsi_series[date]
+                except Exception:
+                    continue
+    
+    elif metric == "momentum_rank":
+        rank_data = compute_momentum_rank(symbols, lookback=63, start=date, end=date, conn=conn)
+        for symbol in symbols:
+            val = rank_data.get(symbol, {}).get(date)
+            if val is not None:
+                scores[symbol] = val
+    
+    elif metric == "revenue_growth_yoy":
+        for symbol in symbols:
+            fpath = DATA_DIR / "fundamentals" / "income-growth" / f"{symbol}.json"
+            if not fpath.exists():
+                continue
+            try:
+                raw = json.loads(fpath.read_text())
+                records = raw if isinstance(raw, list) else raw.get("data", [])
+                # Find most recent quarter before date
+                for r in sorted(records, key=lambda x: x.get("date", ""), reverse=True):
+                    rd = r.get("date", "")[:10]
+                    if rd <= date:
+                        val = r.get("growthRevenue")
+                        if val is not None:
+                            scores[symbol] = val
+                        break
+            except (json.JSONDecodeError, KeyError):
+                continue
+    
+    elif metric == "margin_expanding":
+        for symbol in symbols:
+            fpath = DATA_DIR / "fundamentals" / "income" / f"{symbol}.json"
+            if not fpath.exists():
+                continue
+            try:
+                raw = json.loads(fpath.read_text())
+                records = raw if isinstance(raw, list) else raw.get("data", [])
+                quarters = sorted(
+                    [r for r in records if r.get("period", "").startswith("Q") and r.get("date", "")[:10] <= date],
+                    key=lambda x: x["date"],
+                    reverse=True
+                )
+                if len(quarters) >= 2:
+                    curr_margin = (quarters[0].get("netIncome", 0) / quarters[0].get("revenue", 1)) if quarters[0].get("revenue") else 0
+                    prev_margin = (quarters[1].get("netIncome", 0) / quarters[1].get("revenue", 1)) if quarters[1].get("revenue") else 0
+                    scores[symbol] = (curr_margin - prev_margin) * 100  # margin change in pct points
+            except (json.JSONDecodeError, KeyError, ZeroDivisionError):
+                continue
+    
+    return scores
+
+
+def rank_candidates(candidates: list[tuple], config: dict, conn, date: str,
+                    price_index: dict, pe_series: dict = None,
+                    rsi_cache: dict = None) -> list[tuple]:
+    """
+    Rank entry candidates by the configured ranking metric.
+    
+    Args:
+        candidates: [(symbol, drawdown)] from signal matching
+        config: Strategy config dict
+        conn: DB connection
+        date: Current trading date
+        price_index: {symbol: {date: price}}
+        pe_series: Pre-loaded PE timeseries (optional, for pe_percentile)
+        rsi_cache: Pre-loaded RSI cache (optional)
+    
+    Returns:
+        Sorted candidates list.
+    """
+    ranking_config = config.get("ranking")
+    symbols_in_play = [c[0] for c in candidates]
+    
+    if not ranking_config:
+        # Default: pe_percentile asc when more candidates than slots
+        metric = DEFAULT_RANKING_METRIC
+        order = DEFAULT_RANKING_ORDER
+    else:
+        metric = ranking_config.get("by", DEFAULT_RANKING_METRIC)
+        order = ranking_config.get("order", DEFAULT_RANKING_ORDER)
+    
+    scores = _compute_ranking_scores(metric, symbols_in_play, conn, date,
+                                      price_index, pe_series, rsi_cache)
+    
+    if not scores:
+        # Fallback to original ordering if ranking data unavailable
+        return candidates
+    
+    # Sort: asc = lowest first, desc = highest first
+    reverse = (order == "desc")
+    
+    # Candidates with scores get sorted; those without go to the end
+    scored = [(sym, dd) for sym, dd in candidates if sym in scores]
+    unscored = [(sym, dd) for sym, dd in candidates if sym not in scores]
+    
+    scored.sort(key=lambda x: scores[x[0]], reverse=reverse)
+    
+    return scored + unscored
+
+
+def _precompute_pe_percentile(condition_config: dict, symbols: list[str], conn, start: str, end: str,
+                              price_index: dict = None) -> dict:
+    """
+    Pre-compute PE percentile ranking condition.
+
+    For each trading day, ranks all universe tickers by their most recent
+    quarterly PE (from key-metrics earningsYield).  Tickers in the bottom
+    ``max_percentile`` (cheapest) get a signal.
+
+    Params (in condition_config):
+        max_percentile (float, default 30): percentile cutoff (0-100).
+            Bottom 30 = cheapest 30% of the sector.
+        min_pe (float, default 0): minimum PE to consider (filters
+            near-zero PE from one-off earnings spikes).
+        max_pe (float, default 500): cap to exclude outliers.
+    """
+    from bisect import bisect_right
+
+    max_percentile = condition_config.get("max_percentile", 30)
+    min_pe = condition_config.get("min_pe", 0)
+    max_pe = condition_config.get("max_pe", 500)
+
+    # Load quarterly PE for all universe tickers
+    pe_series = _load_pe_timeseries(symbols)
+    if not pe_series:
+        print("  WARNING: No PE data found for pe_percentile condition")
+        return {}
+
+    print(f"  PE data loaded for {len(pe_series)}/{len(symbols)} tickers")
+
+    # Get trading dates from shared price index or DB
+    if price_index:
+        all_dates = set()
+        for s in symbols:
+            if s in price_index:
+                all_dates.update(d for d in price_index[s] if start <= d <= end)
+        trading_dates = sorted(all_dates)
+    else:
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT date FROM prices WHERE date >= ? AND date <= ? ORDER BY date", (start, end))
+        trading_dates = [row[0] for row in cur.fetchall()]
+
+    # For each trading day, find most recent PE for each ticker, rank, signal bottom N%
+    signals = defaultdict(dict)
+
+    for date in trading_dates:
+        # Collect most recent PE for each ticker as of this date
+        pe_snapshot = {}
+        for symbol, series in pe_series.items():
+            # Binary search for most recent quarter <= date
+            dates_only = [s[0] for s in series]
+            idx = bisect_right(dates_only, date) - 1
+            if idx >= 0:
+                _, pe = series[idx]
+                if min_pe <= pe <= max_pe:
+                    pe_snapshot[symbol] = pe
+
+        if len(pe_snapshot) < 3:
+            continue  # Need enough tickers to rank
+
+        # Rank by PE ascending (lowest = cheapest)
+        ranked = sorted(pe_snapshot.items(), key=lambda x: x[1])
+        cutoff_idx = max(1, int(len(ranked) * max_percentile / 100))
+
+        for symbol, pe in ranked[:cutoff_idx]:
+            signals[symbol][date] = pe  # store PE as the signal value
+
+    return dict(signals)
+
+
+def _precompute_earnings_momentum(condition_config: dict, symbols: list[str], earnings_data: dict, start: str, end: str) -> dict:
+    """
+    Pre-compute earnings momentum condition.
+    
+    For each symbol, computes rolling earnings statistics after each earnings report
+    and expands into date ranges where the condition passes.
+    """
+    from datetime import datetime, timedelta
+    
+    lookback_quarters = condition_config.get("lookback_quarters", 4)
+    min_beats = condition_config.get("min_beats", 2)
+    min_avg_surprise_pct = condition_config.get("min_avg_surprise_pct")
+    no_recent_miss = condition_config.get("no_recent_miss", False)
+    
+    signals = {}
+    
+    for symbol in symbols:
+        if symbol not in earnings_data:
+            continue
+            
+        sym_earnings = earnings_data[symbol]
+        if not sym_earnings:
+            continue
+            
+        # Sort earnings by date
+        sorted_earnings = sorted(sym_earnings.items())
+        signal_data = {}
+        
+        for i, (earn_date, earn_data) in enumerate(sorted_earnings):
+            # Look back at last N quarters (including current)
+            start_idx = max(0, i - lookback_quarters + 1)
+            lookback_earnings = sorted_earnings[start_idx:i+1]
+            
+            if len(lookback_earnings) < min(2, lookback_quarters):  # Need at least 2 quarters of data
+                continue
+                
+            # Compute rolling stats
+            beats = sum(1 for _, ed in lookback_earnings if ed["beat"])
+            total_quarters = len(lookback_earnings)
+            
+            # Average surprise percentage
+            surprises = []
+            for _, ed in lookback_earnings:
+                if ed["eps_estimated"] != 0:
+                    surprise_pct = ((ed["eps_actual"] - ed["eps_estimated"]) / abs(ed["eps_estimated"])) * 100
+                    surprises.append(surprise_pct)
+            avg_surprise = sum(surprises) / len(surprises) if surprises else 0
+            
+            # Check no recent miss (most recent quarter must be a beat)
+            most_recent_beat = lookback_earnings[-1][1]["beat"] if lookback_earnings else False
+            
+            # Apply filters
+            if beats < min_beats:
+                continue
+            if min_avg_surprise_pct is not None and avg_surprise < min_avg_surprise_pct:
+                continue
+            if no_recent_miss and not most_recent_beat:
+                continue
+                
+            # Signal is active from this earnings date until next earnings date (or end of backtest)
+            signal_start = earn_date
+            
+            # Find next earnings date for this symbol
+            next_earn_date = None
+            if i + 1 < len(sorted_earnings):
+                next_earn_date = sorted_earnings[i + 1][0]
+            
+            # Determine signal end date
+            if next_earn_date:
+                # Convert to datetime for date arithmetic
+                signal_end_dt = datetime.strptime(next_earn_date, "%Y-%m-%d") - timedelta(days=1)
+                signal_end = signal_end_dt.strftime("%Y-%m-%d")
+            else:
+                signal_end = end  # Use backtest end date
+                
+            # Generate all trading dates in this range where condition is active
+            # We'll use a simple approach: generate daily dates and let the main loop filter to trading dates
+            current_dt = datetime.strptime(signal_start, "%Y-%m-%d")
+            end_dt = datetime.strptime(min(signal_end, end), "%Y-%m-%d")
+            
+            while current_dt <= end_dt:
+                date_str = current_dt.strftime("%Y-%m-%d")
+                if date_str >= start:  # Only include dates in backtest range
+                    signal_data[date_str] = {
+                        "beats": beats,
+                        "avg_surprise": round(avg_surprise, 2),
+                        "no_recent_miss": most_recent_beat,
+                        "quarters_analyzed": total_quarters
+                    }
+                current_dt += timedelta(days=1)
+        
+        if signal_data:
+            signals[symbol] = signal_data
+    
+    return signals
+
+
+def _precompute_fundamental_condition(condition_config: dict, symbols: list[str], conn, start: str, end: str) -> dict:
+    """
+    Pre-compute fundamental (non-price) conditions for all tickers.
+    
+    Supports: revenue_growth_yoy, revenue_accelerating, margin_expanding,
+              margin_turnaround, relative_performance, volume_conviction.
+    
+    Fundamental signals fire on filingDate (when market learns the data) and remain
+    active until the next quarterly filing date (or end of backtest).
+    """
+    ctype = condition_config["type"]
+    signals = {}
+    
+    for symbol in symbols:
+        try:
+            if ctype == "revenue_growth_yoy":
+                raw = find_revenue_breakouts(
+                    symbol,
+                    threshold=condition_config.get("threshold", 50.0),
+                    start=start, end=end,
+                )
+            elif ctype == "revenue_accelerating":
+                raw = find_revenue_acceleration(
+                    symbol,
+                    min_quarters=condition_config.get("min_quarters", 2),
+                    start=start, end=end,
+                )
+            elif ctype == "margin_expanding":
+                raw = find_margin_expansion(
+                    symbol,
+                    metric=condition_config.get("metric", "net_margin"),
+                    min_quarters=condition_config.get("min_quarters", 2),
+                    start=start, end=end,
+                )
+            elif ctype == "margin_turnaround":
+                raw = find_margin_turnaround(
+                    symbol,
+                    metric=condition_config.get("metric", "net_margin"),
+                    threshold_bps=condition_config.get("threshold_bps", 1000.0),
+                    min_quarters=condition_config.get("min_quarters", 2),
+                    start=start, end=end,
+                )
+            elif ctype == "relative_performance":
+                raw = find_relative_outperformance(
+                    symbol,
+                    benchmark_path=condition_config.get("benchmark_path", None),
+                    threshold=condition_config.get("threshold", 20.0),
+                    window_days=condition_config.get("window_days", 126),
+                    start=start, end=end,
+                    conn=conn,
+                )
+            elif ctype == "volume_conviction":
+                raw = find_volume_conviction(
+                    symbol,
+                    short_window=condition_config.get("short_window", 60),
+                    long_window=condition_config.get("long_window", 252),
+                    ratio_threshold=condition_config.get("ratio", 0.8),
+                    start=start, end=end,
+                    conn=conn,
+                )
+            else:
+                raw = []
+        except Exception as e:
+            raw = []
+        
+        if not raw:
+            continue
+        
+        signal_data = {}
+        
+        if ctype in ("relative_performance", "volume_conviction"):
+            # Daily signals — already have one entry per date
+            for entry in raw:
+                signal_data[entry["signal_date"]] = {
+                    k: v for k, v in entry.items() if k != "signal_date"
+                }
+        else:
+            # Quarterly signals — expand from filing date to next filing date
+            for i, entry in enumerate(raw):
+                sig_start = entry["signal_date"]
+                # Find next signal's filing date (or +100 days as proxy for next quarter)
+                if i + 1 < len(raw):
+                    sig_end_dt = datetime.strptime(raw[i + 1]["signal_date"], "%Y-%m-%d") - timedelta(days=1)
+                else:
+                    sig_end_dt = datetime.strptime(sig_start, "%Y-%m-%d") + timedelta(days=100)
+                
+                sig_end = min(sig_end_dt.strftime("%Y-%m-%d"), end)
+                
+                metadata = {k: v for k, v in entry.items() if k != "signal_date"}
+                
+                current_dt = datetime.strptime(sig_start, "%Y-%m-%d")
+                end_dt = datetime.strptime(sig_end, "%Y-%m-%d")
+                while current_dt <= end_dt:
+                    date_str = current_dt.strftime("%Y-%m-%d")
+                    if date_str >= start:
+                        signal_data[date_str] = metadata
+                    current_dt += timedelta(days=1)
+        
+        if signal_data:
+            signals[symbol] = signal_data
+    
+    return signals
+
+
+def _precompute_technical_condition(condition_config: dict, symbols: list[str], conn, start: str, end: str,
+                                    price_index: dict = None) -> dict:
+    """
+    Pre-compute technical indicator conditions: rsi, momentum_rank, ma_crossover, volume_capitulation.
+
+    Config examples:
+        {"type": "rsi", "period": 14, "operator": "<=", "value": 30}
+        {"type": "momentum_rank", "lookback": 63, "operator": ">=", "value": 75}
+        {"type": "ma_crossover", "fast": 50, "slow": 200, "operator": "==", "value": 1}
+        {"type": "volume_capitulation", "window": 20, "multiplier": 3.0}
+
+    Returns:
+        {symbol: {date: metadata}} matching the standard signal format.
+    """
+    ctype = condition_config["type"]
+    operator = condition_config.get("operator", "<=")
+    threshold = condition_config.get("value", 0)
+    signals = {}
+
+    OPS = {
+        ">": lambda a, b: a > b,
+        ">=": lambda a, b: a >= b,
+        "<": lambda a, b: a < b,
+        "<=": lambda a, b: a <= b,
+        "==": lambda a, b: a == b,
+        "!=": lambda a, b: a != b,
+    }
+    op_fn = OPS.get(operator)
+    if op_fn is None:
+        raise ValueError(f"Unknown operator: {operator}")
+
+    if ctype == "rsi":
+        period = condition_config.get("period", 14)
+        for symbol in symbols:
+            rsi_series = compute_rsi(symbol, period=period, start=start, end=end, conn=conn, price_index=price_index)
+            signal_data = {}
+            for date, rsi_val in rsi_series.items():
+                if op_fn(rsi_val, threshold):
+                    signal_data[date] = {"rsi": rsi_val}
+            if signal_data:
+                signals[symbol] = signal_data
+
+    elif ctype == "momentum_rank":
+        lookback = condition_config.get("lookback", 63)
+        rank_data = compute_momentum_rank(symbols, lookback=lookback, start=start, end=end, conn=conn, price_index=price_index)
+        for symbol in symbols:
+            sym_ranks = rank_data.get(symbol, {})
+            signal_data = {}
+            for date, rank_val in sym_ranks.items():
+                if op_fn(rank_val, threshold):
+                    signal_data[date] = {"momentum_rank": rank_val}
+            if signal_data:
+                signals[symbol] = signal_data
+
+    elif ctype == "ma_crossover":
+        fast = condition_config.get("fast", 50)
+        slow = condition_config.get("slow", 200)
+        for symbol in symbols:
+            ma_series = compute_ma_crossover(symbol, fast=fast, slow=slow, start=start, end=end, conn=conn, price_index=price_index)
+            signal_data = {}
+            for date, signal_val in ma_series.items():
+                if op_fn(signal_val, threshold):
+                    signal_data[date] = {"ma_signal": signal_val}
+            if signal_data:
+                signals[symbol] = signal_data
+
+    elif ctype == "volume_capitulation":
+        window = condition_config.get("window", 20)
+        multiplier = condition_config.get("multiplier", 3.0)
+        for symbol in symbols:
+            cap_series = compute_volume_capitulation(symbol, window=window, multiplier=multiplier,
+                                                     start=start, end=end, conn=conn)
+            signal_data = {}
+            for date, ratio in cap_series.items():
+                # volume_capitulation always fires (ratio >= multiplier), no operator needed
+                signal_data[date] = {"volume_ratio": ratio}
+            if signal_data:
+                signals[symbol] = signal_data
+
+    return signals
+
+
+def _precompute_exit_signals(config: dict, symbols: list[str], conn) -> dict:
+    """
+    Pre-compute fundamental exit signals for all tickers.
+    
+    Config section "exit_conditions" is a list of condition objects:
+    [
+      {"type": "revenue_deceleration", "min_quarters": 2, "require_margin_compression": true},
+      {"type": "margin_collapse", "threshold_bps": -500, "min_quarters": 2}
+    ]
+    
+    Logic is OR — any exit condition firing triggers exit.
+    
+    Returns:
+        {symbol: {date: {"reason": "revenue_deceleration", ...metadata}}}
+    """
+    exit_conditions = config.get("exit_conditions", [])
+    if not exit_conditions:
+        return {}
+    
+    bt_start = config["backtest"]["start"]
+    bt_end = config["backtest"]["end"]
+    combined = {}  # {symbol: {date: metadata}}
+    
+    for cond in exit_conditions:
+        ctype = cond["type"]
+        for symbol in symbols:
+            try:
+                if ctype == "revenue_deceleration":
+                    raw = find_revenue_deceleration(
+                        symbol,
+                        min_quarters=cond.get("min_quarters", 2),
+                        require_margin_compression=cond.get("require_margin_compression", True),
+                        margin_metric=cond.get("metric", "net_margin"),
+                        start=bt_start, end=bt_end,
+                    )
+                elif ctype == "margin_collapse":
+                    raw = find_margin_collapse(
+                        symbol,
+                        metric=cond.get("metric", "net_margin"),
+                        threshold_bps=cond.get("threshold_bps", -500),
+                        min_quarters=cond.get("min_quarters", 2),
+                        start=bt_start, end=bt_end,
+                    )
+                else:
+                    continue
+            except Exception:
+                continue
+            
+            if not raw:
+                continue
+            
+            if symbol not in combined:
+                combined[symbol] = {}
+            
+            for entry in raw:
+                sig_date = entry["signal_date"]
+                if sig_date not in combined[symbol]:
+                    combined[symbol][sig_date] = {
+                        "reason": ctype,
+                        **{k: v for k, v in entry.items() if k != "signal_date"}
+                    }
+    
+    return combined
+
+
+def combine_signals(all_signals: list[dict], logic: str = "all") -> dict:
+    """
+    Combine multiple condition signals using AND or OR logic.
+    
+    Args:
+        all_signals: List of {symbol: {date: metadata}} from each condition
+        logic: "all" (AND - date must appear in ALL signals) or "any" (OR - date appears in ANY signal)
+    
+    Returns:
+        {symbol: {date: combined_metadata}} where combined_metadata is a dict containing
+        metadata from all contributing conditions
+    """
+    if not all_signals:
+        return {}
+    
+    if len(all_signals) == 1:
+        return all_signals[0]
+    
+    combined = {}
+    
+    # Get all symbols that appear in any signal set
+    all_symbols = set()
+    for signal_set in all_signals:
+        all_symbols.update(signal_set.keys())
+    
+    for symbol in all_symbols:
+        symbol_signals = {}
+        
+        if logic == "all":
+            # Intersection: date must appear in ALL signal sets for this symbol
+            # Start with dates from first signal set
+            if symbol in all_signals[0]:
+                candidate_dates = set(all_signals[0][symbol].keys())
+                
+                # Keep only dates that appear in all other signal sets
+                for signal_set in all_signals[1:]:
+                    if symbol not in signal_set:
+                        candidate_dates = set()  # Symbol not in this signal set, no intersection
+                        break
+                    candidate_dates &= set(signal_set[symbol].keys())
+                
+                # Build combined metadata for intersecting dates
+                for date in candidate_dates:
+                    combined_meta = {}
+                    for i, signal_set in enumerate(all_signals):
+                        condition_meta = signal_set[symbol][date]
+                        if isinstance(condition_meta, dict):
+                            # Prefix keys with condition index to avoid conflicts
+                            for k, v in condition_meta.items():
+                                combined_meta[f"condition_{i}_{k}"] = v
+                        else:
+                            # Simple value (like drawdown_pct)
+                            combined_meta[f"condition_{i}_value"] = condition_meta
+                    symbol_signals[date] = combined_meta
+                    
+        elif logic == "any":
+            # Union: date appears in ANY signal set for this symbol
+            all_dates = set()
+            for signal_set in all_signals:
+                if symbol in signal_set:
+                    all_dates.update(signal_set[symbol].keys())
+            
+            for date in all_dates:
+                combined_meta = {}
+                for i, signal_set in enumerate(all_signals):
+                    if symbol in signal_set and date in signal_set[symbol]:
+                        condition_meta = signal_set[symbol][date]
+                        if isinstance(condition_meta, dict):
+                            for k, v in condition_meta.items():
+                                combined_meta[f"condition_{i}_{k}"] = v
+                        else:
+                            combined_meta[f"condition_{i}_value"] = condition_meta
+                symbol_signals[date] = combined_meta
+        
+        if symbol_signals:
+            combined[symbol] = symbol_signals
+    
+    return combined
+
+
+def precompute_signals(config: dict, symbols: list[str], conn, price_index: dict = None) -> dict:
+    """
+    Pre-compute entry signals for all tickers using composable conditions.
+
+    Supports both old format (entry.trigger) and new format (entry.conditions).
+    If price_index is provided, passes it to price-based conditions to avoid re-querying.
+
+    Returns:
+        {symbol: {signal_date: metadata}} — dates where entry conditions are met
+    """
+    start = config["backtest"]["start"]
+    end = config["backtest"]["end"]
+    entry_config = config["entry"]
+    
+    # Handle backward compatibility: convert old format to new format internally
+    if "conditions" in entry_config:
+        # New format
+        conditions = entry_config["conditions"]
+        logic = entry_config.get("logic", "all")
+    else:
+        # Old format - convert trigger to conditions list
+        conditions = [entry_config["trigger"]]
+        if entry_config.get("confirm"):
+            conditions.extend(entry_config["confirm"])
+        logic = "all"
+    
+    # Pre-compute each condition independently
+    all_signals = []
+    earnings_data = None  # Load once if needed
+    
+    for condition in conditions:
+        if condition["type"] == "earnings_momentum":
+            if earnings_data is None:
+                print("Loading earnings data for earnings_momentum condition...")
+                earnings_data = load_earnings_data(symbols, conn)
+        
+        condition_signals = precompute_condition(condition, symbols, conn, start, end, earnings_data, price_index=price_index)
+        all_signals.append(condition_signals)
+    
+    # Combine signals using the specified logic
+    combined_signals = combine_signals(all_signals, logic)
+    
+    # For backward compatibility with priority ranking, we need to extract a single numeric value
+    # from the combined metadata for each signal. We'll use the first numeric value we find.
+    def extract_priority_value(metadata):
+        if isinstance(metadata, (int, float)):
+            return metadata
+        if isinstance(metadata, dict):
+            for value in metadata.values():
+                if isinstance(value, (int, float)):
+                    return value
+        return -25  # Default drawdown for priority ranking
+    
+    # Convert metadata to priority values for existing code compatibility
+    priority_signals = {}
+    for symbol, dates in combined_signals.items():
+        priority_signals[symbol] = {
+            date: extract_priority_value(metadata) 
+            for date, metadata in dates.items()
+        }
+    
+    # Restructure combined_signals metadata into clean array format
+    # From: {"condition_0_revenue_yoy": 56.65, "condition_1_beats": 3, ...}
+    # To:   [{"type": "earnings_momentum", "threshold": ..., "values": {"revenue_yoy": 56.65}}, ...]
+    structured_signals = {}
+    for symbol, dates in combined_signals.items():
+        structured_signals[symbol] = {}
+        for date, metadata in dates.items():
+            if not isinstance(metadata, dict):
+                # Simple value — wrap it
+                structured_signals[symbol][date] = [
+                    {"type": conditions[0]["type"], "values": {"value": metadata}}
+                ]
+                continue
+
+            # Group keys by condition index
+            by_condition = {}
+            for key, val in metadata.items():
+                parts = key.split("_", 2)  # condition_0_metric
+                if len(parts) >= 3 and parts[0] == "condition" and parts[1].isdigit():
+                    idx = int(parts[1])
+                    metric = parts[2]
+                    if idx not in by_condition:
+                        by_condition[idx] = {}
+                    by_condition[idx][metric] = val
+                else:
+                    # Ungrouped key — put in condition 0
+                    if 0 not in by_condition:
+                        by_condition[0] = {}
+                    by_condition[0][key] = val
+
+            result = []
+            for idx in sorted(by_condition.keys()):
+                cond_config = conditions[idx] if idx < len(conditions) else {}
+                entry = {
+                    "type": cond_config.get("type", "unknown"),
+                    "values": by_condition[idx],
+                }
+                # Include threshold from config if present
+                for tkey in ("threshold", "value", "max_percentile", "lookback"):
+                    if tkey in cond_config:
+                        entry[tkey] = cond_config[tkey]
+                result.append(entry)
+
+            structured_signals[symbol][date] = result
+
+    return priority_signals, structured_signals
+
+
+# ---------------------------------------------------------------------------
+# Price Lookup
+# ---------------------------------------------------------------------------
+def build_price_index(symbols: list[str], conn) -> dict:
+    """
+    Build a fast price lookup: {symbol: {date: close}}.
+    Also returns sorted list of all trading dates.
+
+    Uses a single bulk SQL query instead of per-symbol queries.
+    """
+    price_index = {s: {} for s in symbols}
+    all_dates = set()
+
+    cur = conn.cursor()
+    # Bulk load all prices in one query
+    placeholders = ",".join("?" * len(symbols))
+    cur.execute(
+        f"SELECT symbol, date, close FROM prices WHERE symbol IN ({placeholders}) ORDER BY symbol, date ASC",
+        symbols,
+    )
+    for symbol, date, close in cur.fetchall():
+        price_index[symbol][date] = close
+        all_dates.add(date)
+
+    trading_dates = sorted(all_dates)
+    return price_index, trading_dates
+
+
+# ---------------------------------------------------------------------------
+# Position & Portfolio
+# ---------------------------------------------------------------------------
+class Position:
+    """A single open position."""
+
+    def __init__(self, symbol: str, entry_date: str, entry_price: float,
+                 shares: float, peak_price: float = None, signal_detail: dict = None):
+        self.symbol = symbol
+        self.entry_date = entry_date
+        self.entry_price = entry_price
+        self.shares = shares
+        self.peak_price = peak_price or entry_price  # pre-selloff peak for above_peak TP
+        self.high_since_entry = entry_price
+        self.signal_detail = signal_detail  # entry signal info, carried to SELL trades
+
+    def market_value(self, current_price: float) -> float:
+        return self.shares * current_price
+
+    def pnl_pct(self, current_price: float) -> float:
+        if self.entry_price <= 0:
+            return 0
+        return ((current_price - self.entry_price) / self.entry_price) * 100
+
+    def days_held(self, current_date: str) -> int:
+        entry_dt = datetime.strptime(self.entry_date, "%Y-%m-%d")
+        current_dt = datetime.strptime(current_date, "%Y-%m-%d")
+        return (current_dt - entry_dt).days
+
+
+class Portfolio:
+    """Portfolio state tracker."""
+
+    def __init__(self, initial_cash: float):
+        self.initial_cash = initial_cash
+        self.cash = initial_cash
+        self.positions: dict[str, Position] = {}  # symbol -> Position
+        self.trades: list[dict] = []
+        self.nav_history: list[dict] = []  # [{date, nav, cash, positions_value}]
+        self.closed_trades: list[dict] = []
+
+    def open_position(self, symbol: str, date: str, price: float,
+                      amount: float, slippage_bps: float = 0,
+                      peak_price: float = None, signal_detail: dict = None):
+        """Open a new position."""
+        # Apply slippage
+        exec_price = price * (1 + slippage_bps / 10000)
+        shares = amount / exec_price
+
+        if symbol in self.positions:
+            # Add to existing position
+            pos = self.positions[symbol]
+            total_cost = (pos.shares * pos.entry_price) + (shares * exec_price)
+            pos.shares += shares
+            pos.entry_price = total_cost / pos.shares  # weighted avg
+        else:
+            self.positions[symbol] = Position(
+                symbol=symbol,
+                entry_date=date,
+                entry_price=exec_price,
+                shares=shares,
+                peak_price=peak_price,
+                signal_detail=signal_detail,
+            )
+
+        self.cash -= amount
+        self.trades.append({
+            "date": date,
+            "symbol": symbol,
+            "action": "BUY",
+            "price": round(exec_price, 2),
+            "shares": round(shares, 4),
+            "amount": round(amount, 2),
+            "signal_detail": signal_detail,
+        })
+
+    def close_position(self, symbol: str, date: str, price: float,
+                       reason: str, slippage_bps: float = 0,
+                       partial_pct: float = 100):
+        """Close (or partially close) a position."""
+        if symbol not in self.positions:
+            return
+
+        pos = self.positions[symbol]
+        exec_price = price * (1 - slippage_bps / 10000)
+
+        if partial_pct >= 100:
+            # Full close
+            shares_to_sell = pos.shares
+            del self.positions[symbol]
+        else:
+            # Partial close
+            shares_to_sell = pos.shares * (partial_pct / 100)
+            pos.shares -= shares_to_sell
+
+        proceeds = shares_to_sell * exec_price
+        self.cash += proceeds
+
+        cost_basis = shares_to_sell * pos.entry_price
+        pnl = proceeds - cost_basis
+        pnl_pct = ((exec_price - pos.entry_price) / pos.entry_price) * 100
+
+        trade = {
+            "date": date,
+            "symbol": symbol,
+            "action": "SELL",
+            "reason": reason,
+            "price": round(exec_price, 2),
+            "shares": round(shares_to_sell, 4),
+            "amount": round(proceeds, 2),
+            "pnl": round(pnl, 2),
+            "pnl_pct": round(pnl_pct, 2),
+            "entry_date": pos.entry_date,
+            "entry_price": round(pos.entry_price, 2),
+            "days_held": pos.days_held(date),
+            "signal_detail": pos.signal_detail,  # carry entry signal to SELL
+        }
+        self.trades.append(trade)
+        self.closed_trades.append(trade)
+
+    def nav(self, price_index: dict, date: str) -> float:
+        """Calculate net asset value."""
+        positions_value = 0
+        for symbol, pos in self.positions.items():
+            price = price_index.get(symbol, {}).get(date)
+            if price:
+                positions_value += pos.market_value(price)
+                # Track high watermark per position
+                if price > pos.high_since_entry:
+                    pos.high_since_entry = price
+        return self.cash + positions_value
+
+    def record_nav(self, price_index: dict, date: str):
+        """Record daily NAV snapshot with position-level breakdown."""
+        positions_value = 0
+        position_details = {}
+        for symbol, pos in self.positions.items():
+            price = price_index.get(symbol, {}).get(date)
+            if price:
+                mv = pos.market_value(price)
+                positions_value += mv
+                position_details[symbol] = {
+                    "price": round(price, 2),
+                    "shares": round(pos.shares, 4),
+                    "market_value": round(mv, 2),
+                    "pnl_pct": round(pos.pnl_pct(price), 2),
+                    "entry_price": round(pos.entry_price, 2),
+                    "entry_date": pos.entry_date,
+                    "days_held": pos.days_held(date),
+                }
+
+        total_nav = self.cash + positions_value
+        prev_nav = self.nav_history[-1]["nav"] if self.nav_history else self.initial_cash
+        daily_pnl = total_nav - prev_nav
+        daily_pnl_pct = (daily_pnl / prev_nav * 100) if prev_nav > 0 else 0
+
+        self.nav_history.append({
+            "date": date,
+            "nav": round(total_nav, 2),
+            "cash": round(self.cash, 2),
+            "positions_value": round(positions_value, 2),
+            "num_positions": len(self.positions),
+            "daily_pnl": round(daily_pnl, 2),
+            "daily_pnl_pct": round(daily_pnl_pct, 4),
+            "positions": position_details,
+        })
+
+    def position_weight(self, symbol: str, price_index: dict, date: str) -> float:
+        """Get position weight as % of NAV."""
+        total_nav = self.nav(price_index, date)
+        if total_nav <= 0 or symbol not in self.positions:
+            return 0
+        price = price_index.get(symbol, {}).get(date, 0)
+        return (self.positions[symbol].market_value(price) / total_nav) * 100
+
+
+# ---------------------------------------------------------------------------
+# Exit Checks
+# ---------------------------------------------------------------------------
+def check_stop_loss(pos: Position, current_price: float, config: dict) -> bool:
+    """Check if stop loss is triggered."""
+    sl = config.get("stop_loss")
+    if not sl:
+        return False
+
+    sl_type = sl.get("type")
+    sl_value = sl.get("value", -25)
+
+    if sl_type == "drawdown_from_entry":
+        pnl = pos.pnl_pct(current_price)
+        return pnl <= sl_value
+
+    return False
+
+
+def check_take_profit(pos: Position, current_price: float, config: dict) -> bool:
+    """Check if take profit is triggered."""
+    tp = config.get("take_profit")
+    if not tp:
+        return False
+
+    tp_type = tp.get("type")
+    tp_value = tp.get("value", 10)
+
+    if tp_type == "gain_from_entry":
+        pnl = pos.pnl_pct(current_price)
+        return pnl >= tp_value
+
+    elif tp_type == "above_peak":
+        if pos.peak_price and pos.peak_price > 0:
+            gain_from_peak = ((current_price - pos.peak_price) / pos.peak_price) * 100
+            return gain_from_peak >= tp_value
+
+    return False
+
+
+def check_time_stop(pos: Position, current_date: str, config: dict) -> bool:
+    """Check if time stop is triggered."""
+    ts = config.get("time_stop")
+    if not ts:
+        return False
+
+    max_days = ts.get("max_days", 365)
+    return pos.days_held(current_date) >= max_days
+
+
+# ---------------------------------------------------------------------------
+# Rebalancing
+# ---------------------------------------------------------------------------
+def is_rebalance_date(date: str, last_rebal: str, frequency: str) -> bool:
+    """Check if today is a rebalance date."""
+    if frequency == "none":
+        return False
+
+    if not last_rebal:
+        return False
+
+    current = datetime.strptime(date, "%Y-%m-%d")
+    last = datetime.strptime(last_rebal, "%Y-%m-%d")
+
+    if frequency == "quarterly":
+        return (current - last).days >= 90
+    elif frequency == "monthly":
+        return (current - last).days >= 30
+
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Main Backtest Loop
+# ---------------------------------------------------------------------------
+def run_backtest(config: dict, force_close_at_end: bool = True,
+                 shared_price_index: tuple = None) -> dict:
+    """
+    Execute the backtest.
+
+    Args:
+        config: Strategy configuration dict.
+        force_close_at_end: Close all positions on last day (True for backtests, False for deployments).
+        shared_price_index: Optional (price_index, trading_dates) tuple pre-built by the portfolio engine.
+            When provided, skips building the price index and uses these instead.
+
+    Returns dict with:
+        - trades: list of all trades
+        - nav_history: daily NAV series
+        - closed_trades: completed round-trips
+        - metrics: summary statistics
+    """
+    stamp_strategy_id(config)
+    _persist_strategy_config(config)
+    conn = get_connection()
+
+    # Resolve universe
+    symbols = resolve_universe(config, conn)
+    print(f"Universe: {len(symbols)} tickers — {', '.join(symbols)}")
+
+    # Use shared price index if provided, otherwise build one
+    if shared_price_index is not None:
+        shared_pi, shared_td = shared_price_index
+        # Filter to this sleeve's symbols (shared index may have more tickers)
+        price_index = {s: shared_pi[s] for s in symbols if s in shared_pi}
+        all_dates_from_shared = set()
+        for s in symbols:
+            if s in shared_pi:
+                all_dates_from_shared.update(shared_pi[s].keys())
+        trading_dates = sorted(all_dates_from_shared)
+        print(f"Using shared price index ({len(price_index)} tickers from shared)")
+    else:
+        price_index = None
+        trading_dates = None
+
+    # Pre-compute signals (pass price_index to avoid re-querying)
+    print("Pre-computing entry signals...")
+    signals, signal_metadata = precompute_signals(config, symbols, conn, price_index=price_index)
+    total_signals = sum(len(v) for v in signals.values())
+    print(f"Found {total_signals} signal dates across {len(signals)} tickers")
+
+    # Pre-compute exit signals (fundamental-based exits)
+    exit_signals = {}
+    if config.get("exit_conditions"):
+        print("Pre-computing exit signals...")
+        exit_signals = _precompute_exit_signals(config, symbols, conn)
+        total_exit = sum(len(v) for v in exit_signals.values())
+        print(f"Found {total_exit} exit signal dates across {len(exit_signals)} tickers")
+
+    # Load earnings data for rebalancing
+    print("Loading earnings data...")
+    earnings_data = load_earnings_data(symbols, conn)
+    print(f"Loaded earnings for {len(earnings_data)} tickers")
+
+    # Build price index if not shared
+    if price_index is None:
+        print("Building price index...")
+        price_index, trading_dates = build_price_index(symbols, conn)
+    else:
+        print("Price index ready (shared)")
+
+    # Pre-load PE series for ranking (avoids reloading every day)
+    _ranking_pe_series = _load_pe_timeseries(symbols)
+
+    conn.close()
+    # Re-open connection for ranking queries during simulation
+    conn = get_connection()
+
+    # Filter trading dates to backtest range
+    bt_start = config["backtest"]["start"]
+    bt_end = config["backtest"]["end"]
+    trading_dates = [d for d in trading_dates if bt_start <= d <= bt_end]
+    print(f"Backtest period: {trading_dates[0]} to {trading_dates[-1]} ({len(trading_dates)} trading days)")
+
+    # Initialize portfolio
+    initial_cash = config["sizing"]["initial_allocation"]
+    slippage = config["backtest"].get("slippage_bps", 10)
+    max_positions = config["sizing"].get("max_positions", 10)
+    entry_mode = config["backtest"].get("entry_price", "next_close")
+
+    portfolio = Portfolio(initial_cash)
+
+    import random
+
+    # Track pending entries (for next_close execution)
+    pending_entries = []  # [(symbol, peak_price)]
+    last_rebal_date = None
+    stop_loss_cooldowns = {}  # {symbol: last_stop_loss_date}
+    cooldown_days = 0
+    if config.get("stop_loss"):
+        cooldown_calendar = config["stop_loss"].get("cooldown_days", 0)
+        cooldown_days = _calendar_to_trading_days(cooldown_calendar) if cooldown_calendar > 0 else 0
+    entry_priority = config.get("entry", {}).get("priority", "worst_drawdown")
+
+    print(f"Running simulation with ${initial_cash:,.0f}...")
+    print()
+
+    for i, date in enumerate(trading_dates):
+        # --- Execute pending entries from previous day ---
+        for symbol, peak_price, sig_detail in pending_entries:
+            if symbol in portfolio.positions:
+                continue  # Already in portfolio
+            if len(portfolio.positions) >= max_positions:
+                break  # Full
+
+            price = price_index.get(symbol, {}).get(date)
+            if not price:
+                continue
+
+            # Calculate position size
+            current_nav = portfolio.nav(price_index, date)
+            if current_nav <= 0:
+                continue
+
+            sizing_type = config["sizing"]["type"]
+            if sizing_type == "equal_weight":
+                target_weight = 1.0 / max_positions
+                amount = current_nav * target_weight
+            elif sizing_type == "fixed_amount":
+                amount = config["sizing"].get("amount_per_position", initial_cash / max_positions)
+            else:
+                amount = current_nav / max_positions
+
+            # Don't exceed available cash
+            amount = min(amount, portfolio.cash * 0.99)  # Keep 1% cash buffer
+            if amount < 1000:  # Min position size
+                continue
+
+            # Check max position weight
+            max_pct = config.get("rebalancing", {}).get("rules", {}).get("max_position_pct", 100)
+            if (amount / current_nav) * 100 > max_pct:
+                amount = current_nav * (max_pct / 100)
+
+            portfolio.open_position(
+                symbol=symbol, date=date, price=price,
+                amount=amount, slippage_bps=slippage,
+                peak_price=peak_price,
+                signal_detail=sig_detail,
+            )
+
+        pending_entries = []
+
+        # --- Check exits for open positions ---
+        closed_today = []
+        for symbol, pos in list(portfolio.positions.items()):
+            price = price_index.get(symbol, {}).get(date)
+            if not price:
+                continue
+
+            # Check stop loss
+            if check_stop_loss(pos, price, config):
+                portfolio.close_position(symbol, date, price, "stop_loss", slippage)
+                closed_today.append(symbol)
+                if cooldown_days > 0:
+                    stop_loss_cooldowns[symbol] = date
+                continue
+
+            # Check take profit
+            if check_take_profit(pos, price, config):
+                portfolio.close_position(symbol, date, price, "take_profit", slippage)
+                closed_today.append(symbol)
+                continue
+
+            # Check time stop
+            if check_time_stop(pos, date, config):
+                portfolio.close_position(symbol, date, price, "time_stop", slippage)
+                closed_today.append(symbol)
+                continue
+
+            # Check fundamental exit conditions
+            if exit_signals.get(symbol, {}).get(date):
+                reason = exit_signals[symbol][date].get("reason", "fundamental_exit")
+                portfolio.close_position(symbol, date, price, reason, slippage)
+                closed_today.append(symbol)
+                continue
+
+        # --- Check rebalancing ---
+        rebal_freq = config.get("rebalancing", {}).get("frequency", "none")
+        if is_rebalance_date(date, last_rebal_date, rebal_freq):
+            rebal_mode = config.get("rebalancing", {}).get("mode", "trim")
+            if rebal_mode == "equal_weight":
+                _do_equal_weight_rebalance(portfolio, price_index, date, config,
+                                            slippage, symbols, signals, signal_metadata,
+                                            conn, _ranking_pe_series)
+            else:
+                _do_rebalance(portfolio, price_index, date, config, slippage, earnings_data)
+            last_rebal_date = date
+        elif last_rebal_date is None and len(portfolio.positions) > 0:
+            last_rebal_date = date
+
+        # --- Check new entries ---
+        # Collect all candidates with active signals today
+        available_slots = max_positions - len(portfolio.positions) - len(pending_entries)
+        if available_slots > 0:
+            candidates = []
+            # Build trading day index for cooldown check
+            date_idx = trading_dates.index(date) if date in trading_dates else -1
+
+            for symbol in symbols:
+                if symbol in portfolio.positions:
+                    continue
+
+                signal_data = signals.get(symbol, {})
+                if date not in signal_data:
+                    continue
+
+                # Check stop-loss cooldown
+                if cooldown_days > 0 and symbol in stop_loss_cooldowns:
+                    sl_date = stop_loss_cooldowns[symbol]
+                    sl_idx = trading_dates.index(sl_date) if sl_date in trading_dates else -1
+                    if sl_idx >= 0 and (date_idx - sl_idx) < cooldown_days:
+                        continue
+
+                drawdown = signal_data[date]
+                candidates.append((symbol, drawdown))
+
+            # Rank candidates
+            if len(candidates) > available_slots and config.get("ranking"):
+                # Use ranking to select best candidates
+                candidates = rank_candidates(candidates, config, conn, date,
+                                              price_index, pe_series=_ranking_pe_series,
+                                              rsi_cache=None)
+            elif len(candidates) > available_slots:
+                # More candidates than slots, no explicit ranking → default pe_percentile
+                candidates = rank_candidates(candidates, config, conn, date,
+                                              price_index, pe_series=_ranking_pe_series,
+                                              rsi_cache=None)
+            elif entry_priority == "worst_drawdown":
+                candidates.sort(key=lambda x: x[1])  # most negative first
+            elif entry_priority == "random":
+                random.shuffle(candidates)
+
+            # Apply top_n from ranking config if set
+            ranking_top_n = config.get("ranking", {}).get("top_n") if config.get("ranking") else None
+            if ranking_top_n and len(candidates) > ranking_top_n:
+                candidates = candidates[:ranking_top_n]
+
+            # Fill available slots
+            for symbol, drawdown in candidates[:available_slots]:
+                peak_price = _find_recent_peak(symbol, date, price_index, config)
+                sig_detail = signal_metadata.get(symbol, {}).get(date)
+
+                if entry_mode == "next_close":
+                    pending_entries.append((symbol, peak_price, sig_detail))
+                else:
+                    price = price_index.get(symbol, {}).get(date)
+                    if price:
+                        current_nav = portfolio.nav(price_index, date)
+                        amount = min(current_nav / max_positions, portfolio.cash * 0.99)
+                        if amount >= 1000:
+                            portfolio.open_position(
+                                symbol=symbol, date=date, price=price,
+                                amount=amount, slippage_bps=slippage,
+                                peak_price=peak_price,
+                                signal_detail=sig_detail,
+                            )
+
+        # --- Record NAV ---
+        portfolio.record_nav(price_index, date)
+
+    # --- Close any remaining positions at end (backtests only, not live deployments) ---
+    if force_close_at_end:
+        last_date = trading_dates[-1]
+        for symbol in list(portfolio.positions.keys()):
+            price = price_index.get(symbol, {}).get(last_date)
+            if price:
+                portfolio.close_position(symbol, last_date, price, "backtest_end", slippage)
+
+    # Close ranking DB connection
+    conn.close()
+
+    # --- Compute metrics ---
+    metrics = compute_metrics(portfolio, initial_cash, trading_dates)
+
+    # --- Compute benchmark ---
+    print("Computing benchmark (S&P 500)...")
+    benchmark = compute_benchmark(trading_dates, initial_cash)
+
+    # --- Compute alpha ---
+    if benchmark:
+        alpha = metrics["annualized_return_pct"] - benchmark["metrics"]["annualized_return_pct"]
+        metrics["benchmark_return_pct"] = benchmark["metrics"]["total_return_pct"]
+        metrics["benchmark_ann_return_pct"] = benchmark["metrics"]["annualized_return_pct"]
+        metrics["alpha_ann_pct"] = round(alpha, 2)
+
+    from datetime import datetime, timezone
+    # Build open positions list from portfolio
+    last_date = trading_dates[-1]
+    open_positions = []
+    for symbol, pos in portfolio.positions.items():
+        current_price = price_index.get(symbol, {}).get(last_date)
+        if current_price:
+            pnl_pct = ((current_price - pos.entry_price) / pos.entry_price) * 100
+            open_positions.append({
+                "symbol": symbol,
+                "entry_date": pos.entry_date,
+                "entry_price": round(pos.entry_price, 2),
+                "current_price": round(current_price, 2),
+                "shares": round(pos.shares, 4),
+                "market_value": round(pos.shares * current_price, 2),
+                "cost_basis": round(pos.shares * pos.entry_price, 2),
+                "pnl": round(pos.shares * (current_price - pos.entry_price), 2),
+                "pnl_pct": round(pnl_pct, 2),
+                "days_held": (datetime.strptime(last_date, "%Y-%m-%d") - datetime.strptime(pos.entry_date, "%Y-%m-%d")).days,
+            })
+
+    return {
+        "strategy": config["name"],
+        "run_at": datetime.now(timezone.utc).isoformat(),
+        "config": config,
+        "trades": portfolio.trades,
+        "closed_trades": portfolio.closed_trades,
+        "open_positions": open_positions,
+        "nav_history": portfolio.nav_history,
+        "metrics": metrics,
+        "benchmark": benchmark,
+    }
+
+
+def _find_recent_peak(symbol: str, date: str, price_index: dict,
+                      config: dict) -> float:
+    """Find the pre-selloff peak price for a symbol."""
+    prices = price_index.get(symbol, {})
+    
+    # Get window_days from the first price-based condition, or use default
+    window_calendar = 90  # default
+    entry_config = config["entry"]
+    
+    if "conditions" in entry_config:
+        # New format - find first price condition with window_days
+        for condition in entry_config["conditions"]:
+            if condition["type"] in ("current_drop", "period_drop", "selloff"):
+                window_calendar = condition.get("window_days", 90)
+                break
+    else:
+        # Old format
+        trigger = entry_config["trigger"]
+        window_calendar = trigger.get("window_days", 90)
+    
+    window_trading = _calendar_to_trading_days(window_calendar)
+
+    # Look back window * 2 trading days to find the peak before the selloff
+    sorted_dates = sorted(d for d in prices.keys() if d <= date)
+    lookback = sorted_dates[-(window_trading * 2):] if len(sorted_dates) > window_trading * 2 else sorted_dates
+
+    if not lookback:
+        return prices.get(date, 0)
+
+    return max(prices[d] for d in lookback)
+
+
+def _do_rebalance(portfolio: Portfolio, price_index: dict, date: str,
+                  config: dict, slippage: float, earnings_data: dict = None):
+    """Rebalance positions according to rules."""
+    rules = config.get("rebalancing", {}).get("rules", {})
+    max_pct = rules.get("max_position_pct", 100)
+
+    current_nav = portfolio.nav(price_index, date)
+    if current_nav <= 0:
+        return
+
+    # Trim positions that exceed max weight
+    for symbol in list(portfolio.positions.keys()):
+        weight = portfolio.position_weight(symbol, price_index, date)
+        if weight > max_pct:
+            trim_pct = ((weight - max_pct) / weight) * 100
+            price = price_index.get(symbol, {}).get(date)
+            if price:
+                portfolio.close_position(
+                    symbol, date, price, "rebalance_trim",
+                    slippage, partial_pct=trim_pct,
+                )
+
+    # Earnings-beat add: if position is up > threshold AND recent earnings beat
+    add_on_beat = rules.get("add_on_earnings_beat")
+    if add_on_beat and earnings_data:
+        gain_threshold = add_on_beat.get("min_gain_pct", 15)
+        max_add_multiplier = add_on_beat.get("max_add_multiplier", 1.5)
+        lookback_days = add_on_beat.get("lookback_days", 90)  # how recent the beat must be
+
+        current_nav = portfolio.nav(price_index, date)
+        current_dt = datetime.strptime(date, "%Y-%m-%d")
+
+        for symbol, pos in list(portfolio.positions.items()):
+            price = price_index.get(symbol, {}).get(date)
+            if not price:
+                continue
+
+            # Check if position is up enough
+            pnl = pos.pnl_pct(price)
+            if pnl < gain_threshold:
+                continue
+
+            # Check for recent earnings beat
+            sym_earnings = earnings_data.get(symbol, {})
+            recent_beat = False
+            for earn_date, earn_data in sym_earnings.items():
+                earn_dt = datetime.strptime(earn_date, "%Y-%m-%d")
+                days_ago = (current_dt - earn_dt).days
+                if 0 <= days_ago <= lookback_days and earn_data["beat"]:
+                    recent_beat = True
+                    break
+
+            if not recent_beat:
+                continue
+
+            # Add to position — up to max_add_multiplier of original size
+            original_cost = pos.entry_price * pos.shares
+            max_total = original_cost * max_add_multiplier
+            current_value = pos.market_value(price)
+            room_to_add = max_total - current_value
+
+            if room_to_add <= 1000:
+                continue
+
+            amount = min(room_to_add, portfolio.cash * 0.25)  # Don't use more than 25% of cash
+            if amount < 1000:
+                continue
+
+            # Check weight cap
+            new_weight = ((current_value + amount) / current_nav) * 100
+            if new_weight > max_pct:
+                amount = (max_pct / 100 * current_nav) - current_value
+                if amount < 1000:
+                    continue
+
+            portfolio.open_position(
+                symbol=symbol, date=date, price=price,
+                amount=amount, slippage_bps=slippage,
+                peak_price=pos.peak_price,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Equal-Weight Rebalance (with optional re-ranking rotation)
+# ---------------------------------------------------------------------------
+def _do_equal_weight_rebalance(portfolio: Portfolio, price_index: dict, date: str,
+                                config: dict, slippage: float, symbols: list[str],
+                                signals: dict, signal_metadata: dict,
+                                conn, pe_series: dict = None):
+    """
+    Equal-weight rebalance: reset all positions to 1/N weight.
+    
+    If ranking is configured, also re-ranks the universe and rotates:
+    - Sell positions that fell out of top N
+    - Buy new positions that entered top N
+    - Then equal-weight all holdings
+    
+    Without ranking, just reweights existing positions to equal weight.
+    """
+    current_nav = portfolio.nav(price_index, date)
+    if current_nav <= 0:
+        return
+
+    max_positions = config["sizing"].get("max_positions", 10)
+    ranking_config = config.get("ranking")
+    
+    # Determine target holdings
+    if ranking_config:
+        # Re-rank full universe and pick top N
+        top_n = ranking_config.get("top_n", max_positions)
+        
+        # Build candidates from all universe tickers with active signals today
+        candidates = []
+        for symbol in symbols:
+            if date in signals.get(symbol, {}):
+                drawdown = signals[symbol][date]
+                candidates.append((symbol, drawdown))
+        
+        if candidates:
+            ranked = rank_candidates(candidates, config, conn, date,
+                                      price_index, pe_series=pe_series)
+            target_symbols = set(sym for sym, _ in ranked[:top_n])
+        else:
+            target_symbols = set(portfolio.positions.keys())
+    else:
+        # No ranking — keep current holdings
+        target_symbols = set(portfolio.positions.keys())
+    
+    # Step 1: Sell positions that are no longer in target set
+    for symbol in list(portfolio.positions.keys()):
+        if symbol not in target_symbols:
+            price = price_index.get(symbol, {}).get(date)
+            if price:
+                portfolio.close_position(symbol, date, price, "rebalance_rotation", slippage)
+    
+    # Step 2: Calculate target weight per position
+    n_targets = len(target_symbols)
+    if n_targets == 0:
+        return
+    
+    # Recalculate NAV after sells
+    current_nav = portfolio.nav(price_index, date)
+    target_amount = current_nav / n_targets
+    
+    # Step 3: Reweight existing positions (trim or add)
+    for symbol in list(portfolio.positions.keys()):
+        if symbol not in target_symbols:
+            continue
+        price = price_index.get(symbol, {}).get(date)
+        if not price:
+            continue
+        
+        pos = portfolio.positions[symbol]
+        current_value = pos.market_value(price)
+        diff = target_amount - current_value
+        
+        if diff < -1000:
+            # Overweight — trim
+            trim_pct = (abs(diff) / current_value) * 100
+            portfolio.close_position(symbol, date, price, "rebalance_trim", slippage, partial_pct=min(trim_pct, 99))
+        elif diff > 1000 and portfolio.cash > 1000:
+            # Underweight — add
+            add_amount = min(diff, portfolio.cash * 0.95)
+            if add_amount >= 1000:
+                sig_detail = signal_metadata.get(symbol, {}).get(date)
+                portfolio.open_position(symbol, date, price, add_amount, slippage,
+                                         signal_detail=sig_detail)
+    
+    # Step 4: Buy new positions (rotation entries)
+    # Recalculate NAV and target after reweighting
+    current_nav = portfolio.nav(price_index, date)
+    n_remaining = len(target_symbols)
+    if n_remaining == 0:
+        return
+    target_amount = current_nav / n_remaining
+    
+    for symbol in target_symbols:
+        if symbol in portfolio.positions:
+            continue  # Already held
+        price = price_index.get(symbol, {}).get(date)
+        if not price:
+            continue
+        
+        amount = min(target_amount, portfolio.cash * 0.95)
+        if amount < 1000:
+            continue
+        
+        sig_detail = signal_metadata.get(symbol, {}).get(date)
+        portfolio.open_position(symbol, date, price, amount, slippage,
+                                 signal_detail=sig_detail)
+
+
+# ---------------------------------------------------------------------------
+# Benchmark
+# ---------------------------------------------------------------------------
+def compute_benchmark(trading_dates: list[str], initial_cash: float,
+                      conn=None) -> dict:
+    """
+    Compute S&P 500 buy-and-hold benchmark over the same period.
+
+    Tries DB first (SPY), then falls back to index JSON files (GSPC).
+
+    Returns:
+        {symbol, nav_history: [{date, nav, daily_pnl_pct}], metrics: {...}}
+    """
+    price_dict = {}
+    bench_symbol = None
+
+    # Try DB first
+    own_conn = conn is None
+    if own_conn:
+        conn = get_connection()
+    for sym in ["SPY", "^GSPC", "GSPC"]:
+        prices = get_prices(sym, start=trading_dates[0], end=trading_dates[-1], conn=conn)
+        if prices and len(prices) > 10:
+            bench_symbol = sym
+            price_dict = {d: c for d, c in prices}
+            break
+    if own_conn:
+        conn.close()
+
+    # Fall back to index JSON
+    if not bench_symbol:
+        index_dir = DATA_DIR / "prices" / "indices"
+        for fname, label in [("GSPC.json", "S&P 500"), ("DJI.json", "DJIA")]:
+            fpath = index_dir / fname
+            if fpath.exists():
+                try:
+                    data = json.loads(fpath.read_text())
+                    records = data.get("data", data) if isinstance(data, dict) else data
+                    if isinstance(records, list):
+                        for r in records:
+                            d = r.get("date", "")[:10]
+                            c = r.get("close")
+                            if d and c and trading_dates[0] <= d <= trading_dates[-1]:
+                                price_dict[d] = c
+                        if len(price_dict) > 10:
+                            bench_symbol = label
+                            break
+                except (json.JSONDecodeError, KeyError):
+                    continue
+
+    if not bench_symbol or len(price_dict) < 10:
+        return None
+
+    # Buy-and-hold: invest initial_cash on day 1
+    first_price = None
+    nav_history = []
+    prev_nav = initial_cash
+
+    for date in trading_dates:
+        price = price_dict.get(date)
+        if not price:
+            continue
+        if first_price is None:
+            first_price = price
+
+        nav = initial_cash * (price / first_price)
+        daily_pnl = nav - prev_nav
+        daily_pnl_pct = (daily_pnl / prev_nav * 100) if prev_nav > 0 else 0
+
+        nav_history.append({
+            "date": date,
+            "nav": round(nav, 2),
+            "daily_pnl_pct": round(daily_pnl_pct, 4),
+        })
+        prev_nav = nav
+
+    if not nav_history:
+        return None
+
+    final_nav = nav_history[-1]["nav"]
+    total_return = ((final_nav - initial_cash) / initial_cash) * 100
+    calendar_days = (datetime.strptime(trading_dates[-1], "%Y-%m-%d") -
+                     datetime.strptime(trading_dates[0], "%Y-%m-%d")).days
+    years = max(calendar_days / 365.25, 0.01)
+    ann_return = ((final_nav / initial_cash) ** (1 / years) - 1) * 100 if years > 0 else 0
+
+    # Max drawdown
+    peak = 0
+    max_dd = 0
+    for point in nav_history:
+        if point["nav"] > peak:
+            peak = point["nav"]
+        dd = ((point["nav"] - peak) / peak) * 100 if peak > 0 else 0
+        if dd < max_dd:
+            max_dd = dd
+
+    return {
+        "symbol": bench_symbol,
+        "nav_history": nav_history,
+        "metrics": {
+            "total_return_pct": round(total_return, 2),
+            "annualized_return_pct": round(ann_return, 2),
+            "max_drawdown_pct": round(max_dd, 2),
+            "final_nav": round(final_nav, 2),
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+def compute_metrics(portfolio: Portfolio, initial_cash: float,
+                    trading_dates: list[str]) -> dict:
+    """Compute summary performance metrics."""
+    nav_series = portfolio.nav_history
+    if not nav_series:
+        return {}
+
+    final_nav = nav_series[-1]["nav"]
+    total_return = ((final_nav - initial_cash) / initial_cash) * 100
+
+    # Annualized return (calendar days / 365.25, per GIPS/CFA standard)
+    calendar_days = (datetime.strptime(trading_dates[-1], "%Y-%m-%d") -
+                     datetime.strptime(trading_dates[0], "%Y-%m-%d")).days
+    years = max(calendar_days / 365.25, 0.01)
+    ann_return = ((final_nav / initial_cash) ** (1 / years) - 1) * 100 if years > 0 else 0
+
+    # Max drawdown
+    peak_nav = 0
+    max_dd = 0
+    max_dd_date = ""
+    for point in nav_series:
+        if point["nav"] > peak_nav:
+            peak_nav = point["nav"]
+        dd = ((point["nav"] - peak_nav) / peak_nav) * 100 if peak_nav > 0 else 0
+        if dd < max_dd:
+            max_dd = dd
+            max_dd_date = point["date"]
+
+    # Trade stats
+    closed = portfolio.closed_trades
+    # Exclude backtest_end trades for win rate calculation
+    total_entries = len([t for t in portfolio.trades if t["action"] == "BUY"])
+    real_trades = [t for t in closed if t["reason"] != "backtest_end"]
+    wins = [t for t in real_trades if t["pnl"] > 0]
+    losses = [t for t in real_trades if t["pnl"] <= 0]
+
+    win_rate = (len(wins) / len(real_trades) * 100) if real_trades else 0
+    all_wins = [t for t in closed if t["pnl"] > 0]
+    win_rate_incl_open = (len(all_wins) / len(closed) * 100) if closed else 0
+    avg_win = sum(t["pnl_pct"] for t in wins) / len(wins) if wins else 0
+    avg_loss = sum(t["pnl_pct"] for t in losses) / len(losses) if losses else 0
+    avg_days = sum(t["days_held"] for t in real_trades) / len(real_trades) if real_trades else 0
+
+    # PnL by exit reason
+    by_reason = defaultdict(lambda: {"count": 0, "pnl": 0})
+    for t in closed:
+        reason = t["reason"]
+        by_reason[reason]["count"] += 1
+        by_reason[reason]["pnl"] += t["pnl"]
+
+    # Profit factor
+    gross_wins = sum(t["pnl"] for t in wins)
+    gross_losses = abs(sum(t["pnl"] for t in losses))
+    profit_factor = min(gross_wins / gross_losses, 999.99) if gross_losses > 0 else 999.99
+
+    # Volatility metrics (from daily NAV returns)
+    daily_returns = []
+    for i in range(1, len(nav_series)):
+        prev_nav = nav_series[i - 1]["nav"]
+        if prev_nav > 0:
+            daily_returns.append((nav_series[i]["nav"] - prev_nav) / prev_nav)
+
+    if daily_returns:
+        import statistics
+        import math
+
+        daily_std = statistics.stdev(daily_returns) if len(daily_returns) > 1 else 0
+        ann_vol = daily_std * (252 ** 0.5) * 100
+
+        # Load risk-free rate from treasury data (3-month T-bill)
+        # Use average rate over the backtest period for accuracy
+        risk_free_ann = 0.0
+        try:
+            treasury_path = Path(__file__).parent.parent / "data" / "macro" / "treasury-rates.json"
+            if treasury_path.exists():
+                treasury_data = json.loads(treasury_path.read_text())
+                t_rates = treasury_data.get("data", treasury_data) if isinstance(treasury_data, dict) else treasury_data
+                # Filter to backtest date range
+                start_date = nav_series[0]["date"]
+                end_date = nav_series[-1]["date"]
+                period_rates = [r["month3"] for r in t_rates
+                               if start_date <= r["date"] <= end_date and r.get("month3") is not None]
+                if period_rates:
+                    risk_free_ann = sum(period_rates) / len(period_rates)  # already in % terms
+        except Exception:
+            risk_free_ann = 2.0  # Conservative default when treasury data unavailable
+
+        # Sharpe = (annualized return - risk-free rate) / annualized volatility
+        excess_return = ann_return - risk_free_ann
+        sharpe = excess_return / ann_vol if ann_vol > 0 else 0
+
+        # Sortino = (annualized return - risk-free rate) / annualized downside deviation
+        # Downside deviation: use ALL returns, replace positives with 0
+        daily_rf = risk_free_ann / 100 / 252  # convert annual % to daily decimal
+        downside_sq = [min(r - daily_rf, 0) ** 2 for r in daily_returns]
+        downside_dev = math.sqrt(sum(downside_sq) / len(downside_sq)) * math.sqrt(252) * 100
+        sortino = excess_return / downside_dev if downside_dev > 0 else 0
+    else:
+        ann_vol = 0
+        sharpe = 0
+        sortino = 0
+        risk_free_ann = 0.0
+
+    # Utilized capital metrics
+    positions_values = [p["positions_value"] for p in nav_series]
+    peak_utilized_capital = max(positions_values) if positions_values else 0
+    avg_utilized_capital = sum(positions_values) / len(positions_values) if positions_values else 0
+    total_pnl = final_nav - initial_cash
+    return_on_utilized_capital_pct = (
+        (total_pnl / avg_utilized_capital) * 100 if avg_utilized_capital > 0 else 0
+    )
+    utilization_pct = (avg_utilized_capital / initial_cash) * 100 if initial_cash > 0 else 0
+
+    return {
+        "total_return_pct": round(total_return, 2),
+        "annualized_return_pct": round(ann_return, 2),
+        "max_drawdown_pct": round(max_dd, 2),
+        "max_drawdown_date": max_dd_date,
+        "final_nav": round(final_nav, 2),
+        "total_entries": total_entries,
+        "total_trades": len(real_trades),
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate_pct": round(win_rate, 2),
+        "win_rate_incl_open_pct": round(win_rate_incl_open, 2),
+        "avg_win_pct": round(avg_win, 2),
+        "avg_loss_pct": round(avg_loss, 2),
+        "avg_holding_days": round(avg_days, 1),
+        "profit_factor": round(profit_factor, 2),
+        "annualized_volatility_pct": round(ann_vol, 2),
+        "sharpe_ratio": round(sharpe, 2),
+        "sortino_ratio": round(sortino, 2),
+        "risk_free_rate_pct": round(risk_free_ann, 2),
+        "peak_utilized_capital": round(peak_utilized_capital, 2),
+        "avg_utilized_capital": round(avg_utilized_capital, 2),
+        "utilization_pct": round(utilization_pct, 2),
+        "return_on_utilized_capital_pct": round(return_on_utilized_capital_pct, 2),
+        "by_exit_reason": dict(by_reason),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Report Printer
+# ---------------------------------------------------------------------------
+def save_results(result: dict, strategy_path: str, output_dir: str | None = None):
+    """Auto-save backtest results to JSON.
+
+    If output_dir is given, write clean-named files there (results.json,
+    results_daily.json, config.json).  Otherwise fall back to the legacy
+    timestamped naming under backtest/results/.
+    """
+    if output_dir:
+        results_dir = Path(output_dir)
+    else:
+        results_dir = Path(os.environ.get("WORKSPACE", "/app")) / "backtest" / "results"
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- build filenames ------------------------------------------------
+    if output_dir:
+        # Clean naming inside a dedicated run directory
+        filename = "results.json"
+        daily_filename = "results_daily.json"
+    else:
+        # Legacy: timestamped flat files
+        name = result["strategy"].lower().replace(" ", "_")
+        bt = result["config"]["backtest"]
+        start = bt["start"].replace("-", "")
+        end = bt["end"].replace("-", "")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"{name}_{start}_{end}_{timestamp}.json"
+        daily_filename = f"{name}_{start}_{end}_{timestamp}_daily.json"
+
+    filepath = results_dir / filename
+
+    # Create a clean output — strip position details from nav_history for file size
+    nav_summary = []
+    for point in result["nav_history"]:
+        nav_summary.append({
+            "date": point["date"],
+            "nav": point["nav"],
+            "cash": point["cash"],
+            "positions_value": point["positions_value"],
+            "num_positions": point["num_positions"],
+            "daily_pnl": point["daily_pnl"],
+            "daily_pnl_pct": point["daily_pnl_pct"],
+        })
+
+    output = {
+        "strategy": result["strategy"],
+        "config": result["config"],
+        "metrics": result["metrics"],
+        "trades": result["trades"],
+        "closed_trades": result["closed_trades"],
+        "open_positions": result.get("open_positions", []),
+        "nav_history": nav_summary,
+        "benchmark": {
+            "symbol": result["benchmark"]["symbol"],
+            "metrics": result["benchmark"]["metrics"],
+        } if result.get("benchmark") else None,
+    }
+
+    with open(filepath, "w") as f:
+        json.dump(output, f, indent=2)
+
+    # Full daily detail (with per-position breakdown)
+    daily_filepath = results_dir / daily_filename
+    daily_output = {
+        "strategy": result["strategy"],
+        "nav_history": result["nav_history"],
+        "benchmark_nav": result["benchmark"]["nav_history"] if result.get("benchmark") else None,
+    }
+    with open(daily_filepath, "w") as f:
+        json.dump(daily_output, f, indent=2)
+
+    # Copy strategy config into the output dir for provenance
+    if output_dir:
+        import shutil
+        config_dst = results_dir / "config.json"
+        shutil.copy2(strategy_path, config_dst)
+
+    # Auto-index into backtest_runs table (skip deployment evals — they use output_dir)
+    if not output_dir:
+        try:
+            from index_backtests import index_result, SCHEMA
+            import sqlite3 as _sqlite3
+            _db = Path(os.environ.get("DB_PATH", "/app/data/alphascout.db"))
+            _conn = _sqlite3.connect(str(_db))
+            _conn.executescript(SCHEMA)
+            index_result(_conn, filepath)
+            _conn.commit()
+            _conn.close()
+        except Exception as e:
+            print(f"  Warning: failed to index run into DB: {e}")
+
+    return filepath, daily_filepath
+
+
+def print_report(result: dict):
+    """Print a formatted backtest report."""
+    m = result["metrics"]
+    config_name = result["strategy"]
+
+    print()
+    print("=" * 70)
+    print(f"  BACKTEST REPORT: {config_name}")
+    print("=" * 70)
+
+    print(f"\n  Performance")
+    print(f"  {'Total Return:':<25} {m['total_return_pct']:>8.2f}%")
+    print(f"  {'Annualized Return:':<25} {m['annualized_return_pct']:>8.2f}%")
+    print(f"  {'Max Drawdown:':<25} {m['max_drawdown_pct']:>8.2f}%  ({m['max_drawdown_date']})")
+    print(f"  {'Final NAV:':<25} ${m['final_nav']:>12,.2f}")
+    print(f"  {'Profit Factor:':<25} {m['profit_factor']:>8.2f}")
+
+    # Benchmark comparison
+    if "benchmark_return_pct" in m:
+        print(f"\n  Benchmark (S&P 500)")
+        print(f"  {'Benchmark Return:':<25} {m['benchmark_return_pct']:>8.2f}%")
+        print(f"  {'Benchmark Ann. Return:':<25} {m['benchmark_ann_return_pct']:>8.2f}%")
+        print(f"  {'Alpha (annualized):':<25} {m['alpha_ann_pct']:>8.2f}%")
+
+    print(f"\n  Trade Statistics")
+    print(f"  {'Total Trades:':<25} {m['total_trades']:>8}")
+    print(f"  {'Wins:':<25} {m['wins']:>8}")
+    print(f"  {'Losses:':<25} {m['losses']:>8}")
+    print(f"  {'Win Rate:':<25} {m['win_rate_pct']:>8.1f}%")
+    print(f"  {'Avg Win:':<25} {m['avg_win_pct']:>8.2f}%")
+    print(f"  {'Avg Loss:':<25} {m['avg_loss_pct']:>8.2f}%")
+    print(f"  {'Avg Holding Period:':<25} {m['avg_holding_days']:>8.1f} days")
+
+    print(f"\n  Exits by Reason")
+    for reason, stats in m.get("by_exit_reason", {}).items():
+        print(f"  {'  ' + reason + ':':<25} {stats['count']:>4} trades  ${stats['pnl']:>12,.2f}")
+
+    # Print last 20 trades
+    trades = result["closed_trades"]
+    real_trades = [t for t in trades if t["reason"] != "backtest_end"]
+    if real_trades:
+        print(f"\n  Recent Trades (last 20)")
+        print(f"  {'Date':<12} {'Symbol':<8} {'Entry $':>8} {'Exit $':>8} {'PnL%':>7} {'Days':>5} {'Reason':<15}")
+        print("  " + "-" * 68)
+        for t in real_trades[-20:]:
+            print(f"  {t['date']:<12} {t['symbol']:<8} ${t['entry_price']:>7.2f} "
+                  f"${t['price']:>7.2f} {t['pnl_pct']:>6.1f}% {t['days_held']:>5} {t['reason']:<15}")
+
+    # NAV at key dates
+    nav_hist = result["nav_history"]
+    if nav_hist:
+        print(f"\n  NAV Snapshots")
+        step = max(1, len(nav_hist) // 10)
+        print(f"  {'Date':<12} {'NAV':>14} {'Positions':>10}")
+        print("  " + "-" * 40)
+        for i in range(0, len(nav_hist), step):
+            n = nav_hist[i]
+            print(f"  {n['date']:<12} ${n['nav']:>13,.2f} {n['num_positions']:>10}")
+        # Always print last
+        n = nav_hist[-1]
+        print(f"  {n['date']:<12} ${n['nav']:>13,.2f} {n['num_positions']:>10}")
+
+    print()
+    print("=" * 70)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(description="AlphaScout Backtest Engine")
+    parser.add_argument("strategy", type=str, help="Path to strategy JSON config")
+    parser.add_argument("--start", type=str, help="Override backtest start date")
+    parser.add_argument("--end", type=str, help="Override backtest end date")
+    parser.add_argument("--allocation", type=float, help="Override initial allocation")
+    parser.add_argument("--json", action="store_true", help="Output results as JSON")
+    parser.add_argument("--output-dir", type=str, help="Directory for results (clean naming: results.json, config.json, charts)")
+
+    args = parser.parse_args()
+
+    config = load_strategy(args.strategy)
+
+    # Apply CLI overrides
+    if args.start:
+        config["backtest"]["start"] = args.start
+    if args.end:
+        config["backtest"]["end"] = args.end
+    if args.allocation:
+        config["sizing"]["initial_allocation"] = args.allocation
+
+    result = run_backtest(config)
+
+    if args.json:
+        print(json.dumps(result, indent=2, default=str))
+    else:
+        print_report(result)
+
+    # Auto-save results
+    filepath, daily_filepath = save_results(result, args.strategy, output_dir=args.output_dir)
+    print(f"\n  Results saved to: {filepath}")
+    print(f"  Daily detail saved to: {daily_filepath}")
+
+    # Persist trades to DB (single source of truth)
+    try:
+        from deploy_engine import persist_trades
+        run_id = filepath.stem if hasattr(filepath, 'stem') else str(filepath).rsplit('/', 1)[-1].replace('.json', '')
+        all_trades = result.get("trades", [])
+        if all_trades:
+            n = persist_trades("backtest", run_id, all_trades)
+            print(f"  💾 {n} trade(s) persisted to DB")
+    except Exception as e:
+        print(f"  ⚠ Trade persist failed: {e}")
+
+
+if __name__ == "__main__":
+    main()

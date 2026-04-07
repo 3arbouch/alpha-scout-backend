@@ -1,0 +1,34 @@
+{
+  "name": "T12 Profit Factor",
+  "universe": {
+    "type": "symbols",
+    "symbols": [
+      "AAPL",
+      "MSFT"
+    ]
+  },
+  "entry": {
+    "conditions": [
+      {
+        "type": "always"
+      }
+    ],
+    "logic": "all"
+  },
+  "take_profit": {
+    "type": "gain_from_entry",
+    "value": 0.5
+  },
+  "sizing": {
+    "type": "equal_weight",
+    "max_positions": 2,
+    "initial_allocation": 100000
+  },
+  "backtest": {
+    "start": "2024-06-01",
+    "end": "2024-06-30",
+    "entry_price": "next_close",
+    "slippage_bps": 5
+  },
+  "strategy_id": "2bd70c5a5d56"
+}

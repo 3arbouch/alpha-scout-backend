@@ -1,0 +1,43 @@
+{
+  "name": "T5 Legacy Mean Reversion",
+  "universe": {
+    "type": "symbols",
+    "symbols": [
+      "AAPL",
+      "MSFT",
+      "GOOGL",
+      "NVDA",
+      "META"
+    ]
+  },
+  "entry": {
+    "conditions": [
+      {
+        "type": "current_drop",
+        "threshold": -15,
+        "window_days": 90
+      }
+    ],
+    "logic": "all"
+  },
+  "sizing": {
+    "type": "equal_weight",
+    "max_positions": 3,
+    "initial_allocation": 100000
+  },
+  "stop_loss": {
+    "type": "drawdown_from_entry",
+    "value": -25
+  },
+  "take_profit": {
+    "type": "gain_from_entry",
+    "value": 30
+  },
+  "backtest": {
+    "start": "2023-01-01",
+    "end": "2025-12-31",
+    "entry_price": "next_close",
+    "slippage_bps": 10
+  },
+  "strategy_id": "b791b36cda36"
+}

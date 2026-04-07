@@ -1,0 +1,21 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    volumes:
+      # Persistent data — survives container rebuilds
+      - ./data:/app/data
+      - ./strategies:/app/strategies
+      - ./deployments:/app/deployments
+      - ./backtest:/app/backtest
+      - ./logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

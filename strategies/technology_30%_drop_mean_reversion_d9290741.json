@@ -1,0 +1,54 @@
+{
+  "name": "Technology 30% Drop Mean Reversion",
+  "version": 1,
+  "author": {
+    "id": "owner",
+    "name": "Omar"
+  },
+  "universe": {
+    "type": "sector",
+    "sector": "Technology",
+    "exclude": []
+  },
+  "entry": {
+    "trigger": {
+      "type": "current_drop",
+      "window_days": 180,
+      "threshold": -30
+    },
+    "priority": "worst_drawdown",
+    "confirm": []
+  },
+  "stop_loss": {
+    "type": "drawdown_from_entry",
+    "value": -35,
+    "cooldown_days": 90
+  },
+  "take_profit": {
+    "type": "gain_from_entry",
+    "value": 50
+  },
+  "time_stop": null,
+  "rebalancing": {
+    "frequency": "quarterly",
+    "rules": {
+      "max_position_pct": 25,
+      "on_earnings_beat": "hold",
+      "on_earnings_miss": "trim",
+      "trim_pct": 25
+    }
+  },
+  "sizing": {
+    "type": "equal_weight",
+    "max_positions": 25,
+    "initial_allocation": 100000.0
+  },
+  "backtest": {
+    "start": "2026-01-01",
+    "end": "2026-03-16",
+    "entry_price": "next_close",
+    "slippage_bps": 10
+  },
+  "strategy_id": "d92907417405",
+  "created_at": "2026-03-16T12:50:53.036838+00:00"
+}

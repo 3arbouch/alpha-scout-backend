@@ -1,0 +1,95 @@
+{
+  "name": "Banks & Fintech \u2014 30% Drop + 2x Earnings Beats",
+  "version": 1,
+  "author": {
+    "id": "owner",
+    "name": "Omar"
+  },
+  "universe": {
+    "type": "symbols",
+    "symbols": [
+      "AXP",
+      "BAC",
+      "C",
+      "CBOE",
+      "CFG",
+      "CME",
+      "COF",
+      "COIN",
+      "FDS",
+      "FITB",
+      "GS",
+      "HBAN",
+      "HOOD",
+      "IBKR",
+      "ICE",
+      "JPM",
+      "KEY",
+      "MA",
+      "MCO",
+      "MS",
+      "MSCI",
+      "MTB",
+      "NDAQ",
+      "PNC",
+      "PYPL",
+      "RF",
+      "RJF",
+      "SCHW",
+      "SPGI",
+      "SYF",
+      "TFC",
+      "USB",
+      "V",
+      "WFC"
+    ]
+  },
+  "entry": {
+    "conditions": [
+      {
+        "type": "current_drop",
+        "threshold": -30,
+        "window_days": 90
+      },
+      {
+        "type": "earnings_momentum",
+        "min_beats": 2,
+        "lookback_quarters": 4
+      }
+    ],
+    "logic": "all",
+    "priority": "worst_drawdown"
+  },
+  "stop_loss": {
+    "type": "drawdown_from_entry",
+    "value": -35,
+    "cooldown_days": 90
+  },
+  "take_profit": {
+    "type": "gain_from_entry",
+    "value": 60
+  },
+  "time_stop": null,
+  "rebalancing": {
+    "frequency": "quarterly",
+    "rules": {
+      "max_position_pct": 25,
+      "on_earnings_beat": "hold",
+      "on_earnings_miss": "trim",
+      "trim_pct": 50
+    }
+  },
+  "sizing": {
+    "type": "equal_weight",
+    "max_positions": 20,
+    "initial_allocation": 1000000
+  },
+  "backtest": {
+    "start": "2020-01-01",
+    "end": "2025-01-01",
+    "entry_price": "next_close",
+    "slippage_bps": 10
+  },
+  "strategy_id": "7650d30e4295",
+  "created_at": "2026-03-17T17:36:07.356054+00:00"
+}

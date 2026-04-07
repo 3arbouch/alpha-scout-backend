@@ -1,0 +1,41 @@
+{
+  "name": "T2 Ranked Entry",
+  "universe": {
+    "type": "symbols",
+    "symbols": [
+      "AAPL",
+      "MSFT",
+      "GOOGL",
+      "NVDA",
+      "META",
+      "AMZN",
+      "INTC",
+      "AMD"
+    ]
+  },
+  "entry": {
+    "conditions": [
+      {
+        "type": "always"
+      }
+    ],
+    "logic": "all"
+  },
+  "ranking": {
+    "by": "pe_percentile",
+    "order": "asc",
+    "top_n": 3
+  },
+  "sizing": {
+    "type": "equal_weight",
+    "max_positions": 3,
+    "initial_allocation": 100000
+  },
+  "backtest": {
+    "start": "2024-01-01",
+    "end": "2024-12-31",
+    "entry_price": "next_close",
+    "slippage_bps": 10
+  },
+  "strategy_id": "180829a6b785"
+}

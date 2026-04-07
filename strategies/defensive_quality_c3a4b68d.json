@@ -1,0 +1,57 @@
+{
+  "name": "Defensive Quality",
+  "universe": {
+    "type": "symbols",
+    "symbols": [
+      "JNJ",
+      "PG",
+      "KO",
+      "PEP",
+      "CL",
+      "MCD",
+      "WMT",
+      "COST",
+      "UNH",
+      "LLY"
+    ]
+  },
+  "entry": {
+    "conditions": [
+      {
+        "type": "current_drop",
+        "window_days": 180,
+        "threshold": -15
+      }
+    ],
+    "logic": "all",
+    "priority": "worst_drawdown"
+  },
+  "sizing": {
+    "type": "equal_weight",
+    "max_positions": 10,
+    "initial_allocation": 500000
+  },
+  "stop_loss": {
+    "type": "drawdown_from_entry",
+    "value": -20,
+    "cooldown_days": 90
+  },
+  "take_profit": {
+    "type": "gain_from_entry",
+    "value": 50
+  },
+  "time_stop": {
+    "max_days": 365
+  },
+  "backtest": {
+    "start": "2020-01-01",
+    "end": "2026-03-28",
+    "entry_price": "next_close",
+    "slippage_bps": 10
+  },
+  "strategy_id": "c3a4b68d3035",
+  "rebalancing": {
+    "frequency": "none",
+    "rules": {}
+  }
+}

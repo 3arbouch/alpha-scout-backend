@@ -1,0 +1,58 @@
+{
+  "name": "Healthcare Quality",
+  "version": "v1",
+  "author": {
+    "id": "owner",
+    "name": "Omar"
+  },
+  "universe": {
+    "type": "sector",
+    "sector": "Healthcare"
+  },
+  "entry": {
+    "conditions": [
+      {
+        "type": "current_drop",
+        "window_days": 180,
+        "threshold": -15
+      },
+      {
+        "type": "earnings_momentum",
+        "lookback_quarters": 4,
+        "min_beats": 2
+      }
+    ],
+    "logic": "all",
+    "priority": "worst_drawdown"
+  },
+  "sizing": {
+    "type": "equal_weight",
+    "max_positions": 10,
+    "initial_allocation": 1000000
+  },
+  "stop_loss": {
+    "type": "drawdown_from_entry",
+    "value": -35,
+    "cooldown_days": 90
+  },
+  "take_profit": {
+    "type": "gain_from_entry",
+    "value": 60
+  },
+  "rebalancing": {
+    "frequency": "quarterly",
+    "rules": {
+      "max_position_pct": 25,
+      "on_earnings_miss": "trim",
+      "trim_pct": 25
+    }
+  },
+  "backtest": {
+    "start": "2015-01-01",
+    "end": "2026-12-31",
+    "entry_price": "next_close",
+    "slippage_bps": 10
+  },
+  "strategy_id": "ec1425a24c8b",
+  "time_stop": null
+}
