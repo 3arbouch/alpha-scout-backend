@@ -903,7 +903,10 @@ async def get_sector(metric: str):
     valid = ["industry-pe", "sector-pe", "sector-performance"]
     if metric not in valid:
         raise HTTPException(status_code=400, detail=f"Invalid metric. Valid: {valid}")
+    # Try {metric}.json first, then {metric}/latest.json
     data = read_json_file(DATA_DIR / "sector" / f"{metric}.json")
+    if not data:
+        data = read_json_file(DATA_DIR / "sector" / metric / "latest.json")
     if not data:
         raise HTTPException(status_code=404, detail=f"Sector data not found for {metric}")
     return {"metric": metric, "data": data}
