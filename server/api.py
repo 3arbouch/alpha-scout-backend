@@ -3560,7 +3560,7 @@ async def get_macro_derived(
         query += " AND date <= ?"
         params.append(end)
     query += " ORDER BY date, series"
-    with get_db() as conn:
+    with get_market_db() as conn:
         cur = conn.execute(query, params)
         rows = [{"date": r["date"], "series": r["series"], "value": r["value"]} for r in cur.fetchall()]
     return {"count": len(rows), "data": rows}
