@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 SCRIPT_DIR = Path(__file__).parent
 WORKSPACE = Path(os.environ.get("WORKSPACE", "/app"))
 DEPLOYMENTS_DIR = WORKSPACE / "deployments"
-DB_PATH = Path(os.environ.get("DB_PATH", "/app/data/alphascout.db"))
+from db_config import APP_DB_PATH as DB_PATH
 
 sys.path.insert(0, str(SCRIPT_DIR))
 

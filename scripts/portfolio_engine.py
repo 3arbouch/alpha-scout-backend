@@ -46,7 +46,7 @@ from regime import evaluate_regime_series
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-DB_PATH = Path(os.environ.get("DB_PATH", "/app/data/alphascout.db"))
+from db_config import MARKET_DB_PATH as DB_PATH, APP_DB_PATH
 WORKSPACE = Path(os.environ.get("WORKSPACE", "/app"))
 STRATEGIES_DIR = WORKSPACE / "strategies"
 
@@ -162,8 +162,10 @@ def _resolve_strategy_config(strategy_ref: dict) -> dict:
 
     if "strategy_id" in strategy_ref:
         sid = strategy_ref["strategy_id"]
-        # Look up from DB (single source of truth)
-        conn = get_connection()
+        # Look up from app DB (strategies are app state, not market data)
+        import sqlite3 as _sqlite3
+        conn = _sqlite3.connect(str(APP_DB_PATH))
+        conn.row_factory = _sqlite3.Row
         try:
             row = conn.execute(
                 "SELECT config FROM strategies WHERE strategy_id = ?", (sid,)
@@ -328,9 +330,11 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
 
         if all_regime_ids:
             print(f"\n  Loading {len(all_regime_ids)} regime definitions...")
-            conn = get_connection()
-            regime_configs, regime_id_to_name = _load_regime_configs(list(all_regime_ids), conn)
-            conn.close()
+            import sqlite3 as _sqlite3
+            _app_conn = _sqlite3.connect(str(APP_DB_PATH))
+            _app_conn.row_factory = _sqlite3.Row
+            regime_configs, regime_id_to_name = _load_regime_configs(list(all_regime_ids), _app_conn)
+            _app_conn.close()
 
             print(f"  Computing regime series {bt_start} to {bt_end}...")
             regime_series = evaluate_regime_series(bt_start, bt_end, regime_configs)
@@ -1058,7 +1062,7 @@ CREATE INDEX IF NOT EXISTS idx_pbt_created_at ON portfolio_backtest_runs(created
 
 
 def _ensure_portfolio_backtest_table():
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(APP_DB_PATH))
     conn.executescript(PORTFOLIO_BACKTEST_SCHEMA)
     conn.close()
 
@@ -1101,7 +1105,7 @@ def save_portfolio_results(result: dict, output_dir: str = None) -> Path:
 
     try:
         _ensure_portfolio_backtest_table()
-        conn = sqlite3.connect(str(DB_PATH))
+        conn = sqlite3.connect(str(APP_DB_PATH))
         conn.execute("""
             INSERT OR REPLACE INTO portfolio_backtest_runs (
                 run_id, portfolio_id, portfolio_name, created_at,

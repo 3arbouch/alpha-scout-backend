@@ -37,7 +37,7 @@ log = logging.getLogger("macro_data")
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-DB_PATH = Path(os.environ.get("DB_PATH", "/app/data/alphascout.db"))
+from db_config import MARKET_DB_PATH as DB_PATH
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 LEGACY_MACRO_DB = DATA_DIR / "macro" / "macro.db"
 LEGACY_FRED_DIR = DATA_DIR / "macro" / "fred"

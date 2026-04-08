@@ -84,7 +84,7 @@ def load_earnings_data(symbols: list[str], conn) -> dict:
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-DB_PATH = Path(os.environ.get("DB_PATH", "/app/data/alphascout.db"))
+from db_config import MARKET_DB_PATH as DB_PATH
 WORKSPACE = Path(os.environ.get("WORKSPACE", "/app"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 
@@ -2634,7 +2634,7 @@ def save_results(result: dict, strategy_path: str, output_dir: str | None = None
         try:
             from index_backtests import index_result, SCHEMA
             import sqlite3 as _sqlite3
-            _db = Path(os.environ.get("DB_PATH", "/app/data/alphascout.db"))
+            from db_config import APP_DB_PATH as _db
             _conn = _sqlite3.connect(str(_db))
             _conn.executescript(SCHEMA)
             index_result(_conn, filepath)

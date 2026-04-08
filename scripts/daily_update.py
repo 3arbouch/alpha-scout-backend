@@ -27,7 +27,7 @@ from urllib.parse import urlencode
 BASE_URL = "https://financialmodelingprep.com/stable"
 API_KEY = os.environ.get("FMP_API_KEY", "")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
-DB_PATH = Path(os.environ.get("DB_PATH", "/app/data/alphascout.db"))
+from db_config import MARKET_DB_PATH as DB_PATH
 RATE_LIMIT = 2800
 DEFAULT_CONCURRENCY = 30
 

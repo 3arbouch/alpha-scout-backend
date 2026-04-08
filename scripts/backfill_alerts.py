@@ -11,7 +11,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent.parent / "data" / "alphascout.db"
+from db_config import APP_DB_PATH as DB_PATH
 DEPLOYMENTS_DIR = Path(__file__).parent.parent / "deployments"
 
 

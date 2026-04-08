@@ -67,7 +67,7 @@ from deploy_engine import (
 from deploy_engine import deploy_regime, evaluate_regime_one, stop_regime_deployment
 
 _WORKSPACE = Path(os.environ.get("WORKSPACE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")))
-DB_PATH = Path(os.environ.get("DB_PATH", str(_WORKSPACE / "data" / "alphascout.db")))
+from db_config import APP_DB_PATH as DB_PATH
 DEPLOY_DIR = _WORKSPACE / "deployments"
 
 STRAT_CONFIG = {
@@ -607,8 +607,15 @@ check("deployments by status uses index",
 check("trades by symbol+date uses index",
       has_index("SELECT * FROM trades WHERE symbol = ? AND date = ?", ("AAPL", "2024-06-03")))
 
+# prices table is in market.db, check with separate connection
+from db_config import MARKET_DB_PATH
+_mkt_conn = sqlite3.connect(str(MARKET_DB_PATH))
+_mkt_cur = _mkt_conn.cursor()
+_mkt_cur.execute("EXPLAIN QUERY PLAN SELECT * FROM prices WHERE symbol = ? AND date = ?", ("AAPL", "2024-06-03"))
+_mkt_plan = " ".join(str(r) for r in _mkt_cur.fetchall())
+_mkt_conn.close()
 check("prices by symbol+date uses index",
-      has_index("SELECT * FROM prices WHERE symbol = ? AND date = ?", ("AAPL", "2024-06-03")))
+      "SCAN" not in _mkt_plan or "USING INDEX" in _mkt_plan or "SEARCH" in _mkt_plan)
 
 
 # =========================================================================

@@ -27,7 +27,7 @@ from pathlib import Path
 # Config
 # ---------------------------------------------------------------------------
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
-DB_PATH = Path(os.environ.get("DB_PATH", "/app/data/alphascout.db"))
+from db_config import MARKET_DB_PATH as DB_PATH
 ALL_TABLES = ["prices", "income", "balance", "cashflow", "earnings", "insider_trades", "analyst_grades"]
 
 logging.basicConfig(

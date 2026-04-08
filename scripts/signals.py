@@ -26,7 +26,7 @@ from datetime import datetime, timedelta
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-DB_PATH = Path(os.environ.get("DB_PATH", "/app/data/alphascout.db"))
+from db_config import MARKET_DB_PATH as DB_PATH
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
 
 def get_connection():

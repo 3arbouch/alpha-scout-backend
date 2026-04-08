@@ -12,7 +12,7 @@ import os, sys, json, sqlite3, argparse, time
 from pathlib import Path
 from datetime import datetime
 
-DB_PATH = Path(os.environ.get("DB_PATH", "/app/data/alphascout.db"))
+from db_config import APP_DB_PATH as DB_PATH
 RESULTS_DIR = Path(os.environ.get("WORKSPACE", "/app")) / "backtest" / "results"
 
 SCHEMA = """

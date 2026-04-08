@@ -41,7 +41,7 @@ from datetime import datetime
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-DB_PATH = Path(os.environ.get("DB_PATH", "/app/data/alphascout.db"))
+from db_config import MARKET_DB_PATH as DB_PATH
 
 OPERATORS = {
     ">": lambda a, b: a > b,

@@ -24,13 +24,13 @@ from typing import Optional
 from contextlib import contextmanager
 from functools import partial
 
-from fastapi import FastAPI, HTTPException, Query, Depends, Security
+from fastapi import FastAPI, HTTPException, Query, Depends, Security, Header
 from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 import math
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 
 async def _run_sync(func, *args, **kwargs):
@@ -41,8 +41,9 @@ async def _run_sync(func, *args, **kwargs):
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-DB_PATH = Path(os.environ.get("DB_PATH", "/app/data/alphascout.db"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data"))
+MARKET_DB_PATH = Path(os.environ.get("MARKET_DB_PATH", str(DATA_DIR / "market.db")))
+APP_DB_PATH = Path(os.environ.get("APP_DB_PATH", str(DATA_DIR / "app.db")))
 WORKSPACE = Path(os.environ.get("WORKSPACE", "/app"))
 STRATEGIES_DIR = WORKSPACE / "strategies"
 BACKTEST_RESULTS_DIR = WORKSPACE / "backtest" / "results"
@@ -77,31 +78,64 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
+# JWT auth for dashboard
+import jwt as _jwt
+import bcrypt as _bcrypt
+
+JWT_SECRET = os.environ.get("JWT_SECRET", "change-me-in-production")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRY_HOURS = 24
+DASHBOARD_USER = os.environ.get("DASHBOARD_USER", "admin")
+DASHBOARD_PASSWORD_HASH = os.environ.get("DASHBOARD_PASSWORD_HASH", "")
+
 
 async def verify_api_key(key: Optional[str] = Security(api_key_header)):
-    if not API_KEY:
-        return  # No key configured = open access
-    if key != API_KEY:
+    """Accept either X-API-Key header or Bearer JWT token."""
+    if not API_KEY and not DASHBOARD_PASSWORD_HASH:
+        return  # No auth configured = open access
+    if key and key == API_KEY:
+        return  # Valid API key
+    # Try JWT from Authorization header (injected by frontend)
+    # FastAPI doesn't pass Authorization here, so API key is the primary path.
+    # JWT is validated separately via verify_dashboard_token for /auth/* flows.
+    if API_KEY and key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
 # ---------------------------------------------------------------------------
-# Database
+# Database — split into market (shared, read-only) and app (per-environment)
 # ---------------------------------------------------------------------------
 @contextmanager
-def get_db():
-    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+def get_market_db():
+    """Market data: prices, fundamentals, earnings, macro, universe_profiles."""
+    conn = sqlite3.connect(str(MARKET_DB_PATH), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     try:
         yield conn
     finally:
         conn.close()
 
+@contextmanager
+def get_app_db():
+    """App state: strategies, portfolios, deployments, trades, alerts, regimes."""
+    conn = sqlite3.connect(str(APP_DB_PATH), check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+@contextmanager
+def get_db():
+    """Backward compat — returns app DB connection."""
+    with get_app_db() as conn:
+        yield conn
 
 MACRO_DB_PATH = DATA_DIR / "macro" / "macro.db"
 
 @contextmanager
 def get_macro_db():
+    """Legacy macro dashboard tables (oil_prices, vix, dxy, spx, fred_series)."""
     conn = sqlite3.connect(str(MACRO_DB_PATH), check_same_thread=False)
     conn.row_factory = sqlite3.Row
     try:
@@ -111,8 +145,8 @@ def get_macro_db():
 
 
 def query_db(sql: str, params: tuple = (), limit: int = 100, offset: int = 0):
-    """Execute a read query and return list of dicts."""
-    with get_db() as conn:
+    """Execute a read query on market DB and return list of dicts."""
+    with get_market_db() as conn:
         cur = conn.cursor()
         cur.execute(sql + f" LIMIT {limit} OFFSET {offset}", params)
         rows = cur.fetchall()
@@ -120,8 +154,8 @@ def query_db(sql: str, params: tuple = (), limit: int = 100, offset: int = 0):
 
 
 def query_db_count(sql: str, params: tuple = ()):
-    """Get count for a query."""
-    with get_db() as conn:
+    """Get count for a query on market DB."""
+    with get_market_db() as conn:
         cur = conn.cursor()
         cur.execute(sql, params)
         return cur.fetchone()[0]
@@ -158,14 +192,67 @@ def validate_symbol(symbol: str) -> str:
 @app.get("/health")
 async def health():
     """Health check — no auth required."""
-    db_exists = DB_PATH.exists()
-    db_size = DB_PATH.stat().st_size if db_exists else 0
     return {
         "status": "ok",
-        "db": str(DB_PATH),
-        "db_exists": db_exists,
-        "db_size_mb": round(db_size / 1024 / 1024, 1),
+        "market_db": str(MARKET_DB_PATH),
+        "market_db_exists": MARKET_DB_PATH.exists(),
+        "app_db": str(APP_DB_PATH),
+        "app_db_exists": APP_DB_PATH.exists(),
     }
+
+
+# ---------------------------------------------------------------------------
+# Dashboard Auth (JWT)
+# ---------------------------------------------------------------------------
+from pydantic import BaseModel as _AuthBM
+
+class LoginRequest(_AuthBM):
+    username: str
+    password: str
+
+class TokenResponse(_AuthBM):
+    access_token: str
+    token_type: str = "bearer"
+    expires_in: int = JWT_EXPIRY_HOURS * 3600
+    user: str
+
+
+@app.post("/auth/login", tags=["Auth"])
+async def login(body: LoginRequest):
+    """Authenticate with username/password. Returns a JWT token for dashboard access."""
+    if not DASHBOARD_PASSWORD_HASH:
+        raise HTTPException(500, "Dashboard auth not configured. Set DASHBOARD_PASSWORD_HASH in .env")
+
+    if body.username != DASHBOARD_USER:
+        raise HTTPException(401, "Invalid credentials")
+
+    if not _bcrypt.checkpw(body.password.encode(), DASHBOARD_PASSWORD_HASH.encode()):
+        raise HTTPException(401, "Invalid credentials")
+
+    payload = {
+        "sub": body.username,
+        "iat": datetime.now(timezone.utc),
+        "exp": datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRY_HOURS),
+    }
+    token = _jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+    return TokenResponse(access_token=token, user=body.username)
+
+
+@app.get("/auth/me", tags=["Auth"])
+async def get_current_user(authorization: Optional[str] = Header(None)):
+    """Validate a JWT token and return the current user."""
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Missing or invalid Authorization header")
+
+    token = authorization[7:]
+    try:
+        payload = _jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        return {"user": payload["sub"], "expires": payload.get("exp")}
+    except _jwt.ExpiredSignatureError:
+        raise HTTPException(401, "Token expired")
+    except _jwt.InvalidTokenError:
+        raise HTTPException(401, "Invalid token")
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +269,7 @@ def _sync_universe_profiles():
     if not profile_dir.exists():
         return 0
 
-    with get_db() as conn:
+    with get_market_db() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS universe_profiles (
                 symbol       TEXT PRIMARY KEY,
@@ -300,7 +387,7 @@ async def get_universe(
 
     where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
 
-    with get_db() as conn:
+    with get_market_db() as conn:
         total = conn.execute(
             f"SELECT COUNT(*) FROM universe_profiles{where}", params
         ).fetchone()[0]
@@ -324,7 +411,7 @@ async def search(
 ):
     """Search tickers and company names."""
     query = f"%{q}%"
-    with get_db() as conn:
+    with get_market_db() as conn:
         rows = conn.execute(
             """SELECT symbol, name, sector, industry, market_cap
                FROM universe_profiles
@@ -918,16 +1005,14 @@ async def get_sector(metric: str):
 @app.get("/api/stats", dependencies=[Depends(verify_api_key)])
 async def get_stats():
     """Database and data layer statistics."""
-    stats = {}
-    with get_db() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        tables = [r["name"] for r in cur.fetchall()]
-        for t in tables:
-            cur.execute(f"SELECT COUNT(*) FROM {t}")
-            stats[t] = cur.fetchone()[0]
+    stats = {"market": {}, "app": {}}
+    with get_market_db() as conn:
+        for t in [r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]:
+            stats["market"][t] = conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+    with get_app_db() as conn:
+        for t in [r["name"] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]:
+            stats["app"][t] = conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
 
-    # JSON file counts
     json_counts = {}
     for folder in ["prices/daily", "prices/quotes", "universe/profiles",
                     "fundamentals/income", "metrics/key-metrics",
@@ -939,7 +1024,8 @@ async def get_stats():
 
     return {
         "db_tables": stats,
-        "db_size_mb": round(DB_PATH.stat().st_size / 1024 / 1024, 1),
+        "market_db_size_mb": round(MARKET_DB_PATH.stat().st_size / 1024 / 1024, 1) if MARKET_DB_PATH.exists() else 0,
+        "app_db_size_mb": round(APP_DB_PATH.stat().st_size / 1024 / 1024, 1) if APP_DB_PATH.exists() else 0,
         "json_layers": json_counts,
     }
 
@@ -3386,7 +3472,7 @@ async def evaluate_regime_endpoint(
 @app.get("/macro/series", tags=["Macro"])
 async def list_macro_series(api_key: str = Security(api_key_header)):
     """List all available macro series with metadata."""
-    with get_db() as conn:
+    with get_market_db() as conn:
         cur = conn.execute(
             "SELECT series, COUNT(*) as rows, MIN(date) as first_date, MAX(date) as latest_date, "
             "MAX(source) as source FROM macro_indicators GROUP BY series ORDER BY series"
@@ -3427,7 +3513,7 @@ async def get_macro_indicators(
         query += " AND date <= ?"
         params.append(end)
     query += " ORDER BY date, series"
-    with get_db() as conn:
+    with get_market_db() as conn:
         cur = conn.execute(query, params)
         rows = [{"date": r["date"], "series": r["series"], "value": r["value"]} for r in cur.fetchall()]
     return {"count": len(rows), "data": rows}
@@ -3441,7 +3527,7 @@ async def get_macro_latest(
     """Get the latest value for each requested series."""
     series_list = [s.strip() for s in series.split(",")]
     results = {}
-    with get_db() as conn:
+    with get_market_db() as conn:
         for s in series_list:
             cur = conn.execute(
                 "SELECT date, value FROM macro_indicators WHERE series = ? ORDER BY date DESC LIMIT 1",

@@ -6,6 +6,8 @@ logs/
 
 # Environment (contains secrets)
 .env
+.env.dev
+.env.*
 
 # Python
 __pycache__/
