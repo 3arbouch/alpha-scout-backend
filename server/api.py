@@ -1198,32 +1198,10 @@ def _ensure_strategies_table():
 
 
 def _sync_strategies_from_files():
-    """One-time migration: load existing JSON strategy files into the DB table.
-
-    Uses INSERT OR IGNORE so it won't overwrite strategies already in the DB.
-    """
+    """DEPRECATED — DB is the single source of truth for strategies.
+    Kept as a no-op so existing lifespan hook doesn't break."""
     _ensure_strategies_table()
-    if not STRATEGIES_DIR.exists():
-        return 0
-    count = 0
-    with get_db() as conn:
-        for f in STRATEGIES_DIR.glob("*.json"):
-            try:
-                config = json.loads(f.read_text())
-                sid = config.get("strategy_id")
-                if not sid:
-                    continue
-                _normalize_entry(config)
-                conn.execute(
-                    """INSERT OR IGNORE INTO strategies (strategy_id, name, config, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?)""",
-                    (sid, config.get("name", f.stem), json.dumps(config), config.get("created_at"), config.get("updated_at")),
-                )
-                count += 1
-            except (json.JSONDecodeError, OSError):
-                continue
-        conn.commit()
-    return count
+    return 0
 
 
 def _get_strategy_config(strategy_id: str) -> dict | None:
@@ -1238,11 +1216,8 @@ def _get_strategy_config(strategy_id: str) -> dict | None:
 
 
 def _write_strategy_file(strategy_id: str, config: dict):
-    """Write a JSON file for backward compat with the backtest engine CLI."""
-    STRATEGIES_DIR.mkdir(parents=True, exist_ok=True)
-    name_slug = re.sub(r"[^a-z0-9]+", "_", config.get("name", "strategy").lower())[:40]
-    filename = f"{name_slug}_{strategy_id}.json"
-    (STRATEGIES_DIR / filename).write_text(json.dumps(config, indent=2))
+    """DEPRECATED — DB is the single source of truth. No-op."""
+    pass
 
 
 # Create table at import time so endpoints work even without lifespan (e.g. TestClient)
@@ -1816,31 +1791,32 @@ async def deploy_strategy(body: DeployRequest, _: str = Depends(verify_api_key))
 @app.get("/strategies/deployments", tags=["Deployments"])
 async def list_deployments(
     include_stopped: bool = Query(False),
-    strategy_id: Optional[str] = Query(None, description="Filter by strategy_id (exact match)"),
+    type: Optional[str] = Query(None, description="Filter by type: 'strategy' or 'portfolio'"),
     _: str = Depends(verify_api_key),
 ):
-    """List all strategy deployments."""
+    """List all deployments (strategies and portfolios)."""
     from deploy_engine import list_deployments as _list
-    deployments = _list(include_stopped=include_stopped, strategy_id=strategy_id)
+    deployments = _list(include_stopped=include_stopped, deploy_type=type)
     return {
         "total": len(deployments),
         "data": [_sanitize_floats({
             "id": d["id"],
-            "strategy_id": d.get("strategy_id"),
-            "strategy_name": d["strategy_name"],
+            "type": d.get("type", "strategy"),
+            "name": d.get("name", ""),
+            "num_sleeves": d.get("num_sleeves", 1),
             "start_date": d["start_date"],
             "initial_capital": d["initial_capital"],
             "status": d["status"],
             "created_at": d["created_at"],
-            "last_evaluated": d["last_evaluated"],
-            "last_nav": d["last_nav"],
-            "last_return_pct": d["last_return_pct"],
-            "total_entries": d["total_trades"],
-            "closed_trades_count": (d["total_trades"] or 0) - (d["open_positions"] or 0),
-            "open_positions": d["open_positions"],
+            "last_evaluated": d.get("last_evaluated"),
+            "last_nav": d.get("last_nav"),
+            "last_return_pct": d.get("last_return_pct"),
+            "total_trades": d.get("total_trades", 0),
+            "open_positions": d.get("open_positions", 0),
             "last_alpha_pct": d.get("last_alpha_pct"),
             "last_benchmark_return_pct": d.get("last_benchmark_return_pct"),
             "last_sharpe_ratio": d.get("last_sharpe_ratio"),
+            "last_max_drawdown_pct": d.get("last_max_drawdown_pct"),
             "last_ann_volatility_pct": d.get("last_ann_volatility_pct"),
             "rolling_vol_30d_pct": d.get("rolling_vol_30d_pct"),
             "current_utilization_pct": d.get("current_utilization_pct"),
@@ -1849,7 +1825,7 @@ async def list_deployments(
             "utilization_pct": d.get("utilization_pct"),
             "return_on_utilized_capital_pct": d.get("return_on_utilized_capital_pct"),
             "alert_mode": bool(d.get("alert_mode", 0)),
-            "error": d["error"],
+            "error": d.get("error"),
         }) for d in deployments],
     }
 
@@ -1866,8 +1842,6 @@ async def get_deployment(deploy_id: str, _: str = Depends(verify_api_key)):
     if not d:
         raise HTTPException(404, f"Deployment '{deploy_id}' not found")
 
-    latest = d.pop("latest", None)
-
     # Parse stored config
     config = None
     if d.get("config_json"):
@@ -1878,21 +1852,23 @@ async def get_deployment(deploy_id: str, _: str = Depends(verify_api_key)):
 
     result = _sanitize_floats({
         "id": d["id"],
-        "strategy_name": d["strategy_name"],
+        "type": d.get("type", "strategy"),
+        "name": d.get("name", ""),
+        "num_sleeves": d.get("num_sleeves", 1),
         "config": config,
         "start_date": d["start_date"],
         "initial_capital": d["initial_capital"],
         "status": d["status"],
         "created_at": d["created_at"],
-        "last_evaluated": d["last_evaluated"],
-        "last_nav": d["last_nav"],
-        "last_return_pct": d["last_return_pct"],
-        "total_entries": d["total_trades"],
-        "closed_trades_count": (d["total_trades"] or 0) - (d["open_positions"] or 0),
-        "open_positions": d["open_positions"],
+        "last_evaluated": d.get("last_evaluated"),
+        "last_nav": d.get("last_nav"),
+        "last_return_pct": d.get("last_return_pct"),
+        "total_trades": d.get("total_trades", 0),
+        "open_positions": d.get("open_positions", 0),
         "last_alpha_pct": d.get("last_alpha_pct"),
         "last_benchmark_return_pct": d.get("last_benchmark_return_pct"),
         "last_sharpe_ratio": d.get("last_sharpe_ratio"),
+        "last_max_drawdown_pct": d.get("last_max_drawdown_pct"),
         "last_ann_volatility_pct": d.get("last_ann_volatility_pct"),
         "rolling_vol_30d_pct": d.get("rolling_vol_30d_pct"),
         "current_utilization_pct": d.get("current_utilization_pct"),
@@ -1900,42 +1876,20 @@ async def get_deployment(deploy_id: str, _: str = Depends(verify_api_key)):
         "avg_utilized_capital": d.get("avg_utilized_capital"),
         "utilization_pct": d.get("utilization_pct"),
         "return_on_utilized_capital_pct": d.get("return_on_utilized_capital_pct"),
-        "error": d["error"],
+        "error": d.get("error"),
     })
 
-    if latest:
-        metrics = latest.get("metrics", {})
-        # Rename total_trades → closed_trades_count in metrics for consistency
-        if "total_entries" in metrics:
-            metrics["total_entries"] = metrics["total_entries"]
-        if "total_trades" in metrics:
-            metrics["closed_trades_count"] = metrics.pop("total_trades")
-        result["metrics"] = _sanitize_floats(metrics)
-        result["trades"] = latest.get("trades", [])
-        result["closed_trades"] = _sanitize_floats(latest.get("closed_trades", []))
-        result["open_positions_detail"] = _sanitize_floats(latest.get("open_positions", []))
-        result["nav_history"] = latest.get("nav_history", [])
-        result["benchmark"] = _sanitize_floats(latest.get("benchmark"))
-
-        # Compact daily snapshot with utilization metrics
-        initial = d["initial_capital"] or 0
-        daily_snapshot = []
-        for point in latest.get("nav_history", []):
-            invested = point.get("positions_value", 0)
-            cash = point.get("cash", 0)
-            nav = point.get("nav", invested + cash)
-            pnl = nav - initial
-            daily_snapshot.append({
-                "date": point["date"],
-                "nav": round(nav, 2),
-                "invested_capital": round(invested, 2),
-                "idle_capital": round(cash, 2),
-                "utilization_pct": round((invested / nav) * 100, 2) if nav > 0 else 0,
-                "daily_pnl": round(point.get("daily_pnl", 0), 2),
-                "cumulative_return_pct": round((pnl / initial) * 100, 2) if initial > 0 else 0,
-                "return_on_invested_pct": round((pnl / invested) * 100, 2) if invested > 0 else 0,
-            })
-        result["daily_snapshot"] = _sanitize_floats(daily_snapshot)
+    # Rich data from results file (loaded by get_deployment)
+    if d.get("metrics"):
+        result["metrics"] = _sanitize_floats(d["metrics"])
+    if d.get("sleeves"):
+        result["sleeves"] = _sanitize_floats(d["sleeves"])
+    if d.get("nav_history"):
+        result["nav_history"] = d["nav_history"]
+    if d.get("benchmark"):
+        result["benchmark"] = _sanitize_floats(d["benchmark"])
+    if d.get("regime_history"):
+        result["regime_history"] = d["regime_history"]
 
     return result
 

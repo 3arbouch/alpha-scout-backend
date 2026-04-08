@@ -591,7 +591,7 @@ print("\n" + "=" * 70)
 print("TEST 14: Deploy → evaluate → DB roundtrip")
 print("=" * 70)
 
-from deploy_engine_v2 import (
+from deploy_engine import (
     deploy, evaluate_one, get_db, get_deployment,
     stop_deployment, list_deployments,
 )

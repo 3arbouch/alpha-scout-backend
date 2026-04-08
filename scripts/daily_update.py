@@ -378,6 +378,22 @@ async def fetch_prices(tickers):
         data = await fmp_get("historical-price-eod/full", {"symbol": idx, "from": from_date})
         if data: save_merged(data, dedup_date, "prices", "indices", f"{safe}.json")
 
+    # Sector ETFs + SPY — stored in prices/daily like regular tickers so they sync to DB
+    BENCHMARK_ETFS = ["SPY", "XLK", "XLF", "XLE", "XLV", "XLP", "XLY", "XLI", "XLB", "XLRE", "XLC", "XLU"]
+    log.info(f"Fetching benchmark ETFs: {', '.join(BENCHMARK_ETFS)}")
+    for etf in BENCHMARK_ETFS:
+        existing = load("prices", "daily", f"{etf}.json")
+        from_date = "2015-01-01"
+        if existing and isinstance(existing, list) and len(existing) > 0:
+            try:
+                from_date = existing[0].get("date", from_date)
+            except (IndexError, AttributeError):
+                pass
+        data = await fmp_get("historical-price-eod/full", {"symbol": etf, "from": from_date})
+        if data and isinstance(data, list) and len(data) > 0:
+            if save_merged(data, dedup_date, "prices", "daily", f"{etf}.json"):
+                modified_tickers["prices"].add(etf)
+
 async def fetch_fundamentals(tickers):
     log.info("=" * 60)
     log.info("LAYER 3: Fundamentals")

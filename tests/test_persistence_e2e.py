@@ -59,7 +59,7 @@ def approx(a, b, tol=0.5):
 # ---------------------------------------------------------------------------
 # Setup: deploy fresh strategy + portfolio for testing
 # ---------------------------------------------------------------------------
-from deploy_engine_v2 import (
+from deploy_engine import (
     deploy, evaluate_one, evaluate_all, get_db, get_deployment,
     stop_deployment, pause_deployment, resume_deployment,
     list_deployments, set_alert_mode, persist_trades, persist_sleeves,

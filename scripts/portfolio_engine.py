@@ -38,8 +38,8 @@ from copy import deepcopy
 sys.path.insert(0, str(Path(__file__).parent))
 
 from backtest_engine import (
-    run_backtest, load_strategy, compute_benchmark, stamp_strategy_id,
-    get_connection, build_price_index, resolve_universe,
+    run_backtest, load_strategy, validate_strategy, compute_benchmark,
+    stamp_strategy_id, get_connection, build_price_index, resolve_universe,
 )
 from regime import evaluate_regime_series
 
@@ -130,39 +130,29 @@ def compute_portfolio_id(config: dict) -> str:
 def _resolve_strategy_config(strategy_ref: dict) -> dict:
     """
     Resolve a sleeve's strategy reference to a validated config.
-    
-    Three paths, ALL go through load_strategy() validation:
-      1. strategy_id  → look up in strategies/ dir, load & validate
-      2. config_path  → load from file & validate
-      3. strategy_config (inline) → validate, auto-save to strategies/, assign strategy_id
-    
+
+    Three paths:
+      1. strategy_config (inline) → validate directly, stamp strategy_id
+      2. config_path → load from file & validate
+      3. strategy_id → look up from DB (strategies table), validate
+
     Returns a validated strategy config with a strategy_id.
     Raises ValueError if config is invalid or strategy not found.
     """
     if "strategy_config" in strategy_ref or "config" in strategy_ref:
-        # Inline config — validate and auto-save
+        # Inline config — validate directly (no temp files)
         inline = deepcopy(strategy_ref.get("strategy_config") or strategy_ref["config"])
-        
-        # Stamp a strategy_id so it's a first-class strategy
+
+        # Ensure backtest block exists (portfolio overrides it later, but
+        # validate_strategy() requires it for validation)
+        if "backtest" not in inline:
+            inline["backtest"] = {
+                "start": "2015-01-01", "end": "2025-12-31",
+                "entry_price": "next_close", "slippage_bps": 10,
+            }
+
         stamp_strategy_id(inline)
-        
-        # Write to temp file, load through load_strategy() for full validation
-        import tempfile
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False, 
-                                          dir=str(STRATEGIES_DIR)) as f:
-            json.dump(inline, f, indent=2)
-            tmp_path = f.name
-        
-        try:
-            validated = load_strategy(tmp_path)
-        finally:
-            Path(tmp_path).unlink(missing_ok=True)
-        
-        # Auto-save as a real strategy file (load_strategy triggers _persist_strategy_config via stamp)
-        from backtest_engine import _persist_strategy_config
-        _persist_strategy_config(validated)
-        
-        return validated
+        return validate_strategy(inline)
 
     if "config_path" in strategy_ref:
         path = Path(strategy_ref["config_path"])
@@ -172,18 +162,30 @@ def _resolve_strategy_config(strategy_ref: dict) -> dict:
 
     if "strategy_id" in strategy_ref:
         sid = strategy_ref["strategy_id"]
+        # Look up from DB (single source of truth)
+        conn = get_connection()
+        try:
+            row = conn.execute(
+                "SELECT config FROM strategies WHERE strategy_id = ?", (sid,)
+            ).fetchone()
+        finally:
+            conn.close()
+        if row:
+            config = json.loads(row[0])
+            return validate_strategy(config)
+
+        # Fallback: check strategies/ dir for legacy files
         for f in STRATEGIES_DIR.glob("*.json"):
             try:
                 cfg = json.loads(f.read_text())
                 if cfg.get("strategy_id") == sid:
-                    return load_strategy(str(f))
+                    return validate_strategy(cfg)
             except Exception:
                 continue
-        raise ValueError(f"Strategy {sid} not found in {STRATEGIES_DIR}")
+        raise ValueError(f"Strategy {sid} not found in DB or {STRATEGIES_DIR}")
 
     raise ValueError(
-        "Sleeve must reference a strategy via 'strategy_id', 'config_path', or 'strategy_config'. "
-        "Inline strategy configs are validated against the strategy schema."
+        "Sleeve must reference a strategy via 'strategy_id', 'config_path', or 'strategy_config'."
     )
 
 
@@ -936,9 +938,14 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
             "contribution_pct": contribution_pct,
         })
 
-    # Compute benchmark
-    print("\nComputing benchmark (S&P 500)...")
-    benchmark = compute_benchmark(all_dates, initial_capital)
+    # Compute benchmark — use sector ETF for single-sleeve, SPX for multi-sleeve
+    bench_sector = None
+    if len(sleeves) == 1:
+        bench_sector = sleeves[0]["config"].get("universe", {}).get("sector")
+    from backtest_engine import SECTOR_ETF_MAP
+    bench_label = SECTOR_ETF_MAP.get(bench_sector, "S&P 500") if bench_sector else "S&P 500"
+    print(f"\nComputing benchmark ({bench_label})...")
+    benchmark = compute_benchmark(all_dates, initial_capital, sector=bench_sector)
     if benchmark:
         alpha = portfolio_metrics.get("annualized_return_pct", 0) - benchmark["metrics"]["annualized_return_pct"]
         portfolio_metrics["benchmark_return_pct"] = benchmark["metrics"]["total_return_pct"]

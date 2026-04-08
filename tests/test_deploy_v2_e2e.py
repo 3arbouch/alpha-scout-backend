@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-End-to-end test for deploy_engine_v2 (unified deployment model).
+End-to-end test for deploy_engine (unified deployment model).
 
 Tests:
   1. Deploy a single strategy (auto-wrapped as portfolio)
@@ -24,7 +24,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
 
-from deploy_engine_v2 import (
+from deploy_engine import (
     deploy, evaluate_one, evaluate_all, get_db,
     stop_deployment, pause_deployment, resume_deployment,
     list_deployments, get_deployment, set_alert_mode,

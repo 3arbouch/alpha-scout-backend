@@ -37,28 +37,9 @@ def stamp_strategy_id(config: dict) -> dict:
 
 
 def _persist_strategy_config(config: dict) -> Path | None:
-    """Save strategy config to strategies/ if no file with this strategy_id exists yet.
-    Returns the path if created, None if already existed."""
-    strategies_dir = WORKSPACE / "strategies"
-    strategies_dir.mkdir(parents=True, exist_ok=True)
-    sid = config.get("strategy_id")
-    if not sid:
-        return None
-    # Check if any existing file has this strategy_id
-    for f in strategies_dir.glob("*.json"):
-        try:
-            existing = json.loads(f.read_text())
-            if existing.get("strategy_id") == sid:
-                return None  # already exists
-        except (json.JSONDecodeError, OSError):
-            continue
-    # Create new file — exclude backtest-specific overrides from the saved config
-    name_slug = (config.get("name", "strategy") or "strategy").lower().replace(" ", "_").replace("&", "and")[:40]
-    filename = f"{name_slug}_{sid[:8]}.json"
-    path = strategies_dir / filename
-    path.write_text(json.dumps(config, indent=2))
-    print(f"New strategy saved: {path}")
-    return path
+    """DEPRECATED — strategies are persisted to DB only.
+    Kept as a no-op for backward compatibility with callers."""
+    return None
 
 # Add scripts dir to path for signals import
 SCRIPT_DIR = Path(__file__).parent
@@ -373,10 +354,14 @@ def get_config_schema() -> dict:
 
 
 def load_strategy(path: str) -> dict:
-    """Load and validate a strategy config file."""
+    """Load a strategy config from a JSON file and validate it."""
     with open(path) as f:
         config = json.load(f)
+    return validate_strategy(config)
 
+
+def validate_strategy(config: dict) -> dict:
+    """Validate and normalize a strategy config dict. Returns the validated config."""
     # Check required fields
     for field in REQUIRED_FIELDS:
         if field not in config:
@@ -1760,7 +1745,6 @@ def run_backtest(config: dict, force_close_at_end: bool = True,
         - metrics: summary statistics
     """
     stamp_strategy_id(config)
-    _persist_strategy_config(config)
     conn = get_connection()
 
     # Resolve universe
@@ -2022,8 +2006,10 @@ def run_backtest(config: dict, force_close_at_end: bool = True,
     metrics = compute_metrics(portfolio, initial_cash, trading_dates)
 
     # --- Compute benchmark ---
-    print("Computing benchmark (S&P 500)...")
-    benchmark = compute_benchmark(trading_dates, initial_cash)
+    universe_sector = config.get("universe", {}).get("sector")
+    bench_label = SECTOR_ETF_MAP.get(universe_sector, "S&P 500") if universe_sector else "S&P 500"
+    print(f"Computing benchmark ({bench_label})...")
+    benchmark = compute_benchmark(trading_dates, initial_cash, sector=universe_sector)
 
     # --- Compute alpha ---
     if benchmark:
@@ -2293,12 +2279,28 @@ def _do_equal_weight_rebalance(portfolio: Portfolio, price_index: dict, date: st
 # ---------------------------------------------------------------------------
 # Benchmark
 # ---------------------------------------------------------------------------
-def compute_benchmark(trading_dates: list[str], initial_cash: float,
-                      conn=None) -> dict:
-    """
-    Compute S&P 500 buy-and-hold benchmark over the same period.
+SECTOR_ETF_MAP = {
+    "Technology": "XLK",
+    "Healthcare": "XLV",
+    "Financial Services": "XLF",
+    "Energy": "XLE",
+    "Consumer Cyclical": "XLY",
+    "Consumer Defensive": "XLP",
+    "Industrials": "XLI",
+    "Basic Materials": "XLB",
+    "Real Estate": "XLRE",
+    "Communication Services": "XLC",
+    "Utilities": "XLU",
+}
 
-    Tries DB first (SPY), then falls back to index JSON files (GSPC).
+
+def compute_benchmark(trading_dates: list[str], initial_cash: float,
+                      conn=None, sector: str = None) -> dict:
+    """
+    Compute buy-and-hold benchmark over the same period.
+
+    If sector is provided, uses the sector ETF (e.g. XLK for Technology).
+    Falls back to SPY / S&P 500 index for multi-sector or unknown sectors.
 
     Returns:
         {symbol, nav_history: [{date, nav, daily_pnl_pct}], metrics: {...}}
@@ -2306,11 +2308,17 @@ def compute_benchmark(trading_dates: list[str], initial_cash: float,
     price_dict = {}
     bench_symbol = None
 
+    # Build candidate list: sector ETF first, then broad market
+    candidates = []
+    if sector and sector in SECTOR_ETF_MAP:
+        candidates.append(SECTOR_ETF_MAP[sector])
+    candidates.extend(["SPY", "^GSPC", "GSPC"])
+
     # Try DB first
     own_conn = conn is None
     if own_conn:
         conn = get_connection()
-    for sym in ["SPY", "^GSPC", "GSPC"]:
+    for sym in candidates:
         prices = get_prices(sym, start=trading_dates[0], end=trading_dates[-1], conn=conn)
         if prices and len(prices) > 10:
             bench_symbol = sym
@@ -2319,7 +2327,7 @@ def compute_benchmark(trading_dates: list[str], initial_cash: float,
     if own_conn:
         conn.close()
 
-    # Fall back to index JSON
+    # Fall back to index JSON (broad market only)
     if not bench_symbol:
         index_dir = DATA_DIR / "prices" / "indices"
         for fname, label in [("GSPC.json", "S&P 500"), ("DJI.json", "DJIA")]:
