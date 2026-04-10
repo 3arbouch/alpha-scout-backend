@@ -3567,6 +3567,18 @@ async def get_macro_derived(
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Auto-Trader (mounted as sub-router)
+# ---------------------------------------------------------------------------
+try:
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from auto_trader.api import router as auto_trader_router
+    app.include_router(auto_trader_router, dependencies=[Depends(verify_api_key)])
+except ImportError:
+    pass  # auto_trader not available in this environment
+
+
+# ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":

@@ -17,3 +17,6 @@ __pycache__/
 # OS
 .DS_Store
 strategies/
+auto_trader/.prompt_*
+auto_trader/.stop_*
+auto_trader/.starting_*
