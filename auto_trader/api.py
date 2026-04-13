@@ -252,6 +252,8 @@ class CreateRunRequest(BaseModel):
     capital: float = Field(default=1_000_000, description="Initial capital")
     model: str = Field(default="sonnet", description="Claude model: sonnet, opus, haiku")
     max_experiments: int = Field(default=1000, ge=1, le=10000, description="Safety cap. Default 1000.")
+    sector: str | None = Field(default=None, description="Restrict to a sector (e.g. 'Energy', 'Technology'). If set, data queries only return stocks in this sector.")
+    alpha_benchmark: str = Field(default="auto", description="Benchmark for alpha: 'sector' (sector ETF), 'market' (SPY), 'auto' (sector if sector is set, else market)")
     starting_portfolio: dict | None = Field(default=None, description="Optional starting portfolio config.")
 
 
@@ -312,6 +314,16 @@ async def get_config():
              }.get(m, "")}
             for m in VALID_METRICS
         ],
+        "sectors": [
+            "Technology", "Healthcare", "Financial Services", "Energy",
+            "Consumer Cyclical", "Consumer Defensive", "Industrials",
+            "Basic Materials", "Real Estate", "Communication Services", "Utilities",
+        ],
+        "alpha_benchmarks": [
+            {"id": "auto", "description": "Sector ETF if sector is set, SPY otherwise"},
+            {"id": "sector", "description": "Sector ETF (e.g. XLE for Energy)"},
+            {"id": "market", "description": "S&P 500 (SPY)"},
+        ],
         "defaults": {
             "metric": "sharpe_ratio",
             "model": "sonnet",
@@ -319,6 +331,8 @@ async def get_config():
             "max_experiments": 1000,
             "start": "2015-01-01",
             "end": "2024-12-31",
+            "sector": None,
+            "alpha_benchmark": "auto",
         },
     }
 
@@ -477,6 +491,18 @@ async def create_run(body: CreateRunRequest):
     run_id = _generate_run_id(body.name)
     now = datetime.now(timezone.utc).isoformat()
 
+    # Validate sector
+    valid_sectors = ["Technology", "Healthcare", "Financial Services", "Energy",
+                     "Consumer Cyclical", "Consumer Defensive", "Industrials",
+                     "Basic Materials", "Real Estate", "Communication Services", "Utilities"]
+    if body.sector and body.sector not in valid_sectors:
+        raise HTTPException(400, f"Invalid sector: '{body.sector}'. Valid: {valid_sectors}")
+
+    # Resolve alpha benchmark
+    alpha_benchmark = body.alpha_benchmark
+    if alpha_benchmark == "auto":
+        alpha_benchmark = "sector" if body.sector else "market"
+
     config = {
         "metric": body.metric,
         "conditions": body.conditions,
@@ -485,6 +511,8 @@ async def create_run(body: CreateRunRequest):
         "capital": body.capital,
         "model": body.model,
         "max_experiments": body.max_experiments,
+        "sector": body.sector,
+        "alpha_benchmark": alpha_benchmark,
     }
     if body.starting_portfolio:
         config["starting_portfolio"] = body.starting_portfolio
@@ -560,6 +588,11 @@ async def start_run(run_id: str, body: StartRunRequest = StartRunRequest()):
     ]
     for cond in config.get("conditions", []):
         cmd.extend(["--condition", cond])
+
+    if config.get("sector"):
+        cmd.extend(["--sector", config["sector"]])
+    if config.get("alpha_benchmark"):
+        cmd.extend(["--alpha-benchmark", config["alpha_benchmark"]])
 
     if config.get("starting_portfolio"):
         sp_file = PROJECT_ROOT / "auto_trader" / f".starting_{run_id}.json"

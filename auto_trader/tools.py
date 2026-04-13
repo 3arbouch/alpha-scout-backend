@@ -23,8 +23,9 @@ from claude_agent_sdk import tool, create_sdk_mcp_server
 MARKET_DB_PATH = Path(os.environ.get("MARKET_DB_PATH",
     str(Path(__file__).parent.parent / "data" / "market.db")))
 
-# Date cutoff — set by create_auto_trader_tools() at runtime
+# Filters — set by create_auto_trader_tools() at runtime
 _STOP_DATE: str | None = None
+_SECTOR: str | None = None
 
 # Tables that have a date column (for silent filtering)
 DATE_COLUMN_MAP = {
@@ -97,13 +98,29 @@ def execute_query(sql: str) -> dict:
         conn = sqlite3.connect(str(MARKET_DB_PATH))
         conn.row_factory = sqlite3.Row
 
-        # Create temporary views that filter by stop date
-        if _STOP_DATE:
-            for table, date_col in DATE_COLUMN_MAP.items():
-                conn.execute(f"""
-                    CREATE TEMP VIEW IF NOT EXISTS {table} AS
-                    SELECT * FROM main.{table} WHERE {date_col} <= '{_STOP_DATE}'
-                """)
+        # Build WHERE clauses for temp views
+        # Tables with a symbol column that should be sector-filtered
+        SYMBOL_TABLES = {"prices", "income", "balance", "cashflow", "earnings",
+                         "insider_trades", "analyst_grades"}
+
+        for table, date_col in DATE_COLUMN_MAP.items():
+            conditions = []
+            if _STOP_DATE:
+                conditions.append(f"{date_col} <= '{_STOP_DATE}'")
+            if _SECTOR and table in SYMBOL_TABLES:
+                conditions.append(
+                    f"symbol IN (SELECT symbol FROM main.universe_profiles WHERE sector = '{_SECTOR}')"
+                )
+            if conditions:
+                where = " AND ".join(conditions)
+                conn.execute(f"CREATE TEMP VIEW IF NOT EXISTS {table} AS SELECT * FROM main.{table} WHERE {where}")
+
+        # Filter universe_profiles by sector (but keep it queryable)
+        if _SECTOR:
+            conn.execute(f"""
+                CREATE TEMP VIEW IF NOT EXISTS universe_profiles AS
+                SELECT * FROM main.universe_profiles WHERE sector = '{_SECTOR}'
+            """)
 
         cursor = conn.execute(sql)
         rows = cursor.fetchmany(500)
@@ -242,14 +259,16 @@ async def validate_portfolio_tool(args: dict[str, Any]) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": json.dumps(result)}]}
 
 
-def create_auto_trader_tools(stop_date: str | None = None):
+def create_auto_trader_tools(stop_date: str | None = None, sector: str | None = None):
     """Create the MCP server with auto-trader tools.
 
     Args:
         stop_date: If set, silently filters all query results to dates <= stop_date.
+        sector: If set, silently filters stock data to only this sector.
     """
-    global _STOP_DATE
+    global _STOP_DATE, _SECTOR
     _STOP_DATE = stop_date
+    _SECTOR = sector
 
     return create_sdk_mcp_server(
         name="auto_trader",

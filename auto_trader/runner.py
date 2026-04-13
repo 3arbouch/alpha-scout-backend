@@ -275,10 +275,12 @@ def normalize_config(portfolio_config: dict) -> dict:
     return config
 
 
-def run_backtest(portfolio_config: dict, start: str, end: str, capital: float) -> dict | None:
-    """Run a portfolio backtest. Returns metrics dict or None on failure."""
+def run_backtest(portfolio_config: dict, start: str, end: str, capital: float,
+                 sector: str | None = None) -> dict | None:
+    """Run a portfolio backtest. Returns metrics dict with both market and sector alpha."""
     try:
         from portfolio_engine import run_portfolio_backtest
+        from backtest_engine import compute_benchmark, SECTOR_ETF_MAP
 
         config = normalize_config(portfolio_config)
         config["backtest"] = {
@@ -288,7 +290,32 @@ def run_backtest(portfolio_config: dict, start: str, end: str, capital: float) -
         }
 
         result = run_portfolio_backtest(config, force_close_at_end=True)
-        return result.get("metrics", {})
+        metrics = result.get("metrics", {})
+
+        # The portfolio engine already computed one benchmark (SPY or sector ETF).
+        # We need to ensure we have BOTH market and sector alphas.
+        nav_history = result.get("combined_nav_history", [])
+        if nav_history:
+            trading_dates = [p["date"] for p in nav_history]
+            final_nav = nav_history[-1]["nav"]
+            ann_return = metrics.get("annualized_return_pct", 0)
+
+            # Market benchmark (SPY) — always compute
+            market_bench = compute_benchmark(trading_dates, capital, sector=None)
+            if market_bench:
+                market_ann = market_bench["metrics"]["annualized_return_pct"]
+                metrics["alpha_vs_market_pct"] = round(ann_return - market_ann, 2)
+                metrics["market_benchmark_return_pct"] = market_bench["metrics"]["total_return_pct"]
+
+            # Sector benchmark — compute if sector is set
+            if sector and sector in SECTOR_ETF_MAP:
+                sector_bench = compute_benchmark(trading_dates, capital, sector=sector)
+                if sector_bench:
+                    sector_ann = sector_bench["metrics"]["annualized_return_pct"]
+                    metrics["alpha_vs_sector_pct"] = round(ann_return - sector_ann, 2)
+                    metrics["sector_benchmark_return_pct"] = sector_bench["metrics"]["total_return_pct"]
+
+        return metrics
     except Exception as e:
         print(f"  Backtest failed: {e}")
         import traceback
@@ -306,6 +333,8 @@ async def run_agent_iteration(
     backtest_end: str,
     initial_capital: float,
     model: str,
+    sector: str | None = None,
+    alpha_benchmark: str = "market",
 ) -> dict:
     """Run a single agent iteration. Returns experiment result."""
     from claude_agent_sdk import query, ClaudeAgentOptions
@@ -320,13 +349,17 @@ async def run_agent_iteration(
         f"{c['metric']} {c['operator']} {c['value']}" for c in conditions
     )
 
-    prompt = f"""You are on iteration {iteration} of an autonomous research loop.
+    sector_desc = f"\n**Sector:** {sector} — All data queries are restricted to {sector} stocks only. Alpha is measured against the {sector} sector ETF." if sector else ""
+    benchmark_desc = f"sector ETF" if alpha_benchmark == "sector" else "S&P 500 (SPY)"
+
+    prompt = f"""You are on experiment {iteration} of an autonomous research loop.
 
 **Objective:** Design a portfolio that {"maximizes" if METRIC_DIRECTION.get(target_metric, True) else "minimizes"} `{target_metric}`.
 **Conditions:** {conditions_desc if conditions else 'None'}
 **Backtest period:** {backtest_start} to {backtest_end}
 **Capital:** ${initial_capital:,.0f}
-{"**Current best " + target_metric + ":** " + f"{best_value:.4f}" if best_value is not None else "**No best yet — this is the first iteration.**"}
+**Alpha benchmark:** {benchmark_desc}{sector_desc}
+{"**Current best " + target_metric + ":** " + f"{best_value:.4f}" if best_value is not None else "**No best yet — this is the first experiment.**"}
 
 **Knowledge cutoff: {backtest_end}**
 You are researching as of {backtest_end}. You do not know what happens after this date.
@@ -349,7 +382,7 @@ Remember: query the data first, don't guess. Explore before you commit."""
     agent_output = []
     tool_calls = 0
     session_id = None
-    auto_trader_tools = create_auto_trader_tools(stop_date=backtest_end)
+    auto_trader_tools = create_auto_trader_tools(stop_date=backtest_end, sector=sector)
     try:
         async for message in query(
             prompt=prompt,
@@ -458,7 +491,7 @@ Remember: query the data first, don't guess. Explore before you commit."""
     # Run backtest
     print(f"  Running backtest ({backtest_start} to {backtest_end})...")
     emit_event(run_id, "backtest_started", {"experiment_number": iteration})
-    metrics = run_backtest(portfolio_config, backtest_start, backtest_end, initial_capital)
+    metrics = run_backtest(portfolio_config, backtest_start, backtest_end, initial_capital, sector=sector)
 
     if metrics is None:
         exp_id = log_experiment(
@@ -472,6 +505,12 @@ Remember: query the data first, don't guess. Explore before you commit."""
             session_id=session_id, duration_seconds=time.time() - t0, error="Backtest failed",
         )
         return {"decision": "discard", "error": "backtest_failed", "id": exp_id}
+
+    # Map alpha_ann_pct to the right benchmark based on run config
+    if alpha_benchmark == "sector" and "alpha_vs_sector_pct" in metrics:
+        metrics["alpha_ann_pct"] = metrics["alpha_vs_sector_pct"]
+    elif "alpha_vs_market_pct" in metrics:
+        metrics["alpha_ann_pct"] = metrics["alpha_vs_market_pct"]
 
     # Score
     target_value = metrics.get(target_metric)
@@ -557,6 +596,8 @@ async def main():
     parser.add_argument("--history", type=int, default=10, help="Past experiments to show agent")
     parser.add_argument("--prompt-file", type=str, default=None, help="Path to prompt file (from API)")
     parser.add_argument("--starting-portfolio", type=str, default=None, help="Path to starting portfolio config JSON")
+    parser.add_argument("--sector", type=str, default=None, help="Restrict data queries to this sector")
+    parser.add_argument("--alpha-benchmark", type=str, default="market", help="Benchmark: sector or market")
     args = parser.parse_args()
 
     if args.metric not in VALID_METRICS:
@@ -679,6 +720,8 @@ async def main():
             backtest_end=args.end,
             initial_capital=args.capital,
             model=args.model,
+            sector=args.sector,
+            alpha_benchmark=args.alpha_benchmark,
         )
 
         if result["decision"] == "keep" and result.get("target_value") is not None:
