@@ -69,6 +69,11 @@ CREATE TABLE IF NOT EXISTS deployments (
     avg_utilized_capital REAL,
     utilization_pct REAL,
     return_on_utilized_capital_pct REAL,
+    -- Dual benchmark
+    alpha_vs_market_pct REAL,
+    alpha_vs_sector_pct REAL,
+    market_benchmark_return_pct REAL,
+    sector_benchmark_return_pct REAL,
     -- Portfolio-specific
     active_regimes TEXT,                     -- JSON array of active regime names
     sleeve_summary TEXT,                     -- JSON array of per-sleeve summaries
@@ -588,6 +593,8 @@ def evaluate_one(deploy_id: str) -> dict | None:
                current_utilization_pct = ?,
                peak_utilized_capital = ?, avg_utilized_capital = ?,
                utilization_pct = ?, return_on_utilized_capital_pct = ?,
+               alpha_vs_market_pct = ?, alpha_vs_sector_pct = ?,
+               market_benchmark_return_pct = ?, sector_benchmark_return_pct = ?,
                active_regimes = ?, sleeve_summary = ?,
                error = NULL
                WHERE id = ?""",
@@ -601,6 +608,8 @@ def evaluate_one(deploy_id: str) -> dict | None:
              metrics.get("avg_utilized_capital"),
              metrics.get("utilization_pct"),
              metrics.get("return_on_utilized_capital_pct"),
+             metrics.get("alpha_vs_market_pct"), metrics.get("alpha_vs_sector_pct"),
+             metrics.get("market_benchmark_return_pct"), metrics.get("sector_benchmark_return_pct"),
              json.dumps(active_regimes), json.dumps(per_sleeve),
              deploy_id),
         )

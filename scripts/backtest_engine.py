@@ -2005,18 +2005,32 @@ def run_backtest(config: dict, force_close_at_end: bool = True,
     # --- Compute metrics ---
     metrics = compute_metrics(portfolio, initial_cash, trading_dates)
 
-    # --- Compute benchmark ---
+    # --- Compute benchmarks ---
     universe_sector = config.get("universe", {}).get("sector")
-    bench_label = SECTOR_ETF_MAP.get(universe_sector, "S&P 500") if universe_sector else "S&P 500"
-    print(f"Computing benchmark ({bench_label})...")
-    benchmark = compute_benchmark(trading_dates, initial_cash, sector=universe_sector)
+    ann_return = metrics["annualized_return_pct"]
 
-    # --- Compute alpha ---
-    if benchmark:
-        alpha = metrics["annualized_return_pct"] - benchmark["metrics"]["annualized_return_pct"]
-        metrics["benchmark_return_pct"] = benchmark["metrics"]["total_return_pct"]
-        metrics["benchmark_ann_return_pct"] = benchmark["metrics"]["annualized_return_pct"]
-        metrics["alpha_ann_pct"] = round(alpha, 2)
+    # Market benchmark (SPY) — always compute
+    print("Computing benchmark (S&P 500)...")
+    market_benchmark = compute_benchmark(trading_dates, initial_cash, sector=None)
+    if market_benchmark:
+        market_ann = market_benchmark["metrics"]["annualized_return_pct"]
+        metrics["alpha_vs_market_pct"] = round(ann_return - market_ann, 2)
+        metrics["market_benchmark_return_pct"] = market_benchmark["metrics"]["total_return_pct"]
+        # Backward compat
+        metrics["benchmark_return_pct"] = market_benchmark["metrics"]["total_return_pct"]
+        metrics["benchmark_ann_return_pct"] = market_benchmark["metrics"]["annualized_return_pct"]
+        metrics["alpha_ann_pct"] = metrics["alpha_vs_market_pct"]
+
+    # Sector benchmark — compute if strategy has a sector universe
+    benchmark = market_benchmark
+    if universe_sector and universe_sector in SECTOR_ETF_MAP:
+        print(f"Computing benchmark ({SECTOR_ETF_MAP[universe_sector]})...")
+        sector_benchmark = compute_benchmark(trading_dates, initial_cash, sector=universe_sector)
+        if sector_benchmark:
+            sector_ann = sector_benchmark["metrics"]["annualized_return_pct"]
+            metrics["alpha_vs_sector_pct"] = round(ann_return - sector_ann, 2)
+            metrics["sector_benchmark_return_pct"] = sector_benchmark["metrics"]["total_return_pct"]
+            benchmark = sector_benchmark
 
     from datetime import datetime, timezone
     # Build open positions list from portfolio
