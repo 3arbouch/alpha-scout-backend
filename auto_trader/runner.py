@@ -41,7 +41,7 @@ def generate_run_id() -> str:
     return hashlib.md5(raw.encode()).hexdigest()[:10]
 
 
-def load_schemas() -> str:
+def _load_schemas() -> str:
     """Load strategy and portfolio schemas from the engines."""
     import json as _json
     try:
@@ -49,10 +49,21 @@ def load_schemas() -> str:
         from portfolio_engine import get_config_schema as portfolio_schema
         strat = _json.dumps(strategy_schema(), indent=2)
         port = _json.dumps(portfolio_schema(), indent=2)
+
+        thesis_schema = _json.dumps({
+            "thesis": {
+                "thesis": {"type": "string", "description": "A clear 2-3 sentence investment thesis"},
+                "assumptions": {"type": "array", "items": "string", "description": "List of assumptions that must hold for this thesis to work"},
+            },
+            "portfolio": "(see Portfolio Config Schema below)",
+        }, indent=2)
+
         return (
-            "## Strategy Config Schema (authoritative — only use fields/values listed here)\n\n"
+            "### Thesis Output Schema\n\n"
+            f"```json\n{thesis_schema}\n```\n\n"
+            "### Strategy Config Schema (authoritative — only use fields/values listed here)\n\n"
             f"```json\n{strat}\n```\n\n"
-            "## Portfolio Config Schema\n\n"
+            "### Portfolio Config Schema\n\n"
             f"```json\n{port}\n```"
         )
     except Exception as e:
@@ -62,25 +73,48 @@ def load_schemas() -> str:
 _custom_prompt = None
 
 def load_program() -> str:
-    """Load the user's system prompt with schemas injected."""
+    """Build the full system prompt: system.md + agent prompt + schemas."""
+    # Fixed system instructions
+    system_path = Path(__file__).parent / "system.md"
+    system_instructions = system_path.read_text()
+
+    # Agent prompt (custom or default)
     if _custom_prompt:
-        program = _custom_prompt
+        agent_prompt = _custom_prompt
     else:
-        path = Path(__file__).parent / "program.md"
-        program = path.read_text()
-    schemas = load_schemas()
-    return program + "\n\n---\n\n" + schemas
+        agent_prompt = (Path(__file__).parent / "program.md").read_text()
+
+    # Dynamic schemas
+    schemas = _load_schemas()
+
+    return system_instructions + "\n\n---\n\n" + agent_prompt + "\n\n---\n\n" + schemas
 
 
 def parse_thesis(agent_output: str) -> dict | None:
-    """Extract the thesis JSON from the agent's output."""
-    match = re.search(r"<thesis>\s*(\{.*?\})\s*</thesis>", agent_output, re.DOTALL)
-    if not match:
-        return None
-    try:
-        return json.loads(match.group(1))
-    except json.JSONDecodeError:
-        return None
+    """Extract the thesis JSON from the agent's output.
+
+    Scans for a JSON object containing both 'thesis' and 'portfolio' keys.
+    """
+    # Find all JSON-like blocks in the output
+    depth = 0
+    start = None
+    for i, ch in enumerate(agent_output):
+        if ch == '{':
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0 and start is not None:
+                candidate = agent_output[start:i+1]
+                try:
+                    parsed = json.loads(candidate)
+                    if isinstance(parsed, dict) and "thesis" in parsed and "portfolio" in parsed:
+                        return parsed
+                except json.JSONDecodeError:
+                    pass
+                start = None
+    return None
 
 
 def build_history_context(run_id: str, target_metric: str, limit: int = 20) -> str:
@@ -403,8 +437,14 @@ Remember: query the data first, don't guess. Explore before you commit."""
         )
         return {"decision": "discard", "error": "parse_failed", "id": exp_id}
 
-    thesis = thesis_data.get("thesis", "")
-    assumptions = thesis_data.get("assumptions", [])
+    # Extract thesis (handles both flat and nested formats)
+    thesis_obj = thesis_data.get("thesis", {})
+    if isinstance(thesis_obj, dict):
+        thesis = thesis_obj.get("thesis", "")
+        assumptions = thesis_obj.get("assumptions", [])
+    else:
+        thesis = str(thesis_obj)
+        assumptions = thesis_data.get("assumptions", [])
     portfolio_config = thesis_data.get("portfolio", {})
 
     print(f"  Thesis: {thesis[:100]}...")

@@ -36,16 +36,35 @@ PROJECT_ROOT = Path(__file__).parent.parent
 DEFAULT_PROMPT = (Path(__file__).parent / "program.md").read_text()
 
 # ---------------------------------------------------------------------------
-# Runs table schema
+# Schema
 # ---------------------------------------------------------------------------
 
-RUNS_SCHEMA = """
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS auto_trader_templates (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    category TEXT NOT NULL,
+    description TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_att_category ON auto_trader_templates(category);
+
+CREATE TABLE IF NOT EXISTS auto_trader_agents (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS auto_trader_runs (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending',
     config TEXT NOT NULL,
-    prompt TEXT NOT NULL,
     current_iteration INTEGER DEFAULT 0,
     max_experiments INTEGER NOT NULL,
     best_metric_value REAL,
@@ -55,44 +74,199 @@ CREATE TABLE IF NOT EXISTS auto_trader_runs (
     started_at TEXT,
     completed_at TEXT,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (agent_id) REFERENCES auto_trader_agents(id)
 );
 CREATE INDEX IF NOT EXISTS idx_atr_status ON auto_trader_runs(status);
+CREATE INDEX IF NOT EXISTS idx_atr_agent ON auto_trader_runs(agent_id);
 """
 
 
-def _ensure_runs_table():
+SEED_TEMPLATES = [
+    {
+        "id": "default",
+        "name": "Default Researcher",
+        "category": "general",
+        "description": "Balanced multi-sector portfolio researcher. Explores all sectors, fundamentals, and macro conditions.",
+        "prompt": """# Default Portfolio Researcher
+
+You are an autonomous portfolio researcher. Your job is to explore market data,
+form an investment thesis, and design a portfolio that optimizes for a target metric.
+
+Your goal is to understand market dynamics and regimes, and which strategies work
+best within these regimes. You have access to market data within a certain period,
+but your objective is to form an investment thesis that works beyond that period —
+you will be deployed live on data you have never seen. Form a deep, fundamental
+understanding of what drives winners and losers. Do not overfit to the training period.
+
+## What You Can Explore
+
+- Price patterns: drawdowns, mean reversion, momentum, sector rotation
+- Fundamentals: earnings beats, revenue growth, margin expansion, valuation
+- Macro regimes: VIX levels, yield curves, oil prices, credit spreads, inflation
+- Cross-asset relationships: how do macro conditions affect different sectors?
+- Historical precedents: what worked in past selloffs, rate cycles, recessions?
+
+## Your Process
+
+1. **Research** — Query the market database to understand current and historical conditions.
+   Follow chains of reasoning — if something is interesting, dig deeper.
+
+2. **Form a thesis** — Write a clear investment thesis with explicit assumptions.
+   What market conditions does this exploit? Why should it work? What could go wrong?
+
+3. **Design the portfolio** — Translate your thesis into a concrete portfolio configuration
+   with strategy sleeves, capital weights, entry/exit conditions, and regime gates.""",
+    },
+    {
+        "id": "energy_specialist",
+        "name": "Energy Specialist",
+        "category": "energy",
+        "description": "Focused on energy sector stocks. Analyzes oil prices, natural gas, refining margins, and energy fundamentals.",
+        "prompt": """# Energy Specialist
+
+You are a portfolio researcher specializing in the energy sector. Your expertise is
+in oil & gas companies, refiners, pipelines, and energy infrastructure.
+
+Your goal is to understand energy market dynamics and regimes, and which strategies work
+best within these regimes. You have access to market data within a certain period,
+but your objective is to form an investment thesis that works beyond that period —
+you will be deployed live on data you have never seen. Form a deep, fundamental
+understanding of what drives winners and losers in energy. Do not overfit to the training period.
+
+## What You Can Explore
+
+- Oil price dynamics: Brent, WTI, price vs 50/200 DMA, breakout signals
+- Natural gas prices and seasonal patterns
+- Energy company fundamentals: revenue tied to commodity prices, margins, capex cycles
+- Refining margins and crack spreads (via refiner earnings)
+- Macro indicators: inflation, USD strength, geopolitical risk proxies (VIX, credit spreads)
+- Insider buying in energy names during selloffs
+- Earnings momentum among energy producers vs servicers
+
+## Your Process
+
+1. **Research** — Start with the macro energy environment: oil prices, natural gas, VIX.
+   Then drill into individual energy companies: earnings beats, revenue growth, margins.
+   Compare E&P companies vs midstream vs refiners vs renewables.
+
+2. **Form a thesis** — Build an energy-focused thesis. What's driving energy prices?
+   Which sub-sectors benefit? Are valuations attractive relative to commodity prices?
+
+3. **Design the portfolio** — Build a portfolio concentrated in energy stocks.
+   Consider regime gating based on oil price levels or VIX.
+   Use drawdown-based entries to buy quality energy names during selloffs.""",
+    },
+    {
+        "id": "tech_momentum",
+        "name": "Tech Momentum",
+        "category": "technology",
+        "description": "Growth-focused tech researcher. Targets high-growth technology stocks with strong earnings execution.",
+        "prompt": """# Tech Momentum Researcher
+
+You are a portfolio researcher focused on high-growth technology stocks. You look for
+companies with accelerating revenue, expanding margins, and strong earnings execution.
+
+Your goal is to understand technology market dynamics and regimes, and which strategies work
+best within these regimes. You have access to market data within a certain period,
+but your objective is to form an investment thesis that works beyond that period —
+you will be deployed live on data you have never seen. Form a deep, fundamental
+understanding of what drives winners and losers in tech. Do not overfit to the training period.
+
+## What You Can Explore
+
+- Technology sector performance vs broad market
+- Earnings momentum: which tech companies consistently beat estimates?
+- Revenue acceleration: consecutive quarters of improving YoY growth
+- Margin expansion: operating and net margin trends in software, semis, cloud
+- Valuation: PE percentile rankings within tech to avoid overpaying
+- Price momentum: which tech names are leading the sector?
+- Analyst sentiment: upgrade/downgrade activity in tech names
+
+## Your Process
+
+1. **Research** — Analyze the technology sector landscape. Which sub-industries are
+   outperforming (SaaS, semis, cybersecurity, AI)? Which companies have the best
+   earnings track record? Look at revenue growth rates and margin trends.
+
+2. **Form a thesis** — Identify the tech themes that drive alpha. Is it earnings
+   momentum? Revenue acceleration? Margin turnarounds? What macro conditions
+   support tech outperformance (low rates, strong growth)?
+
+3. **Design the portfolio** — Build a tech-concentrated portfolio. Use earnings
+   momentum and revenue growth as entry signals. Rank by PE percentile to avoid
+   overvalued names. Consider take-profit rules to lock in gains from volatile tech.""",
+    },
+]
+
+
+def _ensure_tables():
     conn = get_db()
-    conn.executescript(RUNS_SCHEMA)
+    conn.executescript(SCHEMA)
+    # Create default agent if none exists
+    existing = conn.execute("SELECT COUNT(*) FROM auto_trader_agents").fetchone()[0]
+    if existing == 0:
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "INSERT INTO auto_trader_agents (id, name, prompt, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            ("default", "Default Agent", DEFAULT_PROMPT, now, now),
+        )
+        conn.commit()
+    # Seed templates
+    existing_templates = conn.execute("SELECT COUNT(*) FROM auto_trader_templates").fetchone()[0]
+    if existing_templates == 0:
+        now = datetime.now(timezone.utc).isoformat()
+        for t in SEED_TEMPLATES:
+            conn.execute(
+                "INSERT INTO auto_trader_templates (id, name, category, description, prompt, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (t["id"], t["name"], t["category"], t["description"], t["prompt"], now, now),
+            )
+        conn.commit()
     conn.close()
 
 
-_ensure_runs_table()
+_ensure_tables()
 
 
 # ---------------------------------------------------------------------------
 # Request/Response models
 # ---------------------------------------------------------------------------
 
+class CreateAgentRequest(BaseModel):
+    name: str = Field(description="Agent name, e.g. 'Energy Specialist', 'Conservative Alpha'")
+    prompt: str | None = Field(default=None, description="Agent prompt. If omitted, uses the default prompt.")
+
+
+class UpdateAgentRequest(BaseModel):
+    name: str | None = Field(default=None, description="Update agent name")
+    prompt: str | None = Field(default=None, description="Update agent prompt")
+
+
 class CreateRunRequest(BaseModel):
     name: str = Field(description="Human-readable run name")
+    agent_id: str = Field(default="default", description="Agent ID to use for this run")
     metric: str = Field(description="Metric to optimize: sharpe_ratio, alpha_ann_pct, annualized_volatility_pct, max_drawdown_pct")
     conditions: list[str] = Field(default_factory=list, description="Optional conditions, e.g. ['alpha_ann_pct > 0', 'annualized_volatility_pct < 20']")
     start: str = Field(description="Training period start (YYYY-MM-DD)")
     end: str = Field(description="Training period end (YYYY-MM-DD)")
     capital: float = Field(default=1_000_000, description="Initial capital")
     model: str = Field(default="sonnet", description="Claude model: sonnet, opus, haiku")
-    max_experiments: int = Field(default=1000, ge=1, le=10000, description="Safety cap. Run stops automatically when reached. Default 1000.")
-    starting_portfolio: dict | None = Field(default=None, description="Optional starting portfolio config. Backtested as iteration 0.")
-
-
-class UpdatePromptRequest(BaseModel):
-    prompt: str = Field(description="The user-editable agent prompt")
+    max_experiments: int = Field(default=1000, ge=1, le=10000, description="Safety cap. Default 1000.")
+    starting_portfolio: dict | None = Field(default=None, description="Optional starting portfolio config.")
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _get_agent(agent_id: str) -> dict:
+    conn = get_db()
+    row = conn.execute("SELECT * FROM auto_trader_agents WHERE id = ?", (agent_id,)).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(404, f"Agent '{agent_id}' not found")
+    return dict(row)
+
 
 def _get_run(run_id: str) -> dict:
     conn = get_db()
@@ -149,6 +323,144 @@ async def get_config():
     }
 
 
+# ---------------------------------------------------------------------------
+# Agent CRUD
+# ---------------------------------------------------------------------------
+
+@router.post("/agents", status_code=201)
+async def create_agent(body: CreateAgentRequest):
+    """Create a new auto-trader agent with a custom prompt."""
+    agent_id = _generate_run_id(body.name)  # reuse the slug+hash generator
+    now = datetime.now(timezone.utc).isoformat()
+    prompt = body.prompt or DEFAULT_PROMPT
+
+    conn = get_db()
+    conn.execute(
+        "INSERT INTO auto_trader_agents (id, name, prompt, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+        (agent_id, body.name, prompt, now, now),
+    )
+    conn.commit()
+    conn.close()
+
+    return {"id": agent_id, "name": body.name, "prompt_length": len(prompt)}
+
+
+@router.get("/agents")
+async def list_agents():
+    """List all auto-trader agents."""
+    conn = get_db()
+    rows = conn.execute("SELECT id, name, created_at, updated_at FROM auto_trader_agents ORDER BY created_at").fetchall()
+    conn.close()
+
+    # Count runs per agent
+    results = []
+    conn = get_db()
+    for r in rows:
+        d = dict(r)
+        d["run_count"] = conn.execute(
+            "SELECT COUNT(*) FROM auto_trader_runs WHERE agent_id = ?", (r["id"],)
+        ).fetchone()[0]
+        results.append(d)
+    conn.close()
+
+    return {"total": len(results), "data": results}
+
+
+@router.get("/agents/{agent_id}")
+async def get_agent(agent_id: str):
+    """Get agent detail including prompt."""
+    agent = _get_agent(agent_id)
+
+    conn = get_db()
+    agent["run_count"] = conn.execute(
+        "SELECT COUNT(*) FROM auto_trader_runs WHERE agent_id = ?", (agent_id,)
+    ).fetchone()[0]
+    conn.close()
+
+    return agent
+
+
+@router.put("/agents/{agent_id}")
+async def update_agent(agent_id: str, body: UpdateAgentRequest):
+    """Update an agent's name or prompt."""
+    _get_agent(agent_id)  # verify exists
+
+    now = datetime.now(timezone.utc).isoformat()
+    conn = get_db()
+    if body.name is not None:
+        conn.execute("UPDATE auto_trader_agents SET name = ?, updated_at = ? WHERE id = ?",
+                     (body.name, now, agent_id))
+    if body.prompt is not None:
+        conn.execute("UPDATE auto_trader_agents SET prompt = ?, updated_at = ? WHERE id = ?",
+                     (body.prompt, now, agent_id))
+    conn.commit()
+    conn.close()
+
+    return {"id": agent_id, "status": "updated"}
+
+
+@router.delete("/agents/{agent_id}")
+async def delete_agent(agent_id: str):
+    """Delete an agent. Cannot delete if it has active runs."""
+    if agent_id == "default":
+        raise HTTPException(409, "Cannot delete the default agent")
+
+    _get_agent(agent_id)
+
+    conn = get_db()
+    run_count = conn.execute(
+        "SELECT COUNT(*) FROM auto_trader_runs WHERE agent_id = ?",
+        (agent_id,),
+    ).fetchone()[0]
+    if run_count > 0:
+        conn.close()
+        raise HTTPException(409, f"Agent has {run_count} run(s). Delete them first.")
+
+    conn.execute("DELETE FROM auto_trader_agents WHERE id = ?", (agent_id,))
+    conn.commit()
+    conn.close()
+
+    return {"id": agent_id, "status": "deleted"}
+
+
+# ---------------------------------------------------------------------------
+# Templates
+# ---------------------------------------------------------------------------
+
+@router.get("/templates")
+async def list_templates(
+    category: Optional[str] = Query(None, description="Filter by category"),
+):
+    """List all agent prompt templates."""
+    conn = get_db()
+    if category:
+        rows = conn.execute(
+            "SELECT id, name, category, description, created_at FROM auto_trader_templates WHERE category = ? ORDER BY name",
+            (category,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, name, category, description, created_at FROM auto_trader_templates ORDER BY category, name"
+        ).fetchall()
+    conn.close()
+    return {"total": len(rows), "data": [dict(r) for r in rows]}
+
+
+@router.get("/templates/{template_id}")
+async def get_template(template_id: str):
+    """Get a template with its full prompt."""
+    conn = get_db()
+    row = conn.execute("SELECT * FROM auto_trader_templates WHERE id = ?", (template_id,)).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(404, f"Template '{template_id}' not found")
+    return dict(row)
+
+
+# ---------------------------------------------------------------------------
+# Runs
+# ---------------------------------------------------------------------------
+
 @router.post("/runs", status_code=201)
 async def create_run(body: CreateRunRequest):
     """Create an auto-trader run. Returns the run config with a pending status."""
@@ -158,6 +470,9 @@ async def create_run(body: CreateRunRequest):
     valid_model_ids = [m["id"] for m in AVAILABLE_MODELS]
     if body.model not in valid_model_ids:
         raise HTTPException(400, f"Invalid model: '{body.model}'. Valid: {valid_model_ids}")
+
+    # Verify agent exists
+    _get_agent(body.agent_id)
 
     run_id = _generate_run_id(body.name)
     now = datetime.now(timezone.utc).isoformat()
@@ -177,15 +492,15 @@ async def create_run(body: CreateRunRequest):
     conn = get_db()
     conn.execute(
         """INSERT INTO auto_trader_runs
-           (id, name, status, config, prompt, max_experiments, created_at, updated_at)
-           VALUES (?, ?, 'pending', ?, ?, ?, ?, ?)""",
-        (run_id, body.name, json.dumps(config), DEFAULT_PROMPT,
+           (id, name, agent_id, status, config, max_experiments, created_at, updated_at)
+           VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)""",
+        (run_id, body.name, body.agent_id, json.dumps(config),
          body.max_experiments, now, now),
     )
     conn.commit()
     conn.close()
 
-    return {"id": run_id, "name": body.name, "status": "pending", "config": config}
+    return {"id": run_id, "name": body.name, "agent_id": body.agent_id, "status": "pending", "config": config}
 
 
 class StartRunRequest(BaseModel):
@@ -223,9 +538,10 @@ async def start_run(run_id: str, body: StartRunRequest = StartRunRequest()):
 
     config = run["config"]
 
-    # Write the prompt to a temp file for the runner to read
+    # Load prompt from the agent and write to temp file for the runner
+    agent = _get_agent(run.get("agent_id", "default"))
     prompt_file = PROJECT_ROOT / "auto_trader" / f".prompt_{run_id}.md"
-    prompt_file.write_text(run["prompt"])
+    prompt_file.write_text(agent["prompt"])
 
     # Remove any stale stop file
     _stop_file(run_id).unlink(missing_ok=True)
@@ -445,6 +761,14 @@ async def get_run(run_id: str):
     direction = METRIC_DIRECTION.get(run["config"].get("metric"), True)
     best = get_best_experiment(run_id, higher_is_better=direction)
 
+    # Include agent info
+    agent_id = run.get("agent_id", "default")
+    try:
+        agent = _get_agent(agent_id)
+        run["agent"] = {"id": agent_id, "name": agent["name"]}
+    except HTTPException:
+        run["agent"] = {"id": agent_id, "name": "Unknown"}
+
     run["experiments_summary"] = summary
     if best:
         run["best_experiment"] = {
@@ -581,26 +905,7 @@ async def get_experiment_session(run_id: str, experiment_id: str):
 
 @router.get("/runs/{run_id}/prompt")
 async def get_run_prompt(run_id: str):
-    """Get the user-editable agent prompt for a run."""
+    """Get the prompt for this run (from its agent)."""
     run = _get_run(run_id)
-    return {"run_id": run_id, "prompt": run["prompt"]}
-
-
-@router.put("/runs/{run_id}/prompt")
-async def update_run_prompt(run_id: str, body: UpdatePromptRequest):
-    """Update the agent prompt for a run. Only works on pending runs."""
-    run = _get_run(run_id)
-
-    if run["status"] not in ("pending", "stopped", "completed"):
-        raise HTTPException(409, f"Cannot edit prompt while run is {run['status']}")
-
-    now = datetime.now(timezone.utc).isoformat()
-    conn = get_db()
-    conn.execute(
-        "UPDATE auto_trader_runs SET prompt = ?, updated_at = ? WHERE id = ?",
-        (body.prompt, now, run_id),
-    )
-    conn.commit()
-    conn.close()
-
-    return {"run_id": run_id, "status": "updated"}
+    agent = _get_agent(run.get("agent_id", "default"))
+    return {"run_id": run_id, "agent_id": agent["id"], "agent_name": agent["name"], "prompt": agent["prompt"]}
