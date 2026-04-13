@@ -306,6 +306,7 @@ def run_backtest(portfolio_config: dict, start: str, end: str, capital: float,
                 market_ann = market_bench["metrics"]["annualized_return_pct"]
                 metrics["alpha_vs_market_pct"] = round(ann_return - market_ann, 2)
                 metrics["market_benchmark_return_pct"] = market_bench["metrics"]["total_return_pct"]
+                metrics["market_benchmark_ann_return_pct"] = market_bench["metrics"]["annualized_return_pct"]
 
             # Sector benchmark — compute if sector is set
             if sector and sector in SECTOR_ETF_MAP:
@@ -314,6 +315,7 @@ def run_backtest(portfolio_config: dict, start: str, end: str, capital: float,
                     sector_ann = sector_bench["metrics"]["annualized_return_pct"]
                     metrics["alpha_vs_sector_pct"] = round(ann_return - sector_ann, 2)
                     metrics["sector_benchmark_return_pct"] = sector_bench["metrics"]["total_return_pct"]
+                    metrics["sector_benchmark_ann_return_pct"] = sector_bench["metrics"]["annualized_return_pct"]
 
         return metrics
     except Exception as e:

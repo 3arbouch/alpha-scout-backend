@@ -2016,6 +2016,7 @@ def run_backtest(config: dict, force_close_at_end: bool = True,
         market_ann = market_benchmark["metrics"]["annualized_return_pct"]
         metrics["alpha_vs_market_pct"] = round(ann_return - market_ann, 2)
         metrics["market_benchmark_return_pct"] = market_benchmark["metrics"]["total_return_pct"]
+        metrics["market_benchmark_ann_return_pct"] = market_benchmark["metrics"]["annualized_return_pct"]
         # Backward compat
         metrics["benchmark_return_pct"] = market_benchmark["metrics"]["total_return_pct"]
         metrics["benchmark_ann_return_pct"] = market_benchmark["metrics"]["annualized_return_pct"]
@@ -2030,6 +2031,7 @@ def run_backtest(config: dict, force_close_at_end: bool = True,
             sector_ann = sector_benchmark["metrics"]["annualized_return_pct"]
             metrics["alpha_vs_sector_pct"] = round(ann_return - sector_ann, 2)
             metrics["sector_benchmark_return_pct"] = sector_benchmark["metrics"]["total_return_pct"]
+            metrics["sector_benchmark_ann_return_pct"] = sector_benchmark["metrics"]["annualized_return_pct"]
             benchmark = sector_benchmark
 
     from datetime import datetime, timezone

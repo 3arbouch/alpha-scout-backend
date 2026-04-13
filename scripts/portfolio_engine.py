@@ -957,6 +957,7 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
         market_ann = market_benchmark["metrics"]["annualized_return_pct"]
         portfolio_metrics["alpha_vs_market_pct"] = round(ann_return - market_ann, 2)
         portfolio_metrics["market_benchmark_return_pct"] = market_benchmark["metrics"]["total_return_pct"]
+        portfolio_metrics["market_benchmark_ann_return_pct"] = market_benchmark["metrics"]["annualized_return_pct"]
         # Keep backward compat fields
         portfolio_metrics["benchmark_return_pct"] = market_benchmark["metrics"]["total_return_pct"]
         portfolio_metrics["benchmark_ann_return_pct"] = market_benchmark["metrics"]["annualized_return_pct"]
@@ -971,7 +972,8 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
             sector_ann = sector_benchmark["metrics"]["annualized_return_pct"]
             portfolio_metrics["alpha_vs_sector_pct"] = round(ann_return - sector_ann, 2)
             portfolio_metrics["sector_benchmark_return_pct"] = sector_benchmark["metrics"]["total_return_pct"]
-            benchmark = sector_benchmark  # use sector as primary for display
+            portfolio_metrics["sector_benchmark_ann_return_pct"] = sector_benchmark["metrics"]["annualized_return_pct"]
+            benchmark = sector_benchmark
 
     # -----------------------------------------------------------------------
     # Step 6: Print summary
