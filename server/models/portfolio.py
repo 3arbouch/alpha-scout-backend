@@ -11,7 +11,7 @@ Used by: portfolio engine, deploy engine, API.
 from __future__ import annotations
 
 from typing import Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .strategy import StrategyConfig, BacktestParams
 from .regime import RegimeCondition
@@ -35,10 +35,25 @@ class SleeveConfig(BaseModel):
     strategy_config: StrategyConfig | None = Field(default=None, description="Inline strategy config.")
 
     # Regime gating
-    regime_gates: list[str] = Field(
+    regime_gate: list[str] = Field(
         default_factory=list,
-        description="List of regime_ids. Empty = always active. Non-empty = active only when at least one gated regime is on.",
+        description="List of regime_ids. Empty or ['*'] = always active. Non-empty = active only when at least one gated regime is on.",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_legacy_fields(cls, data):
+        """Accept legacy field names from old API clients / stored data."""
+        if isinstance(data, dict):
+            # "config" → "strategy_config"
+            if "config" in data and "strategy_config" not in data:
+                data["strategy_config"] = data.pop("config")
+            elif "config" in data:
+                data.pop("config")
+            # "name" → "label" (old format used "name" for sleeve label)
+            if "name" in data and "label" not in data:
+                data["label"] = data.pop("name")
+        return data
 
 
 # ---------------------------------------------------------------------------
@@ -80,10 +95,33 @@ class PortfolioConfig(BaseModel):
     name: str = Field(min_length=1)
     sleeves: list[SleeveConfig] = Field(min_length=1)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_legacy_fields(cls, data):
+        """Accept legacy field names from old API clients / stored data."""
+        if isinstance(data, dict):
+            # "strategies" → "sleeves"
+            if "strategies" in data and "sleeves" not in data:
+                data["sleeves"] = data.pop("strategies")
+            elif "strategies" in data:
+                data.pop("strategies")
+            # "capital_flow" → "capital_when_gated_off"
+            if "capital_flow" in data and "capital_when_gated_off" not in data:
+                data["capital_when_gated_off"] = data.pop("capital_flow")
+            elif "capital_flow" in data:
+                data.pop("capital_flow")
+        return data
+
+    # Regime gating
+    regime_filter: bool = Field(
+        default=True,
+        description="Enable/disable regime gating. When False, all sleeves are always active.",
+    )
+
     # Regime definitions (inline, keyed by regime_id)
     regime_definitions: dict[str, InlineRegimeDefinition] | None = Field(
         default=None,
-        description="Inline regime configs keyed by regime_id. Alternative: regimes already in DB are auto-loaded.",
+        description="Inline regime configs keyed by regime_id.",
     )
 
     # Capital flow when a sleeve is gated off

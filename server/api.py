@@ -1080,181 +1080,64 @@ def _nulls_to_zero(obj):
 # ---------------------------------------------------------------------------
 # Strategy CRUD — Pydantic Models
 # ---------------------------------------------------------------------------
+# Domain models are the single source of truth. API DTOs compose from them,
+# only adding API-specific concerns (which fields are required on create vs read).
+# Backward compat (tickers→symbols, trigger/confirm→conditions, etc.) is handled
+# by model_validators on the domain models themselves.
+# ---------------------------------------------------------------------------
 from pydantic import BaseModel as _BM, Field
 from typing import Literal
 from enum import Enum
 import hashlib
 
-
-class UniverseConfig(_BM):
-    """Defines which stocks the strategy can trade."""
-    type: Literal["sector", "tickers"] = Field(description="How to define the tradeable universe. 'sector' selects all tickers in a GICS sector; 'tickers' uses an explicit list.")
-    sector: str | None = Field(default=None, description="GICS sector name (e.g. 'Technology', 'Financials', 'Energy'). Required when type='sector'.")
-    tickers: list[str] | None = Field(default=None, description="Explicit list of ticker symbols (e.g. ['AAPL', 'MSFT']). Required when type='tickers'.")
-    exclude: list[str] = Field(default=[], description="Tickers to exclude from the universe, even if they match the sector/list.")
-
-
-from typing import Annotated
-
-
-class CurrentDropCondition(_BM):
-    """Stock is currently X% below its rolling N-day high. Fires every day it stays depressed. Turns off on recovery. Best for mean-reversion."""
-    type: Literal["current_drop"] = "current_drop"
-    threshold: float = Field(default=-25, le=0, description="Drop threshold as negative %. E.g. -25 = stock must be 25% below its high.")
-    window_days: int = Field(default=90, ge=1, le=1000, description="Lookback window in calendar days.")
-
-
-class PeriodDropCondition(_BM):
-    """Within any sliding N-day window, the worst peak-to-trough drawdown exceeded X%. Fires even if the stock has partially recovered since."""
-    type: Literal["period_drop"] = "period_drop"
-    threshold: float = Field(default=-25, le=0, description="Drop threshold as negative %.")
-    window_days: int = Field(default=90, ge=1, le=1000, description="Lookback window in calendar days.")
-
-
-class DailyDropCondition(_BM):
-    """Single-day crash. Stock fell X% from yesterday's close. Point-in-time shock signal."""
-    type: Literal["daily_drop"] = "daily_drop"
-    threshold: float = Field(default=-5, le=0, description="Drop threshold as negative %. E.g. -8 = must fall 8% in one day.")
-
-
-class SelloffCondition(_BM):
-    """Full drawdown cycle from all-time/52w peak. Stays active until price recovers to the peak. Long-duration structural signal."""
-    type: Literal["selloff"] = "selloff"
-    threshold: float = Field(default=-20, le=0, description="Drop threshold as negative %.")
-    window_days: int = Field(default=90, ge=1, le=1000, description="Lookback window in calendar days.")
-
-
-class EarningsMomentumCondition(_BM):
-    """Filters by recent earnings beat/miss pattern. Checks last N quarters of reported EPS vs analyst estimates. Use as a quality filter to avoid value traps."""
-    type: Literal["earnings_momentum"] = "earnings_momentum"
-    lookback_quarters: int = Field(default=4, ge=1, le=8, description="How many past quarters to examine.")
-    min_beats: int = Field(default=2, ge=0, le=8, description="Minimum number of earnings beats required.")
-    min_avg_surprise_pct: float | None = Field(default=None, description="Minimum average surprise %. Null = disabled.")
-    no_recent_miss: bool = Field(default=False, description="If true, the most recent quarter must be a beat.")
-
-
-EntryCondition = Annotated[
-    CurrentDropCondition | PeriodDropCondition | DailyDropCondition | SelloffCondition | EarningsMomentumCondition,
-    Field(discriminator="type")
-]
-
-
-class EntryConfig(_BM):
-    """Entry signal configuration — when and how to open positions."""
-    # New composable format
-    conditions: list[EntryCondition] | None = Field(default=None, min_length=1, description="List of entry conditions. All conditions must be met (logic='all') or any condition can be met (logic='any').")
-    logic: Literal["all", "any"] = Field(default="all", description="How to combine multiple conditions. 'all' means AND logic (all conditions must be true), 'any' means OR logic (any condition can be true).")
-    
-    # Legacy format (accepted on input for backward compatibility, normalized on output)
-    trigger: dict | None = Field(default=None, description="Legacy single trigger format. Automatically converted to conditions list internally.", exclude=True)
-    confirm: list | None = Field(default=None, description="Legacy confirmation filters.", exclude=True)
-    
-    priority: Literal["worst_drawdown", "random"] = Field(
-        default="worst_drawdown",
-        description="When multiple stocks trigger simultaneously, how to rank them. 'worst_drawdown' enters the most beaten-down first; 'random' selects randomly."
-    )
-
-
-class StopLossConfig(_BM):
-    """Stop loss configuration — when to exit a losing position."""
-    type: Literal["drawdown_from_entry"] = Field(
-        description="'drawdown_from_entry': exit if price falls X% below entry price."
-    )
-    value: float | None = Field(default=-35, description="Stop loss threshold. For drawdown_from_entry: negative percentage from entry price (e.g. -35 = exit at 35% loss).")
-    cooldown_days: int = Field(ge=0, default=90, description="Days to wait before re-entering the same ticker after a stop loss is triggered.")
-
-
-class TakeProfitConfig(_BM):
-    """Take profit configuration — when to exit a winning position."""
-    type: Literal["gain_from_entry", "above_peak"] = Field(
-        description="'gain_from_entry': exit when price rises X% above entry price. 'above_peak': exit when price rises X% above the pre-selloff peak (the high before the crash)."
-    )
-    value: float = Field(default=60, description="Take profit target as a positive percentage. For gain_from_entry: % gain from entry (e.g. 60 = sell at 60% profit). For above_peak: % above the pre-selloff peak (e.g. 10 = sell when price is 10% above the prior high).")
-
-
-class TimeStopConfig(_BM):
-    """Time-based exit — force close position after N days regardless of P&L."""
-    days: int = Field(ge=1, description="Maximum holding period in calendar days. Position is closed after this many days if neither stop loss nor take profit has been hit.")
-
-
-class RebalancingRules(_BM):
-    """Rules applied during periodic rebalancing."""
-    max_position_pct: float = Field(ge=1, le=100, default=25, description="Maximum portfolio weight (%) for any single position. Positions exceeding this are trimmed.")
-    on_earnings_beat: Literal["hold", "trim", "add"] = Field(default="hold", description="Action when a held stock beats earnings estimates. 'hold': do nothing. 'trim': reduce position. 'add': increase position.")
-    on_earnings_miss: Literal["hold", "trim", "sell"] = Field(default="trim", description="Action when a held stock misses earnings estimates. 'hold': do nothing. 'trim': reduce by trim_pct. 'sell': close entire position.")
-    trim_pct: float = Field(ge=0, le=100, default=50, description="Percentage of the position to trim when a trim action is triggered (e.g. 50 = sell half).")
-
-
-class RebalancingConfig(_BM):
-    """Periodic portfolio rebalancing schedule and rules."""
-    frequency: Literal["none", "quarterly", "monthly", "on_earnings"] = Field(
-        default="none",
-        description="How often to rebalance. 'none': no rebalancing. 'quarterly'/'monthly': calendar-based. 'on_earnings': rebalance when held stocks report earnings."
-    )
-    rules: RebalancingRules = RebalancingRules()
-
-
-class SizingConfig(_BM):
-    """Position sizing — how much capital to allocate per trade."""
-    type: Literal["equal_weight", "risk_parity", "fixed_amount"] = Field(
-        default="equal_weight",
-        description="Sizing method. 'equal_weight': divide capital equally across max_positions. 'risk_parity': size inversely to volatility. 'fixed_amount': fixed dollar amount per position."
-    )
-    max_positions: int = Field(ge=1, le=100, default=10, description="Maximum number of concurrent open positions.")
-    initial_allocation: float = Field(ge=0, default=1000000, description="Starting capital in USD.")
-
-
-class BacktestConfig(_BM):
-    """Backtest simulation parameters (not part of the live strategy logic)."""
-    start: str = Field(default="2015-01-01", description="Backtest start date (YYYY-MM-DD).")
-    end: str = Field(default="2025-12-31", description="Backtest end date (YYYY-MM-DD).")
-    entry_price: Literal["next_close", "next_open"] = Field(
-        default="next_close",
-        description="Price used to fill entry orders. 'next_close': enter at the closing price of the day after the signal. 'next_open': enter at the next day's open."
-    )
-    slippage_bps: int = Field(ge=0, default=10, description="Simulated slippage in basis points (1 bp = 0.01%). Applied to both entries and exits.")
+# Import all shared types from domain models — no re-declaration
+from models.strategy import (
+    UniverseConfig, EntryConfig, EntryCondition,
+    StopLossConfig, TakeProfitConfig, TimeStopConfig,
+    RebalancingConfig, RebalancingRules, SizingConfig,
+    RankingConfig, ExitCondition, BacktestParams,
+)
+from models.portfolio import (
+    SleeveConfig, PortfolioConfig, InlineRegimeDefinition,
+    AllocationProfile,
+)
+from models.regime import RegimeCondition, RegimeConfig
 
 
 class AuthorConfig(_BM):
-    """Strategy author metadata."""
+    """Strategy author metadata (API-only, not part of domain model)."""
     id: str = Field(default="owner", description="Author identifier.")
     name: str = Field(default="Omar", description="Author display name.")
 
 
 class StrategyCreate(_BM):
-    """Full strategy definition for create/update. All optional fields have sensible defaults — only name, universe, and entry trigger are required to create a minimal strategy."""
+    """Strategy creation request. Composes domain types — only adds API-specific fields.
+    All optional fields have sensible defaults — only name, universe, and entry are required."""
     name: str = Field(min_length=1, max_length=200, description="Human-readable strategy name.")
     version: int = Field(default=1, description="Config version number.")
     author: AuthorConfig = AuthorConfig()
     universe: UniverseConfig
     entry: EntryConfig
-    stop_loss: StopLossConfig | None = Field(default=None, description="Stop loss configuration. Omit or set to null to disable stop losses.")
-    take_profit: TakeProfitConfig | None = Field(default=None, description="Take profit configuration. Omit or set to null to disable take profits.")
-    time_stop: TimeStopConfig | None = Field(default=None, description="Time-based exit. Omit or set to null to hold indefinitely (until SL/TP).")
-    rebalancing: RebalancingConfig = Field(default=RebalancingConfig(), description="Periodic rebalancing settings. Defaults to no rebalancing.")
+    stop_loss: StopLossConfig | None = Field(default=None, description="Stop loss configuration. Omit or set to null to disable.")
+    take_profit: TakeProfitConfig | None = Field(default=None, description="Take profit configuration. Omit or set to null to disable.")
+    time_stop: TimeStopConfig | None = Field(default=None, description="Time-based exit. Omit or set to null to hold indefinitely.")
+    exit_conditions: list[ExitCondition] | None = Field(default=None, description="Fundamental exit triggers (OR logic).")
+    ranking: RankingConfig | None = Field(default=None, description="Rank candidates by metric before applying max_positions.")
+    rebalancing: RebalancingConfig = Field(default=RebalancingConfig(), description="Periodic rebalancing settings.")
     sizing: SizingConfig = Field(default=SizingConfig(), description="Position sizing settings.")
 
 
-def _normalize_entry(config: dict) -> dict:
-    """Convert old trigger/confirm format to new conditions/logic format in-place."""
-    entry = config.get("entry", {})
-    if "trigger" in entry and entry["trigger"] and "conditions" not in entry:
-        trigger = entry["trigger"]
-        conditions = [trigger]
-        confirm = entry.get("confirm") or []
-        if confirm:
-            conditions.extend(confirm)
-        entry["conditions"] = conditions
-        entry["logic"] = "all"
-        entry.pop("trigger", None)
-        entry.pop("confirm", None)
-    elif "conditions" in entry:
-        entry.pop("trigger", None)
-        entry.pop("confirm", None)
-        if not entry.get("logic"):
-            entry["logic"] = "all"
-    config["entry"] = entry
-    return config
+def _normalize_config(config: dict) -> dict:
+    """Normalize a stored config dict through domain model validators.
+
+    Handles legacy field names (tickers→symbols, trigger/confirm→conditions, etc.)
+    by round-tripping through the Pydantic model's model_validators.
+    """
+    from models.strategy import StrategyConfig
+    try:
+        return StrategyConfig.model_validate(config).model_dump(mode="json")
+    except Exception:
+        return config  # return as-is if validation fails (e.g. incomplete config)
 
 
 def _compute_strategy_id(config: dict) -> str:
@@ -1268,19 +1151,10 @@ def _compute_strategy_id(config: dict) -> str:
 # ---------------------------------------------------------------------------
 
 def _ensure_strategies_table():
-    """Create the strategies table if it doesn't exist."""
+    """Ensure all app tables exist."""
+    from schema import init_db
     with get_db() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS strategies (
-                strategy_id  TEXT PRIMARY KEY,
-                name         TEXT NOT NULL,
-                config       TEXT NOT NULL,
-                created_at   TEXT,
-                updated_at   TEXT
-            )
-        """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_strat_name ON strategies(name)")
-        conn.commit()
+        init_db(conn)
 
 
 def _sync_strategies_from_files():
@@ -1354,7 +1228,7 @@ async def list_strategies(_: str = Depends(verify_api_key)):
     results = []
     for r in rows:
         config = json.loads(r["config"])
-        _normalize_entry(config)
+        config = _normalize_config(config)
         results.append({
             "strategy_id": r["strategy_id"],
             "name": r["name"],
@@ -2337,7 +2211,8 @@ async def get_strategy(strategy_id: str, _: str = Depends(verify_api_key)):
     config = _get_strategy_config(strategy_id)
     if not config:
         raise HTTPException(404, f"Strategy '{strategy_id}' not found")
-    return _normalize_entry(config)
+    config = _normalize_config(config)
+    return config
 
 
 @app.put("/strategies/{strategy_id}", tags=["Strategies"])
@@ -2535,31 +2410,21 @@ sys.path.insert(0, str(WORKSPACE / "scripts"))
 from portfolio_engine import run_portfolio_backtest as _run_portfolio_bt, save_portfolio_results as _save_portfolio_results, compute_portfolio_id as _compute_portfolio_id
 
 
-class PortfolioStrategyRef(_BM):
-    strategy_id: str | None = Field(default=None, description="Reference to saved strategy by ID")
-    config_path: str | None = Field(default=None, description="Path to strategy config JSON")
-    config: dict | None = Field(default=None, description="Inline strategy config")
-    weight: float = Field(description="Capital weight (0-1)")
-    regime_gate: list[str] = Field(default=["*"], description="List of regime_ids that activate this sleeve. ['*'] = always active.")
-    label: str | None = Field(default=None, description="Display name for this sleeve")
-
-
-class PortfolioCreate(_BM):
-    name: str = Field(description="Portfolio name")
-    strategies: list[PortfolioStrategyRef] = Field(description="List of strategy references with weights and regime gates")
-    regime_filter: bool = Field(default=True, description="Enable regime gating")
-    capital_flow: str = Field(default="to_cash", description="'to_cash' or 'redistribute'")
-    allocation_profiles: dict | None = Field(default=None, description="Dynamic allocation profiles: {profile_name: {trigger: [regime_ids], weights: {sleeve_label: weight}} | default_weights}")
-    profile_priority: list[str] | None = Field(default=None, description="Priority order for allocation profile evaluation (first match wins)")
+# PortfolioCreate uses the domain PortfolioConfig directly.
+# Backward compat (strategies→sleeves, capital_flow→capital_when_gated_off,
+# config→strategy_config) is handled by model_validators on the domain models.
+PortfolioCreate = PortfolioConfig
 
 
 class PortfolioUpdate(_BM):
     name: str | None = None
-    strategies: list[PortfolioStrategyRef] | None = None
+    sleeves: list[SleeveConfig] | None = None
     regime_filter: bool | None = None
-    capital_flow: str | None = None
-    allocation_profiles: dict | None = None
+    capital_when_gated_off: Literal["to_cash", "redistribute"] | None = None
+    regime_definitions: dict[str, InlineRegimeDefinition] | None = None
+    allocation_profiles: dict[str, AllocationProfile] | None = None
     profile_priority: list[str] | None = None
+    transition_days: int | None = None
 
 
 class PortfolioBacktestRequest(_BM):
@@ -2572,12 +2437,13 @@ class PortfolioBacktestRequest(_BM):
 @app.post("/portfolios", tags=["Portfolios"], status_code=201)
 async def create_portfolio(body: PortfolioCreate, _: str = Depends(verify_api_key)):
     """Create a new portfolio."""
-    config = body.model_dump(mode="json")
+    config = body.model_dump(mode="json", exclude_none=True)
     # Strip capital/backtest from inline strategy configs — capital is a deploy/backtest-time param
-    for s in config.get("strategies", []):
-        if s.get("config") and isinstance(s["config"], dict):
-            s["config"].get("sizing", {}).pop("initial_allocation", None)
-            s["config"].pop("backtest", None)
+    for s in config.get("sleeves", []):
+        sc = s.get("strategy_config")
+        if sc and isinstance(sc, dict):
+            sc.get("sizing", {}).pop("initial_allocation", None)
+            sc.pop("backtest", None)
     portfolio_id = _compute_portfolio_id(config)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 

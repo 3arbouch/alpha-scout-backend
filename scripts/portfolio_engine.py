@@ -53,72 +53,22 @@ STRATEGIES_DIR = WORKSPACE / "strategies"
 
 def get_config_schema() -> dict:
     """
-    Authoritative portfolio config schema.
-    
+    Authoritative portfolio config schema — generated from the Pydantic models.
+
     Usage:
         python3 -c "from portfolio_engine import get_config_schema; import json; print(json.dumps(get_config_schema(), indent=2))"
     """
-    return {
-        "name": {"type": "string", "required": True, "description": "Portfolio name"},
-        "sleeves": {
-            "type": "array",
-            "required": True,
-            "description": "Array of sleeve objects. Each sleeve wraps a strategy with a capital weight and optional regime gates.",
-            "item_schema": {
-                "name": {"type": "string", "required": True, "description": "Sleeve display name"},
-                "weight": {"type": "float", "required": True, "description": "Capital allocation weight. All sleeve weights must sum to 1.0."},
-                "regime_gates": {"type": "string[]", "default": [], "description": "List of regime_ids. Empty = always active. Non-empty = active only when ≥1 gated regime is on."},
-                "strategy_id": {"type": "string", "description": "Reference an existing strategy by ID (preferred). Looks up in strategies/ dir."},
-                "config_path": {"type": "string", "description": "Path to strategy config JSON file. Validated on load."},
-                "strategy_config": {"type": "object", "description": "Inline strategy config. Validated against strategy schema, auto-saved to strategies/ with a strategy_id. Use strategy_id instead when possible."},
-            },
-        },
-        "regime_definitions": {
-            "optional": True,
-            "description": "Inline regime configs keyed by regime_id. Each has conditions array + logic. Alternative: regimes already in DB are auto-loaded by ID.",
-            "item_schema": {
-                "conditions": {"type": "array", "description": "Array of {series, operator, threshold}. series = any key from macro_indicators or macro_derived tables."},
-                "logic": {"type": "string", "values": ["and", "or"], "default": "and"},
-            },
-        },
-        "capital_when_gated_off": {
-            "type": "string",
-            "values": ["to_cash", "redistribute"],
-            "default": "to_cash",
-            "description": "'to_cash' = park gated-off capital as cash. 'redistribute' = proportionally allocate to active sleeves.",
-        },
-        "allocation_profiles": {
-            "optional": True,
-            "description": "Named weight sets for dynamic allocation. Each profile (except 'default') has a 'trigger' array of regime_ids — all must be active. Keys are sleeve names, values are weights. Include 'Cash' key for unallocated.",
-            "example": {
-                "default": {"Tech": 0.60, "Defensives": 0.40},
-                "oil_shock": {"trigger": ["oil_crisis_301db3ee"], "Tech": 0.30, "Defensives": 0.50, "Cash": 0.20},
-            },
-        },
-        "profile_priority": {
-            "optional": True,
-            "type": "string[]",
-            "description": "Ordered list of profile names. Walk top→bottom, first profile whose trigger regimes are ALL active wins. Must end with 'default'.",
-        },
-        "transition_days": {
-            "optional": True,
-            "type": "integer",
-            "default": 1,
-            "description": "Number of trading days to linearly transition between allocation profiles. 1 = instant (legacy). Higher values smooth rebalancing over N days, preventing equity curve jumps.",
-        },
-        "backtest": {
-            "start": {"type": "string", "required": True, "description": "YYYY-MM-DD"},
-            "end": {"type": "string", "required": True, "description": "YYYY-MM-DD"},
-        },
-    }
+    sys.path.insert(0, str(Path(__file__).parent.parent / "server"))
+    from models.portfolio import PortfolioConfig
+    return PortfolioConfig.model_json_schema()
 
 
 def compute_portfolio_id(config: dict) -> str:
     """Deterministic ID from portfolio config."""
     key_parts = {
-        "strategies": config.get("strategies", []),
+        "sleeves": config.get("sleeves", config.get("strategies", [])),
         "regime_filter": config.get("regime_filter", False),
-        "capital_flow": config.get("capital_flow", "to_cash"),
+        "capital_when_gated_off": config.get("capital_when_gated_off", config.get("capital_flow", "to_cash")),
     }
     raw = json.dumps(key_parts, sort_keys=True)
     return hashlib.md5(raw.encode()).hexdigest()[:12]
@@ -330,11 +280,40 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
 
         if all_regime_ids:
             print(f"\n  Loading {len(all_regime_ids)} regime definitions...")
-            import sqlite3 as _sqlite3
-            _app_conn = _sqlite3.connect(str(APP_DB_PATH))
-            _app_conn.row_factory = _sqlite3.Row
-            regime_configs, regime_id_to_name = _load_regime_configs(list(all_regime_ids), _app_conn)
-            _app_conn.close()
+
+            # Resolve inline regime_definitions first, fall back to DB
+            inline_defs = portfolio_config.get("regime_definitions") or {}
+            inline_ids = set()
+            db_ids = []
+            regime_configs = []
+
+            for rid in all_regime_ids:
+                if rid in inline_defs:
+                    inline_ids.add(rid)
+                    defn = inline_defs[rid]
+                    # Convert InlineRegimeDefinition to engine format:
+                    # engine expects {name, conditions/entry_conditions, logic/entry_logic, ...}
+                    rc = {"name": rid}
+                    if isinstance(defn, dict):
+                        rc.update(defn)
+                    else:
+                        # Pydantic model instance — convert to dict
+                        rc.update(defn if isinstance(defn, dict) else defn.model_dump())
+                    regime_configs.append(rc)
+                    regime_id_to_name[rid] = rid
+                    print(f"    {rid}: resolved from inline regime_definitions")
+                else:
+                    db_ids.append(rid)
+
+            # Load remaining from DB
+            if db_ids:
+                import sqlite3 as _sqlite3
+                _app_conn = _sqlite3.connect(str(APP_DB_PATH))
+                _app_conn.row_factory = _sqlite3.Row
+                db_configs, db_id_to_name = _load_regime_configs(db_ids, _app_conn)
+                _app_conn.close()
+                regime_configs.extend(db_configs)
+                regime_id_to_name.update(db_id_to_name)
 
             print(f"  Computing regime series {bt_start} to {bt_end}...")
             regime_series = evaluate_regime_series(bt_start, bt_end, regime_configs)
@@ -1084,8 +1063,9 @@ CREATE INDEX IF NOT EXISTS idx_pbt_created_at ON portfolio_backtest_runs(created
 
 
 def _ensure_portfolio_backtest_table():
+    from schema import init_db
     conn = sqlite3.connect(str(APP_DB_PATH))
-    conn.executescript(PORTFOLIO_BACKTEST_SCHEMA)
+    init_db(conn)
     conn.close()
 
 

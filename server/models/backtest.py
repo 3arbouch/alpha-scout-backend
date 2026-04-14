@@ -143,7 +143,7 @@ class SleeveResult(BaseModel):
     label: str
     strategy_id: str | None = None
     weight: float
-    regime_gates: list[str] = Field(default_factory=list)
+    regime_gate: list[str] = Field(default_factory=list)
     metrics: BacktestMetrics | None = None
     trades: list[TradeRecord] = Field(default_factory=list)
     closed_trades: list[TradeRecord] = Field(default_factory=list)

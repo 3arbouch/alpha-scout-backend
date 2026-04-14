@@ -119,6 +119,7 @@ VALID_TRIGGER_TYPES = [
     "period_drop", "current_drop", "daily_drop", "selloff", "earnings_momentum", "pe_percentile",
     "revenue_growth_yoy", "revenue_accelerating", "margin_expanding",
     "margin_turnaround", "relative_performance", "volume_conviction",
+    "rsi", "momentum_rank", "ma_crossover", "volume_capitulation",
     "always",
 ]
 VALID_STOP_TYPES = ["drawdown_from_entry", "fundamental"]
@@ -132,225 +133,14 @@ VALID_REBAL_MODES = ["trim", "equal_weight"]
 
 def get_config_schema() -> dict:
     """
-    Authoritative strategy config schema. Every field name, type, valid value,
-    default, and description — derived from the engine constants.
-    
+    Authoritative strategy config schema — generated from the Pydantic models.
+
     Usage:
         python3 -c "from backtest_engine import get_config_schema; import json; print(json.dumps(get_config_schema(), indent=2))"
     """
-    return {
-        "name": {"type": "string", "required": True, "description": "Human-readable strategy name"},
-        "universe": {
-            "type": {"type": "string", "values": ["symbols", "sector", "all"], "default": "symbols", "description": "How to resolve the ticker universe"},
-            "symbols": {"type": "string[]", "description": "Explicit ticker list (when type=symbols)"},
-            "sector": {"type": "string", "description": "FMP sector or industry name (when type=sector). Values: Technology, Healthcare, Financial Services, Industrials, Consumer Cyclical, Consumer Defensive, Energy, Basic Materials, Real Estate, Communication Services, Utilities. Industries also work (e.g. 'Aerospace & Defense')"},
-            "exclude": {"type": "string[]", "default": [], "description": "Tickers to exclude"},
-        },
-        "entry": {
-            "conditions": {
-                "type": "array",
-                "required": True,
-                "description": "Array of condition objects. Logic combines them via AND/OR.",
-                "condition_types": {
-                    "always": {
-                        "params": {},
-                        "description": "Every ticker qualifies on every trading day. Use for buy-and-hold / equal-weight / rotation strategies.",
-                    },
-                    "current_drop": {
-                        "params": {
-                            "threshold": {"type": "float", "required": True, "description": "Negative %. e.g. -25 = 25% below window high"},
-                            "window_days": {"type": "int", "default": 90, "description": "Calendar days lookback"},
-                        },
-                        "description": "Current price vs rolling window high. Preferred for mean-reversion.",
-                    },
-                    "period_drop": {
-                        "params": {
-                            "threshold": {"type": "float", "required": True, "description": "Negative %"},
-                            "window_days": {"type": "int", "default": 90, "description": "Calendar days lookback"},
-                        },
-                        "description": "Peak-to-trough within window. Fires even after partial recovery.",
-                    },
-                    "daily_drop": {
-                        "params": {
-                            "threshold": {"type": "float", "required": True, "description": "Negative %. e.g. -5 = single-day 5% crash"},
-                        },
-                        "description": "Single-day price crash.",
-                    },
-                    "selloff": {
-                        "params": {
-                            "threshold": {"type": "float", "required": True, "description": "Negative %. e.g. -20"},
-                            "peak_window": {"type": "string", "default": "all_time", "description": "'all_time' or '52w'"},
-                        },
-                        "description": "Drawdown from ATH or 52-week peak. Remains active during entire selloff period.",
-                    },
-                    "earnings_momentum": {
-                        "params": {
-                            "min_beats": {"type": "int", "default": 2, "description": "Minimum earnings beats in lookback"},
-                            "lookback_quarters": {"type": "int", "default": 4, "description": "Quarters to look back (1-8)"},
-                            "no_recent_miss": {"type": "bool", "default": False, "description": "Require most recent quarter was a beat"},
-                            "min_avg_surprise_pct": {"type": "float", "default": None, "description": "Minimum average surprise %"},
-                        },
-                        "description": "Earnings beat/miss momentum filter. Signal active from filing date to next quarter.",
-                    },
-                    "pe_percentile": {
-                        "params": {
-                            "max_percentile": {"type": "float", "default": 30, "description": "Bottom N% = cheapest. 30 = cheapest 30% of universe."},
-                            "min_pe": {"type": "float", "default": 0, "description": "Floor PE to exclude near-zero spikes"},
-                            "max_pe": {"type": "float", "default": 500, "description": "Cap to exclude outliers"},
-                        },
-                        "description": "PE percentile ranking within universe. Bottom N% get a signal.",
-                    },
-                    "revenue_growth_yoy": {
-                        "params": {
-                            "threshold": {"type": "float", "default": 50, "description": "Minimum YoY revenue growth %"},
-                        },
-                        "description": "Quarterly revenue YoY growth >= threshold. Fires on filing date.",
-                    },
-                    "revenue_accelerating": {
-                        "params": {
-                            "min_quarters": {"type": "int", "default": 2, "description": "Consecutive quarters of acceleration"},
-                        },
-                        "description": "Revenue YoY growth increasing for N consecutive quarters.",
-                    },
-                    "margin_expanding": {
-                        "params": {
-                            "metric": {"type": "string", "default": "net_margin", "values": ["net_margin", "op_margin"]},
-                            "min_quarters": {"type": "int", "default": 2},
-                        },
-                        "description": "Margin expanding YoY AND sequentially for N consecutive quarters.",
-                    },
-                    "margin_turnaround": {
-                        "params": {
-                            "metric": {"type": "string", "default": "net_margin", "values": ["net_margin", "op_margin"]},
-                            "threshold_bps": {"type": "float", "default": 1000, "description": "Minimum margin expansion in basis points YoY"},
-                            "min_quarters": {"type": "int", "default": 2},
-                        },
-                        "description": "Margin expanded >= threshold bps YoY for N consecutive quarters.",
-                    },
-                    "relative_performance": {
-                        "params": {
-                            "threshold": {"type": "float", "default": 20, "description": "Outperformance vs SPX in percentage points"},
-                            "window_days": {"type": "int", "default": 126, "description": "Trading days lookback"},
-                        },
-                        "description": "Stock trailing return minus SPX trailing return > threshold.",
-                    },
-                    "volume_conviction": {
-                        "params": {
-                            "short_window": {"type": "int", "default": 60},
-                            "long_window": {"type": "int", "default": 252},
-                            "ratio": {"type": "float", "default": 0.8, "description": "Short avg volume < ratio × long avg volume"},
-                        },
-                        "description": "Low volume consolidation with price above long-term average. Conviction = quiet accumulation.",
-                    },
-                    "rsi": {
-                        "params": {
-                            "period": {"type": "int", "default": 14},
-                            "operator": {"type": "string", "default": "<=", "values": [">", ">=", "<", "<=", "==", "!="]},
-                            "value": {"type": "float", "default": 30, "description": "RSI threshold"},
-                        },
-                        "description": "RSI indicator condition.",
-                    },
-                    "momentum_rank": {
-                        "params": {
-                            "lookback": {"type": "int", "default": 63, "description": "Trading days for momentum calc"},
-                            "operator": {"type": "string", "default": ">="},
-                            "value": {"type": "float", "default": 75, "description": "Percentile rank threshold"},
-                        },
-                        "description": "Cross-sectional momentum percentile rank.",
-                    },
-                    "ma_crossover": {
-                        "params": {
-                            "fast": {"type": "int", "default": 50},
-                            "slow": {"type": "int", "default": 200},
-                            "operator": {"type": "string", "default": "=="},
-                            "value": {"type": "int", "default": 1, "description": "1 = fast above slow (golden cross)"},
-                        },
-                        "description": "Moving average crossover signal.",
-                    },
-                    "volume_capitulation": {
-                        "params": {
-                            "window": {"type": "int", "default": 20},
-                            "multiplier": {"type": "float", "default": 3.0, "description": "Volume must exceed multiplier × avg"},
-                        },
-                        "description": "Volume spike indicating capitulation selling.",
-                    },
-                },
-            },
-            "logic": {"type": "string", "values": ["all", "any"], "default": "all", "description": "'all' = AND (all conditions must fire), 'any' = OR (any condition fires)"},
-            "priority": {"type": "string", "values": VALID_ENTRY_PRIORITY, "default": "worst_drawdown", "description": "Candidate ordering when candidates <= max_positions and no ranking set"},
-        },
-        "ranking": {
-            "optional": True,
-            "description": "Sort qualified candidates by a metric before applying max_positions. When omitted and candidates > slots, defaults to pe_percentile asc.",
-            "by": {"type": "string", "values": VALID_RANKING_METRICS, "default": "pe_percentile", "description": "Metric to rank candidates"},
-            "order": {"type": "string", "values": ["asc", "desc"], "default": "asc", "description": "Sort direction. asc = lowest first (cheapest/most oversold). desc = highest first (strongest momentum)."},
-            "top_n": {"type": "int", "default": "max_positions", "description": "How many candidates to select after ranking"},
-        },
-        "sizing": {
-            "type": {"type": "string", "values": VALID_SIZING_TYPES, "default": "equal_weight"},
-            "max_positions": {"type": "int", "default": 10, "description": "Max concurrent positions. Omit for unlimited."},
-            "initial_allocation": {"type": "float", "default": 1000000, "description": "Starting capital $"},
-        },
-        "stop_loss": {
-            "optional": True,
-            "description": "Set to null or omit to disable.",
-            "type": {"type": "string", "values": VALID_STOP_TYPES},
-            "value": {"type": "float", "default": -35, "description": "Negative %. -35 = exit at 35% loss from entry"},
-            "cooldown_days": {"type": "int", "default": 0, "description": "Calendar days before re-entering same symbol after stop"},
-        },
-        "take_profit": {
-            "optional": True,
-            "description": "Set to null or omit to disable.",
-            "type": {"type": "string", "values": VALID_TP_TYPES},
-            "value": {"type": "float", "description": "For gain_from_entry: positive %. For above_peak: % above pre-selloff peak."},
-        },
-        "time_stop": {
-            "optional": True,
-            "description": "Set to null or omit to disable. Exits after max_days regardless of P&L.",
-            "max_days": {"type": "int", "description": "Calendar days to hold before forced exit"},
-        },
-        "exit_conditions": {
-            "optional": True,
-            "description": "Fundamental exit triggers. Logic is OR — any condition firing closes the position.",
-            "condition_types": {
-                "revenue_deceleration": {
-                    "params": {
-                        "min_quarters": {"type": "int", "default": 2},
-                        "require_margin_compression": {"type": "bool", "default": True},
-                        "metric": {"type": "string", "default": "net_margin", "values": ["net_margin", "op_margin"]},
-                    },
-                    "description": "Revenue YoY growth declining for N consecutive quarters.",
-                },
-                "margin_collapse": {
-                    "params": {
-                        "metric": {"type": "string", "default": "net_margin", "values": ["net_margin", "op_margin"]},
-                        "threshold_bps": {"type": "float", "default": -500, "description": "Negative bps. -500 = margin contracted 5pp YoY."},
-                        "min_quarters": {"type": "int", "default": 2},
-                    },
-                    "description": "Margin contracting > threshold bps YoY for N consecutive quarters.",
-                },
-            },
-        },
-        "rebalancing": {
-            "frequency": {"type": "string", "values": VALID_REBAL_FREQ, "default": "none"},
-            "mode": {"type": "string", "values": VALID_REBAL_MODES, "default": "trim", "description": "'trim' = only clip overweight positions. 'equal_weight' = reset all to 1/N weight; with ranking also rotates names in/out."},
-            "rules": {
-                "max_position_pct": {"type": "float", "default": 25, "description": "Max single position as % of NAV (trim mode)"},
-                "add_on_earnings_beat": {
-                    "optional": True,
-                    "min_gain_pct": {"type": "float", "default": 15},
-                    "max_add_multiplier": {"type": "float", "default": 1.5},
-                    "lookback_days": {"type": "int", "default": 90},
-                },
-            },
-        },
-        "backtest": {
-            "start": {"type": "string", "default": "2015-01-01", "description": "YYYY-MM-DD"},
-            "end": {"type": "string", "default": "2025-12-31", "description": "YYYY-MM-DD"},
-            "entry_price": {"type": "string", "values": VALID_ENTRY_PRICE, "default": "next_close"},
-            "slippage_bps": {"type": "int", "default": 10, "description": "Slippage in basis points per trade"},
-        },
-    }
+    sys.path.insert(0, str(Path(__file__).parent.parent / "server"))
+    from models.strategy import StrategyConfig
+    return StrategyConfig.model_json_schema()
 
 
 def load_strategy(path: str) -> dict:
@@ -361,93 +151,30 @@ def load_strategy(path: str) -> dict:
 
 
 def validate_strategy(config: dict) -> dict:
-    """Validate and normalize a strategy config dict. Returns the validated config."""
-    # Check required fields
-    for field in REQUIRED_FIELDS:
-        if field not in config:
-            raise ValueError(f"Missing required field: {field}")
+    """Validate and normalize a strategy config dict via the domain model.
 
-    # Handle backward compatibility: convert old entry format to new format
-    entry_config = config["entry"]
-    if "trigger" in entry_config and "conditions" not in entry_config:
-        # Old format - convert to new format internally
-        conditions = [entry_config["trigger"]]
-        if entry_config.get("confirm"):
-            conditions.extend(entry_config["confirm"])
-        
-        # Keep original fields for backward compatibility but add new structure
-        entry_config["conditions"] = conditions
-        entry_config["logic"] = "all"  # Old format always used AND logic
-        
-        # Validate the trigger (for backward compatibility)
-        trigger_type = entry_config["trigger"]["type"]
-        if trigger_type not in VALID_TRIGGER_TYPES:
-            raise ValueError(f"Unknown trigger type: {trigger_type}. Valid: {VALID_TRIGGER_TYPES}")
-    
-    # Validate new format conditions
-    if "conditions" in entry_config:
-        for i, condition in enumerate(entry_config["conditions"]):
-            ctype = condition.get("type")
-            if not ctype:
-                raise ValueError(f"Condition {i} missing 'type' field")
-            if ctype not in VALID_TRIGGER_TYPES:
-                raise ValueError(f"Unknown condition type: {ctype}. Valid: {VALID_TRIGGER_TYPES}")
-            
-            # Validate required parameters by condition type
-            if ctype in ("current_drop", "period_drop", "selloff"):
-                if "threshold" not in condition:
-                    raise ValueError(f"{ctype} condition missing required 'threshold' parameter")
-                if "window_days" not in condition and ctype != "selloff":
-                    condition["window_days"] = 90  # Default
-            elif ctype == "daily_drop":
-                if "threshold" not in condition:
-                    raise ValueError(f"{ctype} condition missing required 'threshold' parameter")
-            elif ctype == "earnings_momentum":
-                # Set defaults for earnings_momentum
-                condition.setdefault("lookback_quarters", 4)
-                condition.setdefault("min_beats", 2)
-                if condition.get("lookback_quarters", 0) < 1 or condition.get("lookback_quarters", 0) > 8:
-                    raise ValueError("earnings_momentum lookback_quarters must be between 1 and 8")
-                if condition.get("min_beats", 0) < 0 or condition.get("min_beats", 0) > 8:
-                    raise ValueError("earnings_momentum min_beats must be between 0 and 8")
-        
-        # Validate logic field
-        logic = entry_config.get("logic") or "all"
-        entry_config["logic"] = logic
-        if logic not in ("all", "any"):
-            raise ValueError(f"Invalid entry logic: {logic}. Must be 'all' or 'any'")
+    Handles backward compat (tickers→symbols, trigger/confirm→conditions, days→max_days)
+    through the Pydantic model_validators, then returns a normalized dict with defaults applied.
+    """
+    sys.path.insert(0, str(Path(__file__).parent.parent / "server"))
+    from pydantic import ValidationError
+    from models.strategy import StrategyConfig
 
-    # Apply defaults for optional fields
-    for key, default in DEFAULTS.items():
-        if key not in config or config[key] is None:
-            config[key] = default
-        elif isinstance(default, dict):
-            merged = {**default, **config[key]}
-            config[key] = merged
-
-    # Validate ranking (optional)
-    if "ranking" in config:
-        rank_cfg = config["ranking"]
-        rank_by = rank_cfg.get("by", DEFAULT_RANKING_METRIC)
-        if rank_by not in VALID_RANKING_METRICS:
-            raise ValueError(f"Unknown ranking metric: {rank_by}. Valid: {VALID_RANKING_METRICS}")
-        rank_order = rank_cfg.get("order", DEFAULT_RANKING_ORDER)
-        if rank_order not in ("asc", "desc"):
-            raise ValueError(f"Invalid ranking order: {rank_order}. Must be 'asc' or 'desc'")
-
-    # Validate stop_loss
-    if config["stop_loss"]:
-        sl_type = config["stop_loss"].get("type")
-        if sl_type and sl_type not in VALID_STOP_TYPES:
-            raise ValueError(f"Unknown stop_loss type: {sl_type}")
-
-    # Validate take_profit
-    if config["take_profit"]:
-        tp_type = config["take_profit"].get("type")
-        if tp_type and tp_type not in VALID_TP_TYPES:
-            raise ValueError(f"Unknown take_profit type: {tp_type}")
-
-    return config
+    try:
+        validated = StrategyConfig.model_validate(config)
+        # Dump back to dict — engine works with dicts, not model instances.
+        # Use exclude_none=False so defaults (stop_loss=None, etc.) are present.
+        result = validated.model_dump(mode="json")
+        # Preserve extra fields the engine may have added (e.g. strategy_id from caller)
+        for k, v in config.items():
+            if k not in result:
+                result[k] = v
+        return result
+    except ValidationError as e:
+        # Convert Pydantic error to ValueError for backward compat with callers
+        first = e.errors()[0]
+        loc = " -> ".join(str(x) for x in first["loc"])
+        raise ValueError(f"{loc}: {first['msg']}")
 
 
 # ---------------------------------------------------------------------------

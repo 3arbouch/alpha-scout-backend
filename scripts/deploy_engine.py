@@ -225,18 +225,10 @@ CREATE INDEX IF NOT EXISTS idx_backtest_runs_created ON backtest_runs(created_at
 
 
 def get_db():
+    from schema import init_db
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
-    conn.executescript(SCHEMA)
-    # Create indexes individually (some may reference columns not yet migrated in old tables)
-    for line in SCHEMA_INDEXES.strip().split(";"):
-        line = line.strip()
-        if line:
-            try:
-                conn.execute(line)
-            except sqlite3.OperationalError:
-                pass  # index references a column from an older schema version — skip
-    conn.commit()
+    init_db(conn)
     return conn
 
 
@@ -1248,19 +1240,10 @@ CREATE INDEX IF NOT EXISTS idx_regime_alerts_deploy ON regime_alerts(deployment_
 
 
 def _get_regime_deploy_db():
+    from schema import init_db
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
-    conn.executescript(REGIME_DEPLOY_SCHEMA)
-    cols = {r[1] for r in conn.execute("PRAGMA table_info(regime_deployments)").fetchall()}
-    for col, typ in [
-        ("total_evaluated_days", "INTEGER DEFAULT 0"),
-        ("total_active_days", "INTEGER DEFAULT 0"),
-        ("last_activated_date", "TEXT"),
-        ("last_deactivated_date", "TEXT"),
-    ]:
-        if col not in cols:
-            conn.execute(f"ALTER TABLE regime_deployments ADD COLUMN {col} {typ}")
-    conn.commit()
+    init_db(conn)
     return conn
 
 

@@ -39,47 +39,8 @@ DEFAULT_PROMPT = (Path(__file__).parent / "program.md").read_text()
 # Schema
 # ---------------------------------------------------------------------------
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS auto_trader_templates (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    category TEXT NOT NULL,
-    description TEXT NOT NULL,
-    prompt TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_att_category ON auto_trader_templates(category);
-
-CREATE TABLE IF NOT EXISTS auto_trader_agents (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    prompt TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS auto_trader_runs (
-    id TEXT PRIMARY KEY,
-    name TEXT NOT NULL,
-    agent_id TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',
-    config TEXT NOT NULL,
-    current_iteration INTEGER DEFAULT 0,
-    max_experiments INTEGER NOT NULL,
-    best_metric_value REAL,
-    best_experiment_id TEXT,
-    pid INTEGER,
-    error TEXT,
-    started_at TEXT,
-    completed_at TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    FOREIGN KEY (agent_id) REFERENCES auto_trader_agents(id)
-);
-CREATE INDEX IF NOT EXISTS idx_atr_status ON auto_trader_runs(status);
-CREATE INDEX IF NOT EXISTS idx_atr_agent ON auto_trader_runs(agent_id);
-"""
+sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+from schema import init_db as _init_schema
 
 
 SEED_TEMPLATES = [
@@ -202,7 +163,7 @@ understanding of what drives winners and losers in tech. Do not overfit to the t
 
 def _ensure_tables():
     conn = get_db()
-    conn.executescript(SCHEMA)
+    _init_schema(conn)
     # Create default agent if none exists
     existing = conn.execute("SELECT COUNT(*) FROM auto_trader_agents").fetchone()[0]
     if existing == 0:
