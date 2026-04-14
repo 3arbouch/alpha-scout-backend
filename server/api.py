@@ -1926,6 +1926,29 @@ async def stop_deployment(deploy_id: str, _: str = Depends(verify_api_key)):
     return {"id": deploy_id, "status": "stopped"}
 
 
+@app.delete("/strategies/deployments/{deploy_id}", tags=["Deployments"])
+async def delete_deployment(deploy_id: str, _: str = Depends(verify_api_key)):
+    """Delete a deployment and all related data (sleeves, trades, alerts)."""
+    with get_db() as conn:
+        row = conn.execute("SELECT id, status FROM deployments WHERE id = ?", (deploy_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, f"Deployment '{deploy_id}' not found")
+        if row["status"] == "active":
+            raise HTTPException(409, "Cannot delete an active deployment. Stop it first.")
+        # Cascade delete related data
+        alert_ids = [r[0] for r in conn.execute(
+            "SELECT id FROM trade_alerts WHERE deployment_id = ?", (deploy_id,)).fetchall()]
+        if alert_ids:
+            placeholders = ",".join("?" * len(alert_ids))
+            conn.execute(f"DELETE FROM trade_executions WHERE alert_id IN ({placeholders})", alert_ids)
+        conn.execute("DELETE FROM trade_alerts WHERE deployment_id = ?", (deploy_id,))
+        conn.execute("DELETE FROM trades WHERE source_id = ?", (deploy_id,))
+        conn.execute("DELETE FROM sleeves WHERE deployment_id = ?", (deploy_id,))
+        conn.execute("DELETE FROM deployments WHERE id = ?", (deploy_id,))
+        conn.commit()
+    return {"deleted": deploy_id}
+
+
 @app.post("/strategies/deployments/{deploy_id}/pause", tags=["Deployments"])
 async def pause_deployment(deploy_id: str, _: str = Depends(verify_api_key)):
     """Pause a deployment (skip daily evaluations)."""
@@ -2762,6 +2785,29 @@ async def stop_portfolio_deployment(deploy_id: str, _: str = Depends(verify_api_
     """Stop a portfolio deployment."""
     _stop_portfolio(deploy_id)
     return {"deploy_id": deploy_id, "status": "stopped"}
+
+
+@app.delete("/portfolios/deployments/{deploy_id}", tags=["Portfolio Deployments"])
+async def delete_portfolio_deployment(deploy_id: str, _: str = Depends(verify_api_key)):
+    """Delete a portfolio deployment and all related data (sleeves, trades, alerts)."""
+    with get_db() as conn:
+        row = conn.execute("SELECT id, status FROM deployments WHERE id = ?", (deploy_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, f"Deployment '{deploy_id}' not found")
+        if row["status"] == "active":
+            raise HTTPException(409, "Cannot delete an active deployment. Stop it first.")
+        # Cascade delete related data
+        alert_ids = [r[0] for r in conn.execute(
+            "SELECT id FROM trade_alerts WHERE deployment_id = ?", (deploy_id,)).fetchall()]
+        if alert_ids:
+            placeholders = ",".join("?" * len(alert_ids))
+            conn.execute(f"DELETE FROM trade_executions WHERE alert_id IN ({placeholders})", alert_ids)
+        conn.execute("DELETE FROM trade_alerts WHERE deployment_id = ?", (deploy_id,))
+        conn.execute("DELETE FROM trades WHERE source_id = ?", (deploy_id,))
+        conn.execute("DELETE FROM sleeves WHERE deployment_id = ?", (deploy_id,))
+        conn.execute("DELETE FROM deployments WHERE id = ?", (deploy_id,))
+        conn.commit()
+    return {"deleted": deploy_id}
 
 
 @app.post("/portfolios/deployments/{deploy_id}/pause", tags=["Portfolio Deployments"])
