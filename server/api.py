@@ -1747,9 +1747,9 @@ async def deploy_config(body: DeployConfigRequest, _: str = Depends(verify_api_k
             )
             conn.commit()
 
-    # Deploy
+    # Deploy — pass portfolio_id so deployment records the FK
     try:
-        result = await _run_sync(deploy, config, body.start_date, body.initial_capital, body.name)
+        result = await _run_sync(deploy, config, body.start_date, body.initial_capital, body.name, portfolio_id)
         result["portfolio_id"] = portfolio_id
         return result
     except Exception as e:
@@ -1777,6 +1777,7 @@ async def list_deployments_unified(
             "type": d.get("type", "strategy"),
             "name": d.get("name", ""),
             "num_sleeves": d.get("num_sleeves", 1),
+            "portfolio_id": d.get("portfolio_id"),
             "start_date": d["start_date"],
             "initial_capital": d["initial_capital"],
             "status": d["status"],
@@ -1827,6 +1828,7 @@ async def get_deployment_unified(deploy_id: str, _: str = Depends(verify_api_key
         "type": d.get("type", "strategy"),
         "name": d.get("name", ""),
         "num_sleeves": d.get("num_sleeves", 1),
+        "portfolio_id": d.get("portfolio_id"),
         "config": config,
         "start_date": d["start_date"],
         "initial_capital": d["initial_capital"],
@@ -2050,6 +2052,7 @@ async def list_deployments(
             "type": d.get("type", "strategy"),
             "name": d.get("name", ""),
             "num_sleeves": d.get("num_sleeves", 1),
+            "portfolio_id": d.get("portfolio_id"),
             "start_date": d["start_date"],
             "initial_capital": d["initial_capital"],
             "status": d["status"],
@@ -2105,6 +2108,7 @@ async def get_deployment(deploy_id: str, _: str = Depends(verify_api_key)):
         "type": d.get("type", "strategy"),
         "name": d.get("name", ""),
         "num_sleeves": d.get("num_sleeves", 1),
+        "portfolio_id": d.get("portfolio_id"),
         "config": config,
         "start_date": d["start_date"],
         "initial_capital": d["initial_capital"],
@@ -3185,18 +3189,41 @@ async def get_portfolio_alerts_today(_: str = Depends(verify_api_key)):
 
 @app.get("/portfolios/{portfolio_id}", tags=["Portfolios"])
 async def get_portfolio(portfolio_id: str, _: str = Depends(verify_api_key)):
-    """Get a single portfolio."""
+    """Get a single portfolio with lineage: source experiments and active deployments."""
     with get_db() as conn:
         cur = conn.execute(
             "SELECT portfolio_id, name, config, created_at, updated_at FROM portfolios WHERE portfolio_id = ?",
             (portfolio_id,),
         )
         row = cur.fetchone()
-    if not row:
-        raise HTTPException(404, f"Portfolio {portfolio_id} not found")
+        if not row:
+            raise HTTPException(404, f"Portfolio {portfolio_id} not found")
+
+        # Linked experiments (research history)
+        experiments = [dict(r) for r in conn.execute(
+            """SELECT id, run_id, iteration, target_metric, target_value, decision,
+                      sharpe_ratio, alpha_ann_pct, total_return_pct, max_drawdown_pct,
+                      annualized_volatility_pct, created_at
+               FROM experiments WHERE portfolio_id = ? ORDER BY created_at DESC""",
+            (portfolio_id,),
+        ).fetchall()]
+
+        # Linked deployments (live trading)
+        deployments = [dict(r) for r in conn.execute(
+            """SELECT id, type, name, status, start_date, initial_capital,
+                      last_nav, last_return_pct, last_sharpe_ratio, last_evaluated, created_at
+               FROM deployments WHERE portfolio_id = ? ORDER BY created_at DESC""",
+            (portfolio_id,),
+        ).fetchall()]
+
     return {
-        "portfolio_id": row["portfolio_id"], "name": row["name"], "config": json.loads(row["config"]),
-        "created_at": row["created_at"], "updated_at": row["updated_at"],
+        "portfolio_id": row["portfolio_id"],
+        "name": row["name"],
+        "config": json.loads(row["config"]),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "experiments": experiments,
+        "deployments": deployments,
     }
 
 

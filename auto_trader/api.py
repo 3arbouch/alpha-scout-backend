@@ -797,7 +797,8 @@ async def list_experiments(
 
     conn = get_db()
     rows = conn.execute(
-        """SELECT id, iteration, thesis, target_metric, target_value, conditions_met,
+        """SELECT id, iteration, thesis, portfolio_id,
+                  target_metric, target_value, conditions_met,
                   total_return_pct, annualized_return_pct, sharpe_ratio, sortino_ratio,
                   max_drawdown_pct, annualized_volatility_pct, alpha_ann_pct,
                   alpha_vs_market_pct, alpha_vs_sector_pct,

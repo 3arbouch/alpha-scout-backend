@@ -429,7 +429,7 @@ def persist_sleeves(source_type: str, source_id: str, portfolio_result: dict,
 # Deploy (unified)
 # ---------------------------------------------------------------------------
 def deploy(config_or_path, start_date: str, capital: float,
-           name: str = None) -> dict:
+           name: str = None, portfolio_id: str = None) -> dict:
     """
     Deploy a strategy or portfolio for live paper-trading.
 
@@ -439,6 +439,7 @@ def deploy(config_or_path, start_date: str, capital: float,
       - A file path to a portfolio JSON config
 
     Single strategies are auto-wrapped as one-sleeve portfolios.
+    portfolio_id links the deployment to the source portfolio entity.
     """
     # Load config
     if isinstance(config_or_path, (str, Path)):
@@ -484,10 +485,10 @@ def deploy(config_or_path, start_date: str, capital: float,
     conn = get_db()
     conn.execute(
         """INSERT INTO deployments
-           (id, type, name, config_json, start_date, initial_capital,
+           (id, type, name, portfolio_id, config_json, start_date, initial_capital,
             num_sleeves, status, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
-        (deploy_id, deploy_type, deploy_name, json.dumps(portfolio_config),
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
+        (deploy_id, deploy_type, deploy_name, portfolio_id, json.dumps(portfolio_config),
          start_date, capital, num_sleeves, now, now),
     )
     conn.commit()

@@ -275,6 +275,29 @@ def normalize_config(portfolio_config: dict) -> dict:
     return config
 
 
+def save_portfolio(portfolio_config: dict) -> str | None:
+    """Save a portfolio config to the portfolios table (idempotent).
+    Returns portfolio_id, or None if save fails.
+
+    Uses deterministic hash so identical configs dedupe to the same ID.
+    """
+    try:
+        from portfolio_engine import compute_portfolio_id
+        pid = compute_portfolio_id(portfolio_config)
+        conn = get_db()
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "INSERT OR IGNORE INTO portfolios (portfolio_id, name, config, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (pid, portfolio_config.get("name", "Unnamed"), json.dumps(portfolio_config), now, now),
+        )
+        conn.commit()
+        conn.close()
+        return pid
+    except Exception as e:
+        print(f"  [warn] Failed to save portfolio: {e}")
+        return None
+
+
 def run_backtest(portfolio_config: dict, start: str, end: str, capital: float,
                  sector: str | None = None) -> dict | None:
     """Run a portfolio backtest. Returns metrics dict with both market and sector alpha."""
@@ -527,6 +550,9 @@ Remember: query the data first, don't guess. Explore before you commit."""
 
     duration_total = time.time() - t0
 
+    # Save portfolio to portfolios table (idempotent) — links experiment → portfolio
+    portfolio_id = save_portfolio(portfolio_config)
+
     exp_id = log_experiment(
         run_id=run_id, iteration=iteration,
         thesis=thesis, assumptions=assumptions, portfolio_config=portfolio_config,
@@ -536,6 +562,7 @@ Remember: query the data first, don't guess. Explore before you commit."""
         backtest_start=backtest_start, backtest_end=backtest_end,
         initial_capital=initial_capital, model=model,
         session_id=session_id, duration_seconds=duration_total,
+        portfolio_id=portfolio_id,
     )
 
     print(f"  {target_metric}: {target_value:.4f}" if target_value else f"  {target_metric}: N/A")

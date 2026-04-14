@@ -52,6 +52,7 @@ def log_experiment(
     tokens_used: int = None,
     duration_seconds: float = None,
     error: str = None,
+    portfolio_id: str = None,
 ) -> str:
     """Log a single experiment. Returns the experiment ID."""
     exp_id = generate_experiment_id(run_id, iteration)
@@ -64,7 +65,7 @@ def log_experiment(
     conn = get_db()
     conn.execute(
         """INSERT INTO experiments
-           (id, run_id, iteration, thesis, assumptions, portfolio_config,
+           (id, run_id, iteration, thesis, assumptions, portfolio_id, portfolio_config,
             target_metric, target_value, conditions, conditions_met,
             total_return_pct, annualized_return_pct, sharpe_ratio, sortino_ratio,
             max_drawdown_pct, annualized_volatility_pct, alpha_ann_pct,
@@ -75,9 +76,9 @@ def log_experiment(
             decision, best_value_so_far, improvement_pct,
             backtest_start, backtest_end, initial_capital,
             model, session_id, tokens_used, duration_seconds, error, created_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (exp_id, run_id, iteration,
-         thesis, json.dumps(assumptions), json.dumps(portfolio_config),
+         thesis, json.dumps(assumptions), portfolio_id, json.dumps(portfolio_config),
          target_metric, target_value, json.dumps(conditions), 1 if conditions_met else 0,
          metrics.get("total_return_pct"), metrics.get("annualized_return_pct"),
          metrics.get("sharpe_ratio"), metrics.get("sortino_ratio"),

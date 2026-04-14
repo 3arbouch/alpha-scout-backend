@@ -194,7 +194,8 @@ CREATE TABLE IF NOT EXISTS deployments (
     id                              TEXT PRIMARY KEY,
     type                            TEXT NOT NULL DEFAULT 'portfolio',
     name                            TEXT NOT NULL,
-    config_json                     TEXT NOT NULL,
+    portfolio_id                    TEXT,                       -- FK → portfolios.portfolio_id (lineage)
+    config_json                     TEXT NOT NULL,              -- frozen snapshot at deploy time
     start_date                      TEXT NOT NULL,
     initial_capital                 REAL NOT NULL,
     status                          TEXT NOT NULL DEFAULT 'active',
@@ -232,6 +233,7 @@ CREATE TABLE IF NOT EXISTS deployments (
 );
 CREATE INDEX IF NOT EXISTS idx_deployments_status ON deployments(status);
 CREATE INDEX IF NOT EXISTS idx_deployments_type ON deployments(type);
+CREATE INDEX IF NOT EXISTS idx_deployments_portfolio ON deployments(portfolio_id);
 """
 
 SLEEVES = """
@@ -447,7 +449,8 @@ CREATE TABLE IF NOT EXISTS experiments (
     -- Agent output
     thesis                          TEXT,
     assumptions                     TEXT,
-    portfolio_config                TEXT,
+    portfolio_id                    TEXT,              -- FK → portfolios.portfolio_id (lineage)
+    portfolio_config                TEXT,              -- legacy: will be phased out, use portfolio_id instead
     -- Optimization target
     target_metric                   TEXT,
     target_value                    REAL,
@@ -488,6 +491,7 @@ CREATE TABLE IF NOT EXISTS experiments (
 );
 CREATE INDEX IF NOT EXISTS idx_experiments_run ON experiments(run_id, iteration);
 CREATE INDEX IF NOT EXISTS idx_experiments_decision ON experiments(run_id, decision);
+CREATE INDEX IF NOT EXISTS idx_experiments_portfolio ON experiments(portfolio_id);
 """
 
 
@@ -608,7 +612,29 @@ ALL_SCHEMAS = [
 ]
 
 
+def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, coltype: str):
+    """Add a column to an existing table if it doesn't already exist."""
+    cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {coltype}")
+
+
+def _apply_migrations(conn: sqlite3.Connection):
+    """Add columns to existing tables that don't have them yet.
+    Run BEFORE schema CREATEs so subsequent index creation on those columns works."""
+    # Check each table exists first (may not if DB is brand new)
+    existing_tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+    if "experiments" in existing_tables:
+        _add_column_if_missing(conn, "experiments", "portfolio_id", "TEXT")
+    if "deployments" in existing_tables:
+        _add_column_if_missing(conn, "deployments", "portfolio_id", "TEXT")
+
+
 def init_db(conn: sqlite3.Connection):
-    """Create all tables and indexes. Idempotent (IF NOT EXISTS)."""
+    """Create all tables and indexes. Idempotent (IF NOT EXISTS + ALTER)."""
+    # Run migrations first so subsequent indexes on new columns work
+    _apply_migrations(conn)
+
     for schema in ALL_SCHEMAS:
         conn.executescript(schema)
+    conn.commit()
