@@ -1688,6 +1688,62 @@ SCRIPTS_DIR = WORKSPACE / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 
+# ---------------------------------------------------------------------------
+# Unified Deploy — accepts a full config directly, no DB lookup needed
+# ---------------------------------------------------------------------------
+
+class DeployConfigRequest(BaseModel):
+    """Deploy a strategy or portfolio by providing the full config directly.
+    Self-contained — regime_definitions, sleeves, everything is in the config."""
+    config: dict = Field(description="Full portfolio or strategy config JSON. If it has 'sleeves', treated as portfolio. Otherwise auto-wrapped as single-sleeve portfolio.")
+    start_date: str = Field(description="Deploy start date (YYYY-MM-DD)")
+    initial_capital: float = Field(default=1_000_000, ge=1000, description="Starting capital in USD")
+    name: str | None = Field(default=None, description="Override the config name")
+
+
+@app.post("/deploy", tags=["Deployments"], status_code=201)
+async def deploy_config(body: DeployConfigRequest, _: str = Depends(verify_api_key)):
+    """Deploy a strategy or portfolio for live paper-trading.
+
+    Accepts the full config directly — no need to save to portfolios/strategies first.
+    The config is frozen at deploy time and used for all future evaluations.
+
+    If the config has 'sleeves', it's deployed as a portfolio.
+    If it has 'universe' and 'entry', it's auto-wrapped as a single-sleeve portfolio.
+    Inline regime_definitions are supported — no DB regime lookup needed.
+    """
+    import traceback
+    from deploy_engine import deploy
+
+    # Validate the config
+    config = body.config
+    is_portfolio = "sleeves" in config or "strategies" in config
+    if is_portfolio:
+        try:
+            validated = PortfolioConfig.model_validate(config)
+            config = validated.model_dump(mode="json", exclude_none=True)
+        except Exception as e:
+            raise HTTPException(422, f"Invalid portfolio config: {e}")
+    else:
+        try:
+            from models.strategy import StrategyConfig
+            validated = StrategyConfig.model_validate(config)
+            config = validated.model_dump(mode="json", exclude_none=True)
+        except Exception as e:
+            raise HTTPException(422, f"Invalid strategy config: {e}")
+
+    try:
+        result = await _run_sync(deploy, config, body.start_date, body.initial_capital, body.name)
+        return result
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(500, f"Deployment failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Legacy Deploy Endpoints (kept for backward compat)
+# ---------------------------------------------------------------------------
+
 class DeployRequest(BaseModel):
     config_path: str | None = None  # path to strategy config (relative to workspace)
     backtest_run_id: str | None = None  # OR deploy from a previous backtest run
