@@ -356,8 +356,8 @@ async def run_agent_iteration(
 
     prompt = f"""You are on experiment {iteration} of an autonomous research loop.
 
-**Objective:** Design a portfolio that {"maximizes" if METRIC_DIRECTION.get(target_metric, True) else "minimizes"} `{target_metric}`.
-**Conditions:** {conditions_desc if conditions else 'None'}
+**Objective (portfolio level):** Design a portfolio that {"maximizes" if METRIC_DIRECTION.get(target_metric, True) else "minimizes"} `{target_metric}`.
+**Conditions (portfolio level):** {conditions_desc if conditions else 'None'}
 **Backtest period:** {backtest_start} to {backtest_end}
 **Capital:** ${initial_capital:,.0f}
 **Alpha benchmark:** {benchmark_desc}{sector_desc}
