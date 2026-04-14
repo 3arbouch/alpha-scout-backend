@@ -1705,8 +1705,8 @@ class DeployConfigRequest(BaseModel):
 async def deploy_config(body: DeployConfigRequest, _: str = Depends(verify_api_key)):
     """Deploy a strategy or portfolio for live paper-trading.
 
-    Accepts the full config directly — no need to save to portfolios/strategies first.
-    The config is frozen at deploy time and used for all future evaluations.
+    Accepts the full config directly. The config is validated, saved to the
+    portfolios table (for future reference/re-deployment), then deployed.
 
     If the config has 'sleeves', it's deployed as a portfolio.
     If it has 'universe' and 'entry', it's auto-wrapped as a single-sleeve portfolio.
@@ -1732,8 +1732,25 @@ async def deploy_config(body: DeployConfigRequest, _: str = Depends(verify_api_k
         except Exception as e:
             raise HTTPException(422, f"Invalid strategy config: {e}")
 
+    # Save to portfolios table (idempotent — deduplicates via portfolio_id hash)
+    from portfolio_engine import compute_portfolio_id
+    portfolio_id = compute_portfolio_id(config)
+    now = datetime.now(timezone.utc).isoformat()
+    with get_db() as conn:
+        existing = conn.execute(
+            "SELECT portfolio_id FROM portfolios WHERE portfolio_id = ?", (portfolio_id,)
+        ).fetchone()
+        if not existing:
+            conn.execute(
+                "INSERT INTO portfolios (portfolio_id, name, config, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                (portfolio_id, config.get("name", "Unnamed"), json.dumps(config), now, now),
+            )
+            conn.commit()
+
+    # Deploy
     try:
         result = await _run_sync(deploy, config, body.start_date, body.initial_capital, body.name)
+        result["portfolio_id"] = portfolio_id
         return result
     except Exception as e:
         traceback.print_exc()
