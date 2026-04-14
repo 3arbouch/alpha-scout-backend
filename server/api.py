@@ -3196,6 +3196,22 @@ async def stop_regime_deployment_endpoint(deploy_id: str, _: str = Depends(verif
     return {"deploy_id": deploy_id, "status": "stopped"}
 
 
+@app.delete("/regimes/deployments/{deploy_id}", tags=["Regime Deployments"])
+async def delete_regime_deployment_endpoint(deploy_id: str, _: str = Depends(verify_api_key)):
+    """Delete a regime deployment and its state history and alerts."""
+    with get_db() as conn:
+        row = conn.execute("SELECT id, status FROM regime_deployments WHERE id = ?", (deploy_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, f"Regime deployment '{deploy_id}' not found")
+        if row["status"] == "active":
+            raise HTTPException(409, "Cannot delete an active regime deployment. Stop it first.")
+        conn.execute("DELETE FROM regime_alerts WHERE deployment_id = ?", (deploy_id,))
+        conn.execute("DELETE FROM regime_state_history WHERE deployment_id = ?", (deploy_id,))
+        conn.execute("DELETE FROM regime_deployments WHERE id = ?", (deploy_id,))
+        conn.commit()
+    return {"deleted": deploy_id}
+
+
 @app.post("/regimes/deployments/{deploy_id}/pause", tags=["Regime Deployments"])
 async def pause_regime_deployment_endpoint(deploy_id: str, _: str = Depends(verify_api_key)):
     _pause_regime_deploy(deploy_id)
