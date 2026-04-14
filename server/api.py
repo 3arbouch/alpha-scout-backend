@@ -1152,6 +1152,7 @@ def _compute_strategy_id(config: dict) -> str:
 
 def _ensure_strategies_table():
     """Ensure all app tables exist."""
+    sys.path.insert(0, str(WORKSPACE / "scripts"))
     from schema import init_db
     with get_db() as conn:
         init_db(conn)
