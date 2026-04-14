@@ -1498,9 +1498,9 @@ def get_regime_alerts(deploy_id: str = None, date: str = None, limit: int = 50) 
 # Compatibility aliases for api.py (v1 portfolio function names → v2 unified)
 # ---------------------------------------------------------------------------
 
-def deploy_portfolio(portfolio_config, start_date, capital, name=None):
+def deploy_portfolio(portfolio_config, start_date, capital, name=None, portfolio_id=None):
     """Deploy a portfolio. Alias for deploy()."""
-    return deploy(portfolio_config, start_date, capital, name)
+    return deploy(portfolio_config, start_date, capital, name, portfolio_id)
 
 def evaluate_portfolio_one(deploy_id):
     """Evaluate a portfolio deployment. Alias for evaluate_one()."""

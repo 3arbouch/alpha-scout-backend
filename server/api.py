@@ -1689,89 +1689,6 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 
 
 # ---------------------------------------------------------------------------
-# Unified Deploy — accepts a full config directly, no DB lookup needed
-# ---------------------------------------------------------------------------
-
-class DeployConfigRequest(BaseModel):
-    """Deploy a strategy or portfolio. Provide EITHER config OR portfolio_id (not both)."""
-    config: dict | None = Field(default=None, description="Full portfolio or strategy config JSON. Saved to portfolios table before deploy.")
-    portfolio_id: str | None = Field(default=None, description="Deploy an already-saved portfolio by ID.")
-    start_date: str = Field(description="Deploy start date (YYYY-MM-DD)")
-    initial_capital: float = Field(default=1_000_000, ge=1000, description="Starting capital in USD")
-    name: str | None = Field(default=None, description="Override the config name")
-
-
-@app.post("/deploy", tags=["Deployments"], status_code=201)
-async def deploy_config(body: DeployConfigRequest, _: str = Depends(verify_api_key)):
-    """Deploy a strategy or portfolio for live paper-trading.
-
-    Provide EITHER:
-      - `config`: full config JSON — validated, saved to portfolios table, deployed
-      - `portfolio_id`: reference to an already-saved portfolio — looked up and deployed
-
-    Exactly one must be set.
-    """
-    import traceback
-    from deploy_engine import deploy
-    from portfolio_engine import compute_portfolio_id
-
-    if (body.config is None) == (body.portfolio_id is None):
-        raise HTTPException(400, "Provide exactly one of 'config' or 'portfolio_id'")
-
-    # Resolve to a validated config + portfolio_id
-    if body.portfolio_id:
-        # Load from saved portfolio
-        with get_db() as conn:
-            row = conn.execute(
-                "SELECT config FROM portfolios WHERE portfolio_id = ?", (body.portfolio_id,)
-            ).fetchone()
-        if not row:
-            raise HTTPException(404, f"Portfolio '{body.portfolio_id}' not found")
-        config = json.loads(row["config"])
-        portfolio_id = body.portfolio_id
-    else:
-        # Validate the provided config
-        config = body.config
-        is_portfolio = "sleeves" in config or "strategies" in config
-        if is_portfolio:
-            try:
-                validated = PortfolioConfig.model_validate(config)
-                config = validated.model_dump(mode="json", exclude_none=True)
-            except Exception as e:
-                raise HTTPException(422, f"Invalid portfolio config: {e}")
-        else:
-            try:
-                from models.strategy import StrategyConfig
-                validated = StrategyConfig.model_validate(config)
-                config = validated.model_dump(mode="json", exclude_none=True)
-            except Exception as e:
-                raise HTTPException(422, f"Invalid strategy config: {e}")
-
-        # Save to portfolios table (idempotent — deduplicates via portfolio_id hash)
-        portfolio_id = compute_portfolio_id(config)
-        now = datetime.now(timezone.utc).isoformat()
-        with get_db() as conn:
-            existing = conn.execute(
-                "SELECT portfolio_id FROM portfolios WHERE portfolio_id = ?", (portfolio_id,)
-            ).fetchone()
-            if not existing:
-                conn.execute(
-                    "INSERT INTO portfolios (portfolio_id, name, config, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                    (portfolio_id, config.get("name", "Unnamed"), json.dumps(config), now, now),
-                )
-                conn.commit()
-
-    # Deploy — pass portfolio_id so deployment records the FK
-    try:
-        result = await _run_sync(deploy, config, body.start_date, body.initial_capital, body.name, portfolio_id)
-        result["portfolio_id"] = portfolio_id
-        return result
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(500, f"Deployment failed: {e}")
-
-
-# ---------------------------------------------------------------------------
 # Unified Deployment Management — /deployments/
 # ---------------------------------------------------------------------------
 
@@ -3025,7 +2942,8 @@ async def deploy_portfolio_endpoint(body: PortfolioDeployRequest, _: str = Depen
     config["portfolio_id"] = body.portfolio_id
 
     try:
-        result = await _run_sync(_deploy_portfolio, config, body.start_date, body.initial_capital, body.name)
+        # Pass portfolio_id so deployment records the FK for lineage
+        result = await _run_sync(_deploy_portfolio, config, body.start_date, body.initial_capital, body.name, body.portfolio_id)
         return result
     except Exception as e:
         traceback.print_exc()
