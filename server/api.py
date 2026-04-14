@@ -1741,6 +1741,218 @@ async def deploy_config(body: DeployConfigRequest, _: str = Depends(verify_api_k
 
 
 # ---------------------------------------------------------------------------
+# Unified Deployment Management — /deployments/
+# ---------------------------------------------------------------------------
+
+@app.get("/deployments", tags=["Deployments (Unified)"])
+async def list_deployments_unified(
+    include_stopped: bool = Query(False),
+    type: Optional[str] = Query(None, description="Filter by type: 'strategy' or 'portfolio'"),
+    _: str = Depends(verify_api_key),
+):
+    """List all deployments. Optional ?type=strategy or ?type=portfolio filter."""
+    from deploy_engine import list_deployments as _list
+    deployments = _list(include_stopped=include_stopped, deploy_type=type)
+    return {
+        "total": len(deployments),
+        "data": [_sanitize_floats({
+            "id": d["id"],
+            "type": d.get("type", "strategy"),
+            "name": d.get("name", ""),
+            "num_sleeves": d.get("num_sleeves", 1),
+            "start_date": d["start_date"],
+            "initial_capital": d["initial_capital"],
+            "status": d["status"],
+            "created_at": d["created_at"],
+            "last_evaluated": d.get("last_evaluated"),
+            "last_nav": d.get("last_nav"),
+            "last_return_pct": d.get("last_return_pct"),
+            "total_trades": d.get("total_trades", 0),
+            "open_positions": d.get("open_positions", 0),
+            "last_alpha_pct": d.get("last_alpha_pct"),
+            "last_benchmark_return_pct": d.get("last_benchmark_return_pct"),
+            "alpha_vs_market_pct": d.get("alpha_vs_market_pct"),
+            "alpha_vs_sector_pct": d.get("alpha_vs_sector_pct"),
+            "market_benchmark_return_pct": d.get("market_benchmark_return_pct"),
+            "sector_benchmark_return_pct": d.get("sector_benchmark_return_pct"),
+            "last_sharpe_ratio": d.get("last_sharpe_ratio"),
+            "last_max_drawdown_pct": d.get("last_max_drawdown_pct"),
+            "last_ann_volatility_pct": d.get("last_ann_volatility_pct"),
+            "rolling_vol_30d_pct": d.get("rolling_vol_30d_pct"),
+            "current_utilization_pct": d.get("current_utilization_pct"),
+            "peak_utilized_capital": d.get("peak_utilized_capital"),
+            "avg_utilized_capital": d.get("avg_utilized_capital"),
+            "utilization_pct": d.get("utilization_pct"),
+            "return_on_utilized_capital_pct": d.get("return_on_utilized_capital_pct"),
+            "alert_mode": bool(d.get("alert_mode", 0)),
+            "error": d.get("error"),
+        }) for d in deployments],
+    }
+
+
+@app.get("/deployments/{deploy_id}", tags=["Deployments (Unified)"])
+async def get_deployment_unified(deploy_id: str, _: str = Depends(verify_api_key)):
+    """Get full deployment details. Response includes sleeve/regime data for portfolio deployments."""
+    from deploy_engine import get_deployment as _get
+    d = _get(deploy_id)
+    if not d:
+        raise HTTPException(404, f"Deployment '{deploy_id}' not found")
+
+    config = None
+    if d.get("config_json"):
+        try:
+            config = json.loads(d["config_json"]) if isinstance(d["config_json"], str) else d["config_json"]
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    result = _sanitize_floats({
+        "id": d["id"],
+        "type": d.get("type", "strategy"),
+        "name": d.get("name", ""),
+        "num_sleeves": d.get("num_sleeves", 1),
+        "config": config,
+        "start_date": d["start_date"],
+        "initial_capital": d["initial_capital"],
+        "status": d["status"],
+        "created_at": d["created_at"],
+        "last_evaluated": d.get("last_evaluated"),
+        "last_nav": d.get("last_nav"),
+        "last_return_pct": d.get("last_return_pct"),
+        "total_trades": d.get("total_trades", 0),
+        "open_positions": d.get("open_positions", 0),
+        "last_alpha_pct": d.get("last_alpha_pct"),
+        "last_benchmark_return_pct": d.get("last_benchmark_return_pct"),
+        "alpha_vs_market_pct": d.get("alpha_vs_market_pct"),
+        "alpha_vs_sector_pct": d.get("alpha_vs_sector_pct"),
+        "market_benchmark_return_pct": d.get("market_benchmark_return_pct"),
+        "sector_benchmark_return_pct": d.get("sector_benchmark_return_pct"),
+        "last_sharpe_ratio": d.get("last_sharpe_ratio"),
+        "last_max_drawdown_pct": d.get("last_max_drawdown_pct"),
+        "last_ann_volatility_pct": d.get("last_ann_volatility_pct"),
+        "rolling_vol_30d_pct": d.get("rolling_vol_30d_pct"),
+        "current_utilization_pct": d.get("current_utilization_pct"),
+        "peak_utilized_capital": d.get("peak_utilized_capital"),
+        "avg_utilized_capital": d.get("avg_utilized_capital"),
+        "utilization_pct": d.get("utilization_pct"),
+        "return_on_utilized_capital_pct": d.get("return_on_utilized_capital_pct"),
+        "alert_mode": bool(d.get("alert_mode", 0)),
+        "error": d.get("error"),
+    })
+
+    # Rich data from results file
+    if d.get("metrics"):
+        result["metrics"] = _sanitize_floats(d["metrics"])
+    if d.get("sleeves"):
+        result["sleeves"] = _sanitize_floats(d["sleeves"])
+    if d.get("nav_history"):
+        result["nav_history"] = d["nav_history"]
+    if d.get("benchmark"):
+        result["benchmark"] = _sanitize_floats(d["benchmark"])
+    if d.get("regime_history"):
+        result["regime_history"] = d["regime_history"]
+
+    return result
+
+
+@app.post("/deployments/{deploy_id}/evaluate", tags=["Deployments (Unified)"])
+async def evaluate_deployment_unified(deploy_id: str, _: str = Depends(verify_api_key)):
+    """Manually trigger re-evaluation of a deployment."""
+    from deploy_engine import evaluate_one
+    result = await _run_sync(evaluate_one, deploy_id)
+    if result is None:
+        raise HTTPException(400, f"Could not evaluate '{deploy_id}' — check status/errors")
+    metrics = result.get("metrics", {})
+    return _sanitize_floats({
+        "id": deploy_id,
+        "status": "evaluated",
+        "nav": metrics.get("final_nav"),
+        "return_pct": metrics.get("total_return_pct"),
+        "total_trades": metrics.get("total_trades"),
+    })
+
+
+@app.post("/deployments/{deploy_id}/stop", tags=["Deployments (Unified)"])
+async def stop_deployment_unified(deploy_id: str, _: str = Depends(verify_api_key)):
+    """Stop a deployment."""
+    from deploy_engine import stop_deployment as _stop
+    _stop(deploy_id)
+    return {"id": deploy_id, "status": "stopped"}
+
+
+@app.post("/deployments/{deploy_id}/pause", tags=["Deployments (Unified)"])
+async def pause_deployment_unified(deploy_id: str, _: str = Depends(verify_api_key)):
+    """Pause a deployment (skip evaluations)."""
+    from deploy_engine import pause_deployment as _pause
+    _pause(deploy_id)
+    return {"id": deploy_id, "status": "paused"}
+
+
+@app.post("/deployments/{deploy_id}/resume", tags=["Deployments (Unified)"])
+async def resume_deployment_unified(deploy_id: str, _: str = Depends(verify_api_key)):
+    """Resume a paused deployment."""
+    from deploy_engine import resume_deployment as _resume
+    _resume(deploy_id)
+    return {"id": deploy_id, "status": "active"}
+
+
+@app.delete("/deployments/{deploy_id}", tags=["Deployments (Unified)"])
+async def delete_deployment_unified(deploy_id: str, _: str = Depends(verify_api_key)):
+    """Delete a stopped deployment and all related data."""
+    with get_db() as conn:
+        row = conn.execute("SELECT id, status FROM deployments WHERE id = ?", (deploy_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, f"Deployment '{deploy_id}' not found")
+        if row["status"] == "active":
+            raise HTTPException(409, "Cannot delete an active deployment. Stop it first.")
+        alert_ids = [r[0] for r in conn.execute(
+            "SELECT id FROM trade_alerts WHERE deployment_id = ?", (deploy_id,)).fetchall()]
+        if alert_ids:
+            placeholders = ",".join("?" * len(alert_ids))
+            conn.execute(f"DELETE FROM trade_executions WHERE alert_id IN ({placeholders})", alert_ids)
+        conn.execute("DELETE FROM trade_alerts WHERE deployment_id = ?", (deploy_id,))
+        conn.execute("DELETE FROM trades WHERE source_id = ?", (deploy_id,))
+        conn.execute("DELETE FROM sleeves WHERE deployment_id = ?", (deploy_id,))
+        conn.execute("DELETE FROM deployments WHERE id = ?", (deploy_id,))
+        conn.commit()
+    return {"deleted": deploy_id}
+
+
+@app.get("/deployments/{deploy_id}/alerts", tags=["Deployments (Unified)"])
+async def get_deployment_alerts_unified(
+    deploy_id: str,
+    date: str = Query(None), status: str = Query(None), limit: int = Query(100),
+    _: str = Depends(verify_api_key),
+):
+    """List trade alerts for a deployment."""
+    from deploy_engine import get_alerts
+    alerts = get_alerts(deploy_id=deploy_id, date=date, status=status, limit=limit)
+    return {"deploy_id": deploy_id, "total": len(alerts), "data": alerts}
+
+
+@app.get("/deployments/{deploy_id}/alerts/summary", tags=["Deployments (Unified)"])
+async def get_deployment_alerts_summary_unified(deploy_id: str, _: str = Depends(verify_api_key)):
+    """Get alert execution summary for a deployment."""
+    from deploy_engine import get_execution_summary as _summary
+    return _summary(deploy_id)
+
+
+@app.post("/deployments/{deploy_id}/alerts/enable", tags=["Deployments (Unified)"])
+async def enable_deployment_alerts_unified(deploy_id: str, _: str = Depends(verify_api_key)):
+    """Enable alert mode for a deployment."""
+    from deploy_engine import set_alert_mode
+    result = set_alert_mode(deploy_id, True)
+    return result
+
+
+@app.post("/deployments/{deploy_id}/alerts/disable", tags=["Deployments (Unified)"])
+async def disable_deployment_alerts_unified(deploy_id: str, _: str = Depends(verify_api_key)):
+    """Disable alert mode for a deployment."""
+    from deploy_engine import set_alert_mode
+    result = set_alert_mode(deploy_id, False)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Legacy Deploy Endpoints (kept for backward compat)
 # ---------------------------------------------------------------------------
 
