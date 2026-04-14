@@ -1693,9 +1693,9 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 # ---------------------------------------------------------------------------
 
 class DeployConfigRequest(BaseModel):
-    """Deploy a strategy or portfolio by providing the full config directly.
-    Self-contained — regime_definitions, sleeves, everything is in the config."""
-    config: dict = Field(description="Full portfolio or strategy config JSON. If it has 'sleeves', treated as portfolio. Otherwise auto-wrapped as single-sleeve portfolio.")
+    """Deploy a strategy or portfolio. Provide EITHER config OR portfolio_id (not both)."""
+    config: dict | None = Field(default=None, description="Full portfolio or strategy config JSON. Saved to portfolios table before deploy.")
+    portfolio_id: str | None = Field(default=None, description="Deploy an already-saved portfolio by ID.")
     start_date: str = Field(description="Deploy start date (YYYY-MM-DD)")
     initial_capital: float = Field(default=1_000_000, ge=1000, description="Starting capital in USD")
     name: str | None = Field(default=None, description="Override the config name")
@@ -1705,47 +1705,61 @@ class DeployConfigRequest(BaseModel):
 async def deploy_config(body: DeployConfigRequest, _: str = Depends(verify_api_key)):
     """Deploy a strategy or portfolio for live paper-trading.
 
-    Accepts the full config directly. The config is validated, saved to the
-    portfolios table (for future reference/re-deployment), then deployed.
+    Provide EITHER:
+      - `config`: full config JSON — validated, saved to portfolios table, deployed
+      - `portfolio_id`: reference to an already-saved portfolio — looked up and deployed
 
-    If the config has 'sleeves', it's deployed as a portfolio.
-    If it has 'universe' and 'entry', it's auto-wrapped as a single-sleeve portfolio.
-    Inline regime_definitions are supported — no DB regime lookup needed.
+    Exactly one must be set.
     """
     import traceback
     from deploy_engine import deploy
-
-    # Validate the config
-    config = body.config
-    is_portfolio = "sleeves" in config or "strategies" in config
-    if is_portfolio:
-        try:
-            validated = PortfolioConfig.model_validate(config)
-            config = validated.model_dump(mode="json", exclude_none=True)
-        except Exception as e:
-            raise HTTPException(422, f"Invalid portfolio config: {e}")
-    else:
-        try:
-            from models.strategy import StrategyConfig
-            validated = StrategyConfig.model_validate(config)
-            config = validated.model_dump(mode="json", exclude_none=True)
-        except Exception as e:
-            raise HTTPException(422, f"Invalid strategy config: {e}")
-
-    # Save to portfolios table (idempotent — deduplicates via portfolio_id hash)
     from portfolio_engine import compute_portfolio_id
-    portfolio_id = compute_portfolio_id(config)
-    now = datetime.now(timezone.utc).isoformat()
-    with get_db() as conn:
-        existing = conn.execute(
-            "SELECT portfolio_id FROM portfolios WHERE portfolio_id = ?", (portfolio_id,)
-        ).fetchone()
-        if not existing:
-            conn.execute(
-                "INSERT INTO portfolios (portfolio_id, name, config, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                (portfolio_id, config.get("name", "Unnamed"), json.dumps(config), now, now),
-            )
-            conn.commit()
+
+    if (body.config is None) == (body.portfolio_id is None):
+        raise HTTPException(400, "Provide exactly one of 'config' or 'portfolio_id'")
+
+    # Resolve to a validated config + portfolio_id
+    if body.portfolio_id:
+        # Load from saved portfolio
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT config FROM portfolios WHERE portfolio_id = ?", (body.portfolio_id,)
+            ).fetchone()
+        if not row:
+            raise HTTPException(404, f"Portfolio '{body.portfolio_id}' not found")
+        config = json.loads(row["config"])
+        portfolio_id = body.portfolio_id
+    else:
+        # Validate the provided config
+        config = body.config
+        is_portfolio = "sleeves" in config or "strategies" in config
+        if is_portfolio:
+            try:
+                validated = PortfolioConfig.model_validate(config)
+                config = validated.model_dump(mode="json", exclude_none=True)
+            except Exception as e:
+                raise HTTPException(422, f"Invalid portfolio config: {e}")
+        else:
+            try:
+                from models.strategy import StrategyConfig
+                validated = StrategyConfig.model_validate(config)
+                config = validated.model_dump(mode="json", exclude_none=True)
+            except Exception as e:
+                raise HTTPException(422, f"Invalid strategy config: {e}")
+
+        # Save to portfolios table (idempotent — deduplicates via portfolio_id hash)
+        portfolio_id = compute_portfolio_id(config)
+        now = datetime.now(timezone.utc).isoformat()
+        with get_db() as conn:
+            existing = conn.execute(
+                "SELECT portfolio_id FROM portfolios WHERE portfolio_id = ?", (portfolio_id,)
+            ).fetchone()
+            if not existing:
+                conn.execute(
+                    "INSERT INTO portfolios (portfolio_id, name, config, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                    (portfolio_id, config.get("name", "Unnamed"), json.dumps(config), now, now),
+                )
+                conn.commit()
 
     # Deploy — pass portfolio_id so deployment records the FK
     try:
