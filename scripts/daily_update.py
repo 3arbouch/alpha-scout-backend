@@ -44,6 +44,9 @@ modified_tickers = {
     "earnings": set(), "insider_trades": set(), "analyst_grades": set(),
 }
 
+# Track which index files were modified (stored in prices/indices/, synced into prices table)
+modified_indices = set()
+
 # ---------------------------------------------------------------------------
 # Mode config (refresh TTLs)
 # ---------------------------------------------------------------------------
@@ -376,7 +379,9 @@ async def fetch_prices(tickers):
         if existing and isinstance(existing, list) and len(existing) > 0:
             from_date = existing[0].get("date", from_date)
         data = await fmp_get("historical-price-eod/full", {"symbol": idx, "from": from_date})
-        if data: save_merged(data, dedup_date, "prices", "indices", f"{safe}.json")
+        if data:
+            if save_merged(data, dedup_date, "prices", "indices", f"{safe}.json"):
+                modified_indices.add(safe)
 
     # Sector ETFs + SPY — stored in prices/daily like regular tickers so they sync to DB
     BENCHMARK_ETFS = ["SPY", "XLK", "XLF", "XLE", "XLV", "XLP", "XLY", "XLI", "XLB", "XLRE", "XLC", "XLU"]
@@ -818,7 +823,7 @@ def load_json(filepath):
 
 def update_db_incremental():
     """Update DB incrementally — only process tickers whose JSON was modified."""
-    total_modified = sum(len(v) for v in modified_tickers.values())
+    total_modified = sum(len(v) for v in modified_tickers.values()) + len(modified_indices)
     if total_modified == 0:
         log.info("No JSON files modified — skipping DB update")
         return
@@ -865,6 +870,28 @@ def update_db_incremental():
         elapsed = time.time() - t0
         log.info(f"  {table}: {table_rows:,} rows upserted ({elapsed:.1f}s)")
         total_rows += table_rows
+
+    # Sync indices (^GSPC → GSPC, etc.) into the prices table.
+    # Stored in prices/indices/*.json but inserted under caret-less symbol for DB queries.
+    if modified_indices:
+        log.info(f"  prices (indices): updating {len(modified_indices)} indices...")
+        t0 = time.time()
+        idx_rows = 0
+        cur = conn.cursor()
+        for safe in sorted(modified_indices):
+            filepath = DATA_DIR / "prices" / "indices" / f"{safe}.json"
+            data = load_json(filepath)
+            if data is None or not isinstance(data, list) or len(data) == 0:
+                continue
+            rows = map_prices(safe, data)  # reuse prices mapper, symbol = caret-less
+            if not rows:
+                continue
+            cur.executemany(TABLE_CONFIGS["prices"]["insert"], rows)
+            idx_rows += len(rows)
+        conn.commit()
+        elapsed = time.time() - t0
+        log.info(f"  prices (indices): {idx_rows:,} rows upserted ({elapsed:.1f}s)")
+        total_rows += idx_rows
 
     stats["db_rows_upserted"] = total_rows
     log.info(f"DB update complete: {total_rows:,} rows upserted")
