@@ -63,6 +63,65 @@ def get_config_schema() -> dict:
     return PortfolioConfig.model_json_schema()
 
 
+def _lookup_symbols_sector(symbols: list[str]) -> str | None:
+    """Look up the common sector for a list of symbols in universe_profiles.
+
+    Returns the sector name if all symbols map to the same non-empty sector.
+    Returns None if they span multiple sectors or any are unknown.
+    """
+    if not symbols:
+        return None
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        placeholders = ",".join("?" * len(symbols))
+        rows = conn.execute(
+            f"SELECT symbol, sector FROM universe_profiles WHERE symbol IN ({placeholders})",
+            list(symbols),
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return None
+    found = {sym: (sec or "") for sym, sec in rows}
+    # Every requested symbol must be classified into the same non-empty sector
+    if len(found) != len(symbols):
+        return None  # at least one symbol missing from universe_profiles
+    sectors = {sec for sec in found.values() if sec}
+    if len(sectors) != 1 or "" in found.values():
+        return None
+    return sectors.pop()
+
+
+def _infer_sleeve_sector(sleeve_config: dict) -> str | None:
+    """Determine a sleeve's effective sector from its universe config.
+
+    - type='sector' → declared sector
+    - type='symbols' → common sector of all symbols (via universe_profiles)
+    - type='all' or anything else → None (multi-sector)
+    """
+    universe = sleeve_config.get("universe", {}) or {}
+    utype = universe.get("type")
+    if utype == "sector":
+        return universe.get("sector") or None
+    if utype == "symbols":
+        symbols = universe.get("symbols") or []
+        return _lookup_symbols_sector(symbols)
+    return None
+
+
+def _infer_portfolio_sector(sleeves: list[dict]) -> str | None:
+    """Determine a portfolio's effective sector by combining per-sleeve sectors.
+
+    Returns the common sector if all sleeves share the same one, else None.
+    """
+    if not sleeves:
+        return None
+    per_sleeve = [_infer_sleeve_sector(s["config"]) for s in sleeves]
+    if any(s is None for s in per_sleeve):
+        return None  # at least one sleeve is multi-sector or unknown
+    distinct = set(per_sleeve)
+    return distinct.pop() if len(distinct) == 1 else None
+
+
 def compute_portfolio_id(config: dict) -> str:
     """Deterministic ID from portfolio config."""
     key_parts = {
@@ -921,10 +980,11 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
             "contribution_pct": contribution_pct,
         })
 
-    # Compute benchmark — use sector ETF for single-sleeve, SPX for multi-sleeve
-    bench_sector = None
-    if len(sleeves) == 1:
-        bench_sector = sleeves[0]["config"].get("universe", {}).get("sector")
+    # Compute benchmark sector — infer from all sleeves' universes.
+    # Uses declared sector when type='sector', or looks up symbols in
+    # universe_profiles when type='symbols'. All sleeves must resolve to
+    # the same sector; otherwise fall back to market benchmark only.
+    bench_sector = _infer_portfolio_sector(sleeves)
     from backtest_engine import SECTOR_ETF_MAP
 
     ann_return = portfolio_metrics.get("annualized_return_pct", 0)
