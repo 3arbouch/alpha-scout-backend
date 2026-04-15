@@ -823,7 +823,9 @@ def get_deployment(deploy_id: str) -> dict | None:
             full = json.loads(latest_path.read_text())
             result["metrics"] = full.get("metrics", {})
             result["nav_history"] = full.get("combined_nav_history", [])
-            result["benchmark"] = full.get("benchmark", {})
+            result["benchmark"] = full.get("benchmark", {})              # legacy: primary
+            result["benchmark_market"] = full.get("benchmark_market")    # SPY time series
+            result["benchmark_sector"] = full.get("benchmark_sector")    # sector ETF (or None)
             result["regime_history"] = full.get("regime_history", [])
 
             # Per-sleeve detail

@@ -1798,6 +1798,10 @@ async def get_deployment_unified(deploy_id: str, _: str = Depends(verify_api_key
         result["nav_history"] = d["nav_history"]
     if d.get("benchmark"):
         result["benchmark"] = _sanitize_floats(d["benchmark"])
+    if d.get("benchmark_market"):
+        result["benchmark_market"] = _sanitize_floats(d["benchmark_market"])
+    if d.get("benchmark_sector"):
+        result["benchmark_sector"] = _sanitize_floats(d["benchmark_sector"])
     if d.get("regime_history"):
         result["regime_history"] = d["regime_history"]
 
@@ -2077,6 +2081,10 @@ async def get_deployment(deploy_id: str, _: str = Depends(verify_api_key)):
         result["nav_history"] = d["nav_history"]
     if d.get("benchmark"):
         result["benchmark"] = _sanitize_floats(d["benchmark"])
+    if d.get("benchmark_market"):
+        result["benchmark_market"] = _sanitize_floats(d["benchmark_market"])
+    if d.get("benchmark_sector"):
+        result["benchmark_sector"] = _sanitize_floats(d["benchmark_sector"])
     if d.get("regime_history"):
         result["regime_history"] = d["regime_history"]
 
@@ -2796,7 +2804,9 @@ async def run_portfolio_backtest_endpoint(body: PortfolioBacktestRequest, _: str
             "nav_history": result.get("combined_nav_history", []),
             "regime_history": regime_history,
             "allocation_profile_history": result.get("allocation_profile_history", []),
-            "benchmark": result.get("benchmark", {}),
+            "benchmark": result.get("benchmark", {}),               # legacy: primary
+            "benchmark_market": result.get("benchmark_market"),     # SPY time series
+            "benchmark_sector": result.get("benchmark_sector"),     # sector ETF (or None)
         })
     except ValueError as e:
         raise HTTPException(400, f"Invalid portfolio config: {e}")

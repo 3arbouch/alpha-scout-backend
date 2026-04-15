@@ -944,6 +944,7 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
 
     # Sector benchmark — compute if single-sector portfolio
     benchmark = market_benchmark
+    sector_benchmark = None
     if bench_sector and bench_sector in SECTOR_ETF_MAP:
         print(f"Computing benchmark ({SECTOR_ETF_MAP[bench_sector]})...")
         sector_benchmark = compute_benchmark(all_dates, initial_capital, sector=bench_sector)
@@ -1015,7 +1016,10 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
         "combined_nav_history": combined_nav_history,
         "regime_history": regime_history,
         "allocation_profile_history": allocation_profile_history,
-        "benchmark": benchmark,
+        # Benchmarks
+        "benchmark": benchmark,                          # legacy: primary benchmark (sector if available, else market)
+        "benchmark_market": market_benchmark,            # always SPY time series + metrics
+        "benchmark_sector": sector_benchmark,            # sector ETF time series (None if multi-sector)
     }
 
 
