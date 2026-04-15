@@ -1798,6 +1798,10 @@ async def get_deployment_unified(deploy_id: str, _: str = Depends(verify_api_key
         result["nav_history"] = d["nav_history"]
     if d.get("benchmark"):
         result["benchmark"] = _sanitize_floats(d["benchmark"])
+    if d.get("benchmark_market"):
+        result["benchmark_market"] = _sanitize_floats(d["benchmark_market"])
+    if d.get("benchmark_sector"):
+        result["benchmark_sector"] = _sanitize_floats(d["benchmark_sector"])
     if d.get("regime_history"):
         result["regime_history"] = d["regime_history"]
 
@@ -1915,7 +1919,7 @@ class DeployRequest(BaseModel):
     name: str | None = None
 
 
-@app.post("/strategies/deploy", tags=["Deployments"])
+@app.post("/strategies/deploy", tags=["Deployments"], deprecated=True)
 async def deploy_strategy(body: DeployRequest, _: str = Depends(verify_api_key)):
     """Deploy a strategy for live paper-trading.
 
@@ -1967,7 +1971,7 @@ async def deploy_strategy(body: DeployRequest, _: str = Depends(verify_api_key))
         raise HTTPException(500, f"Deployment failed: {e}")
 
 
-@app.get("/strategies/deployments", tags=["Deployments"])
+@app.get("/strategies/deployments", tags=["Deployments"], deprecated=True)
 async def list_deployments(
     include_stopped: bool = Query(False),
     type: Optional[str] = Query(None, description="Filter by type: 'strategy' or 'portfolio'"),
@@ -2014,7 +2018,7 @@ async def list_deployments(
     }
 
 
-@app.get("/strategies/deployments/{deploy_id}", tags=["Deployments"])
+@app.get("/strategies/deployments/{deploy_id}", tags=["Deployments"], deprecated=True)
 async def get_deployment(deploy_id: str, _: str = Depends(verify_api_key)):
     """Get full deployment details including latest engine results.
 
@@ -2077,13 +2081,17 @@ async def get_deployment(deploy_id: str, _: str = Depends(verify_api_key)):
         result["nav_history"] = d["nav_history"]
     if d.get("benchmark"):
         result["benchmark"] = _sanitize_floats(d["benchmark"])
+    if d.get("benchmark_market"):
+        result["benchmark_market"] = _sanitize_floats(d["benchmark_market"])
+    if d.get("benchmark_sector"):
+        result["benchmark_sector"] = _sanitize_floats(d["benchmark_sector"])
     if d.get("regime_history"):
         result["regime_history"] = d["regime_history"]
 
     return result
 
 
-@app.get("/strategies/deployments/{deploy_id}/daily", tags=["Deployments"])
+@app.get("/strategies/deployments/{deploy_id}/daily", tags=["Deployments"], deprecated=True)
 async def get_deployment_daily(deploy_id: str, _: str = Depends(verify_api_key)):
     """Get daily NAV + benchmark data for charting equity curves, with utilization metrics."""
     from deploy_engine import DEPLOYMENTS_DIR as _DDIR, get_db as _get_deploy_db
@@ -2121,7 +2129,7 @@ async def get_deployment_daily(deploy_id: str, _: str = Depends(verify_api_key))
     return _sanitize_floats(data)
 
 
-@app.post("/strategies/deployments/{deploy_id}/evaluate", tags=["Deployments"])
+@app.post("/strategies/deployments/{deploy_id}/evaluate", tags=["Deployments"], deprecated=True)
 async def evaluate_deployment(deploy_id: str, _: str = Depends(verify_api_key)):
     """Manually trigger re-evaluation of a deployment (normally done by daily cron)."""
     from deploy_engine import evaluate_one
@@ -2138,7 +2146,7 @@ async def evaluate_deployment(deploy_id: str, _: str = Depends(verify_api_key)):
     })
 
 
-@app.post("/strategies/deployments/{deploy_id}/stop", tags=["Deployments"])
+@app.post("/strategies/deployments/{deploy_id}/stop", tags=["Deployments"], deprecated=True)
 async def stop_deployment(deploy_id: str, _: str = Depends(verify_api_key)):
     """Stop tracking a deployment."""
     from deploy_engine import stop_deployment as _stop
@@ -2146,7 +2154,7 @@ async def stop_deployment(deploy_id: str, _: str = Depends(verify_api_key)):
     return {"id": deploy_id, "status": "stopped"}
 
 
-@app.delete("/strategies/deployments/{deploy_id}", tags=["Deployments"])
+@app.delete("/strategies/deployments/{deploy_id}", tags=["Deployments"], deprecated=True)
 async def delete_deployment(deploy_id: str, _: str = Depends(verify_api_key)):
     """Delete a deployment and all related data (sleeves, trades, alerts)."""
     with get_db() as conn:
@@ -2169,7 +2177,7 @@ async def delete_deployment(deploy_id: str, _: str = Depends(verify_api_key)):
     return {"deleted": deploy_id}
 
 
-@app.post("/strategies/deployments/{deploy_id}/pause", tags=["Deployments"])
+@app.post("/strategies/deployments/{deploy_id}/pause", tags=["Deployments"], deprecated=True)
 async def pause_deployment(deploy_id: str, _: str = Depends(verify_api_key)):
     """Pause a deployment (skip daily evaluations)."""
     from deploy_engine import pause_deployment as _pause
@@ -2177,7 +2185,7 @@ async def pause_deployment(deploy_id: str, _: str = Depends(verify_api_key)):
     return {"id": deploy_id, "status": "paused"}
 
 
-@app.post("/strategies/deployments/{deploy_id}/resume", tags=["Deployments"])
+@app.post("/strategies/deployments/{deploy_id}/resume", tags=["Deployments"], deprecated=True)
 async def resume_deployment(deploy_id: str, _: str = Depends(verify_api_key)):
     """Resume a paused deployment."""
     from deploy_engine import resume_deployment as _resume
@@ -2189,7 +2197,7 @@ async def resume_deployment(deploy_id: str, _: str = Depends(verify_api_key)):
 # Trade Alerts
 # ---------------------------------------------------------------------------
 
-@app.post("/strategies/deployments/{deploy_id}/alerts/enable", tags=["Alerts"])
+@app.post("/strategies/deployments/{deploy_id}/alerts/enable", tags=["Alerts"], deprecated=True)
 async def enable_alerts(deploy_id: str, _: str = Depends(verify_api_key)):
     """Enable alert mode for a deployment. Generates daily BUY/SELL alerts."""
     from deploy_engine import set_alert_mode
@@ -2199,7 +2207,7 @@ async def enable_alerts(deploy_id: str, _: str = Depends(verify_api_key)):
     return result
 
 
-@app.post("/strategies/deployments/{deploy_id}/alerts/disable", tags=["Alerts"])
+@app.post("/strategies/deployments/{deploy_id}/alerts/disable", tags=["Alerts"], deprecated=True)
 async def disable_alerts(deploy_id: str, _: str = Depends(verify_api_key)):
     """Disable alert mode for a deployment."""
     from deploy_engine import set_alert_mode
@@ -2209,7 +2217,7 @@ async def disable_alerts(deploy_id: str, _: str = Depends(verify_api_key)):
     return result
 
 
-@app.get("/strategies/deployments/{deploy_id}/alerts", tags=["Alerts"])
+@app.get("/strategies/deployments/{deploy_id}/alerts", tags=["Alerts"], deprecated=True)
 async def get_deployment_alerts(
     deploy_id: str,
     date: Optional[str] = Query(None, description="Filter by date (YYYY-MM-DD)"),
@@ -2291,7 +2299,7 @@ async def skip_alert(
     return _sanitize_floats(result)
 
 
-@app.get("/strategies/deployments/{deploy_id}/alerts/summary", tags=["Alerts"])
+@app.get("/strategies/deployments/{deploy_id}/alerts/summary", tags=["Alerts"], deprecated=True)
 async def get_execution_summary(deploy_id: str, _: str = Depends(verify_api_key)):
     """Get execution tracking summary: follow-through rate, avg slippage, paper vs real."""
     from deploy_engine import get_execution_summary as _summary
@@ -2678,6 +2686,13 @@ class PortfolioBacktestRequest(_BM):
     initial_capital: float = Field(default=1000000, ge=1000, description="Starting capital")
 
 
+class PortfolioBacktestParams(_BM):
+    """Backtest params for the sub-resource endpoint (portfolio_id comes from URL)."""
+    start: str = Field(default="2020-01-01", description="Backtest start date")
+    end: str = Field(default="2026-03-28", description="Backtest end date")
+    initial_capital: float = Field(default=1000000, ge=1000, description="Starting capital")
+
+
 @app.post("/portfolios", tags=["Portfolios"], status_code=201)
 async def create_portfolio(body: PortfolioCreate, _: str = Depends(verify_api_key)):
     """Create a new portfolio."""
@@ -2721,9 +2736,27 @@ async def list_portfolios(_: str = Depends(verify_api_key)):
     ]
 
 
-@app.post("/portfolios/backtest", tags=["Portfolios"], status_code=202)
+@app.post("/portfolios/{portfolio_id}/backtest", tags=["Portfolios"], status_code=202)
+async def run_portfolio_backtest_subresource(
+    portfolio_id: str, body: PortfolioBacktestParams,
+    _: str = Depends(verify_api_key),
+):
+    """Run a backtest on a saved portfolio (sub-resource pattern — portfolio_id in URL).
+
+    Preferred over the legacy POST /portfolios/backtest endpoint.
+    """
+    legacy_body = PortfolioBacktestRequest(
+        portfolio_id=portfolio_id,
+        start=body.start, end=body.end, initial_capital=body.initial_capital,
+    )
+    return await run_portfolio_backtest_endpoint(legacy_body, _)
+
+
+@app.post("/portfolios/backtest", tags=["Portfolios"], status_code=202, deprecated=True)
 async def run_portfolio_backtest_endpoint(body: PortfolioBacktestRequest, _: str = Depends(verify_api_key)):
-    """Run a portfolio backtest. Non-blocking — runs in thread pool (typically 10-60s)."""
+    """[DEPRECATED] Use POST /portfolios/{portfolio_id}/backtest instead.
+
+    Run a portfolio backtest. Non-blocking — runs in thread pool (typically 10-60s)."""
     import traceback
 
     with get_db() as conn:
@@ -2796,7 +2829,9 @@ async def run_portfolio_backtest_endpoint(body: PortfolioBacktestRequest, _: str
             "nav_history": result.get("combined_nav_history", []),
             "regime_history": regime_history,
             "allocation_profile_history": result.get("allocation_profile_history", []),
-            "benchmark": result.get("benchmark", {}),
+            "benchmark": result.get("benchmark", {}),               # legacy: primary
+            "benchmark_market": result.get("benchmark_market"),     # SPY time series
+            "benchmark_sector": result.get("benchmark_sector"),     # sector ETF (or None)
         })
     except ValueError as e:
         raise HTTPException(400, f"Invalid portfolio config: {e}")
@@ -2805,7 +2840,7 @@ async def run_portfolio_backtest_endpoint(body: PortfolioBacktestRequest, _: str
         raise HTTPException(500, f"Portfolio backtest failed: {e}")
 
 
-@app.get("/portfolios/backtest/results", tags=["Portfolios"])
+@app.get("/portfolios/backtest/results", tags=["Portfolios"], deprecated=True)
 async def list_portfolio_backtest_results(
     portfolio_id: Optional[str] = Query(None, description="Filter by portfolio ID"),
     limit: int = Query(50, ge=1, le=500),
@@ -2856,7 +2891,7 @@ async def list_portfolio_backtest_results(
     return results
 
 
-@app.get("/portfolios/backtest/results/{run_id}", tags=["Portfolios"])
+@app.get("/portfolios/backtest/results/{run_id}", tags=["Portfolios"], deprecated=True)
 async def get_portfolio_backtest_result(run_id: str, _: str = Depends(verify_api_key)):
     """Get full portfolio backtest results including trades, NAV history, and regime history."""
     from portfolio_engine import _ensure_portfolio_backtest_table
@@ -2907,6 +2942,115 @@ async def get_portfolio_backtest_result(run_id: str, _: str = Depends(verify_api
 
 
 # ---------------------------------------------------------------------------
+# Unified Backtests — queryable history across portfolios and strategies
+# ---------------------------------------------------------------------------
+
+@app.get("/backtests", tags=["Backtests"])
+async def list_backtests_unified(
+    portfolio_id: Optional[str] = Query(None, description="Filter by portfolio ID (portfolio backtests only)"),
+    type: Optional[str] = Query(None, description="Filter by type: 'portfolio' or 'strategy'"),
+    limit: int = Query(50, ge=1, le=500),
+    _: str = Depends(verify_api_key),
+):
+    """List backtest runs across portfolios and strategies.
+
+    Filters: ?portfolio_id=, ?type=portfolio|strategy. Default returns most recent first.
+    """
+    from portfolio_engine import _ensure_portfolio_backtest_table
+    _ensure_portfolio_backtest_table()
+
+    results = []
+    with get_db() as conn:
+        # Portfolio backtests
+        if type != "strategy":
+            if portfolio_id:
+                rows = conn.execute(
+                    "SELECT * FROM portfolio_backtest_runs WHERE portfolio_id = ? ORDER BY created_at DESC LIMIT ?",
+                    (portfolio_id, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM portfolio_backtest_runs ORDER BY created_at DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            for row in rows:
+                r = dict(row)
+                metrics = {k: r[k] for k in [
+                    "initial_capital", "final_nav", "total_return_pct", "annualized_return_pct",
+                    "annualized_volatility_pct", "max_drawdown_pct", "sharpe_ratio",
+                    "alpha_ann_pct", "win_rate_pct", "profit_factor",
+                ] if k in r and r[k] is not None}
+                results.append(_sanitize_floats({
+                    "run_id": r["run_id"],
+                    "type": "portfolio",
+                    "portfolio_id": r.get("portfolio_id"),
+                    "name": r.get("portfolio_name"),
+                    "created_at": r["created_at"],
+                    "start_date": r["start_date"],
+                    "end_date": r["end_date"],
+                    "metrics": metrics,
+                }))
+
+        # Strategy backtests (only if no portfolio_id filter — strategies aren't tied to portfolio_id)
+        if type != "portfolio" and not portfolio_id:
+            rows = conn.execute(
+                "SELECT run_id, strategy_id, strategy_name, type, name, created_at, start_date, end_date, "
+                "initial_capital, final_nav, total_return, ann_return, max_drawdown, "
+                "sharpe, alpha, win_rate, profit_factor "
+                "FROM backtest_runs ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+            for row in rows:
+                r = dict(row)
+                if r.get("type") == "portfolio":
+                    continue  # already covered above
+                metrics = {
+                    "initial_capital": r.get("initial_capital"),
+                    "final_nav": r.get("final_nav"),
+                    "total_return_pct": r.get("total_return"),
+                    "annualized_return_pct": r.get("ann_return"),
+                    "max_drawdown_pct": r.get("max_drawdown"),
+                    "sharpe_ratio": r.get("sharpe"),
+                    "alpha_ann_pct": r.get("alpha"),
+                    "win_rate_pct": r.get("win_rate"),
+                    "profit_factor": r.get("profit_factor"),
+                }
+                metrics = {k: v for k, v in metrics.items() if v is not None}
+                results.append(_sanitize_floats({
+                    "run_id": r["run_id"],
+                    "type": "strategy",
+                    "strategy_id": r.get("strategy_id"),
+                    "name": r.get("strategy_name") or r.get("name"),
+                    "created_at": r["created_at"],
+                    "start_date": r["start_date"],
+                    "end_date": r["end_date"],
+                    "metrics": metrics,
+                }))
+
+    # Sort merged results by created_at descending and apply limit
+    results.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+    return {"total": len(results[:limit]), "data": results[:limit]}
+
+
+@app.get("/backtests/{run_id}", tags=["Backtests"])
+async def get_backtest_unified(run_id: str, _: str = Depends(verify_api_key)):
+    """Get full backtest result by run_id. Auto-detects portfolio vs strategy backtest."""
+    from portfolio_engine import _ensure_portfolio_backtest_table
+    _ensure_portfolio_backtest_table()
+
+    # Try portfolio backtest first
+    with get_db() as conn:
+        prow = conn.execute(
+            "SELECT 1 FROM portfolio_backtest_runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+    if prow:
+        return await get_portfolio_backtest_result(run_id, _)
+
+    # Fallback to strategy backtest
+    return await get_backtest_run(run_id, _)
+
+
+# ---------------------------------------------------------------------------
 # Portfolio Deployments
 # ---------------------------------------------------------------------------
 from deploy_engine import (
@@ -2927,9 +3071,36 @@ class PortfolioDeployRequest(_BM):
     name: str | None = Field(default=None, description="Override portfolio name")
 
 
-@app.post("/portfolios/deploy", tags=["Portfolio Deployments"], status_code=201)
+class PortfolioDeployParams(_BM):
+    """Deploy params for the sub-resource endpoint (portfolio_id comes from URL)."""
+    start_date: str = Field(description="Start date (YYYY-MM-DD)")
+    initial_capital: float = Field(default=1000000, ge=1000, description="Starting capital")
+    name: str | None = Field(default=None, description="Override portfolio name")
+
+
+@app.post("/portfolios/{portfolio_id}/deploy", tags=["Portfolio Deployments"], status_code=201)
+async def deploy_portfolio_subresource(
+    portfolio_id: str, body: PortfolioDeployParams,
+    _: str = Depends(verify_api_key),
+):
+    """Deploy a saved portfolio for live paper-trading (sub-resource pattern — portfolio_id in URL).
+
+    Preferred over the legacy POST /portfolios/deploy endpoint.
+    """
+    legacy_body = PortfolioDeployRequest(
+        portfolio_id=portfolio_id,
+        start_date=body.start_date,
+        initial_capital=body.initial_capital,
+        name=body.name,
+    )
+    return await deploy_portfolio_endpoint(legacy_body, _)
+
+
+@app.post("/portfolios/deploy", tags=["Portfolio Deployments"], status_code=201, deprecated=True)
 async def deploy_portfolio_endpoint(body: PortfolioDeployRequest, _: str = Depends(verify_api_key)):
-    """Deploy a portfolio for live paper-trading."""
+    """[DEPRECATED] Use POST /portfolios/{portfolio_id}/deploy instead.
+
+    Deploy a portfolio for live paper-trading."""
     import traceback
 
     with get_db() as conn:
@@ -2950,7 +3121,7 @@ async def deploy_portfolio_endpoint(body: PortfolioDeployRequest, _: str = Depen
         raise HTTPException(500, f"Portfolio deploy failed: {e}")
 
 
-@app.get("/portfolios/deployments", tags=["Portfolio Deployments"])
+@app.get("/portfolios/deployments", tags=["Portfolio Deployments"], deprecated=True)
 async def list_portfolio_deployments_endpoint(
     include_stopped: bool = Query(False),
     portfolio_id: str = Query(None),
@@ -2971,7 +3142,7 @@ async def list_portfolio_deployments_endpoint(
     return _sanitize_floats(results)
 
 
-@app.get("/portfolios/deployments/{deploy_id}", tags=["Portfolio Deployments"])
+@app.get("/portfolios/deployments/{deploy_id}", tags=["Portfolio Deployments"], deprecated=True)
 async def get_portfolio_deployment_endpoint(deploy_id: str, _: str = Depends(verify_api_key)):
     """Get full portfolio deployment state."""
     d = _get_portfolio_deploy(deploy_id)
@@ -2980,7 +3151,7 @@ async def get_portfolio_deployment_endpoint(deploy_id: str, _: str = Depends(ver
     return _sanitize_floats(d)
 
 
-@app.post("/portfolios/deployments/{deploy_id}/evaluate", tags=["Portfolio Deployments"])
+@app.post("/portfolios/deployments/{deploy_id}/evaluate", tags=["Portfolio Deployments"], deprecated=True)
 async def evaluate_portfolio_deployment(deploy_id: str, _: str = Depends(verify_api_key)):
     """Re-evaluate a portfolio deployment (re-runs backtest to today)."""
     import traceback
@@ -3001,14 +3172,14 @@ async def evaluate_portfolio_deployment(deploy_id: str, _: str = Depends(verify_
         raise HTTPException(500, f"Evaluation failed: {e}")
 
 
-@app.post("/portfolios/deployments/{deploy_id}/stop", tags=["Portfolio Deployments"])
+@app.post("/portfolios/deployments/{deploy_id}/stop", tags=["Portfolio Deployments"], deprecated=True)
 async def stop_portfolio_deployment(deploy_id: str, _: str = Depends(verify_api_key)):
     """Stop a portfolio deployment."""
     _stop_portfolio(deploy_id)
     return {"deploy_id": deploy_id, "status": "stopped"}
 
 
-@app.delete("/portfolios/deployments/{deploy_id}", tags=["Portfolio Deployments"])
+@app.delete("/portfolios/deployments/{deploy_id}", tags=["Portfolio Deployments"], deprecated=True)
 async def delete_portfolio_deployment(deploy_id: str, _: str = Depends(verify_api_key)):
     """Delete a portfolio deployment and all related data (sleeves, trades, alerts)."""
     with get_db() as conn:
@@ -3031,14 +3202,14 @@ async def delete_portfolio_deployment(deploy_id: str, _: str = Depends(verify_ap
     return {"deleted": deploy_id}
 
 
-@app.post("/portfolios/deployments/{deploy_id}/pause", tags=["Portfolio Deployments"])
+@app.post("/portfolios/deployments/{deploy_id}/pause", tags=["Portfolio Deployments"], deprecated=True)
 async def pause_portfolio_deployment(deploy_id: str, _: str = Depends(verify_api_key)):
     """Pause a portfolio deployment."""
     _pause_portfolio(deploy_id)
     return {"deploy_id": deploy_id, "status": "paused"}
 
 
-@app.post("/portfolios/deployments/{deploy_id}/resume", tags=["Portfolio Deployments"])
+@app.post("/portfolios/deployments/{deploy_id}/resume", tags=["Portfolio Deployments"], deprecated=True)
 async def resume_portfolio_deployment(deploy_id: str, _: str = Depends(verify_api_key)):
     """Resume a portfolio deployment."""
     _resume_portfolio(deploy_id)
@@ -3048,7 +3219,7 @@ async def resume_portfolio_deployment(deploy_id: str, _: str = Depends(verify_ap
 # ---------------------------------------------------------------------------
 # Portfolio Alerts
 # ---------------------------------------------------------------------------
-@app.post("/portfolios/deployments/{deploy_id}/alerts/enable", tags=["Portfolio Alerts"])
+@app.post("/portfolios/deployments/{deploy_id}/alerts/enable", tags=["Portfolio Alerts"], deprecated=True)
 async def enable_portfolio_alerts(deploy_id: str, _: str = Depends(verify_api_key)):
     """Enable alert mode for a portfolio deployment. Generates daily BUY/SELL alerts from all sleeves."""
     from deploy_engine import set_portfolio_alert_mode
@@ -3058,7 +3229,7 @@ async def enable_portfolio_alerts(deploy_id: str, _: str = Depends(verify_api_ke
     return result
 
 
-@app.post("/portfolios/deployments/{deploy_id}/alerts/disable", tags=["Portfolio Alerts"])
+@app.post("/portfolios/deployments/{deploy_id}/alerts/disable", tags=["Portfolio Alerts"], deprecated=True)
 async def disable_portfolio_alerts(deploy_id: str, _: str = Depends(verify_api_key)):
     """Disable alert mode for a portfolio deployment."""
     from deploy_engine import set_portfolio_alert_mode
@@ -3068,7 +3239,7 @@ async def disable_portfolio_alerts(deploy_id: str, _: str = Depends(verify_api_k
     return result
 
 
-@app.get("/portfolios/deployments/{deploy_id}/alerts", tags=["Portfolio Alerts"])
+@app.get("/portfolios/deployments/{deploy_id}/alerts", tags=["Portfolio Alerts"], deprecated=True)
 async def get_portfolio_alerts(deploy_id: str,
                                date: Optional[str] = Query(None, description="Filter by date (YYYY-MM-DD)"),
                                status: Optional[str] = Query(None, description="Filter: pending, executed, skipped"),
@@ -3079,7 +3250,7 @@ async def get_portfolio_alerts(deploy_id: str,
     return {"total": len(alerts), "data": [_sanitize_floats(a) for a in alerts]}
 
 
-@app.get("/portfolios/deployments/{deploy_id}/alerts/summary", tags=["Portfolio Alerts"])
+@app.get("/portfolios/deployments/{deploy_id}/alerts/summary", tags=["Portfolio Alerts"], deprecated=True)
 async def get_portfolio_execution_summary(deploy_id: str, _: str = Depends(verify_api_key)):
     """Get execution tracking summary for a portfolio deployment: follow-through rate, avg slippage, paper vs real."""
     from deploy_engine import get_execution_summary as _summary
@@ -3390,59 +3561,84 @@ class RegimeDeployRequest(_BM):
     name: str | None = Field(default=None, description="Override regime name")
 
 
-@app.post("/regimes/deploy", tags=["Regime Deployments"], status_code=201)
-async def deploy_regime_endpoint(body: RegimeDeployRequest, _: str = Depends(verify_api_key)):
-    """Deploy a regime for live monitoring. Evaluates daily and generates transition alerts."""
+class RegimeDeployParams(_BM):
+    """Deploy params for the sub-resource endpoint (regime_id comes from URL)."""
+    name: str | None = Field(default=None, description="Override regime name")
+
+
+# ---------------------------------------------------------------------------
+# Regime Deployments — Preferred routes (sub-resource on /regimes/{id}, instances at /regime-deployments/)
+# ---------------------------------------------------------------------------
+
+@app.post("/regimes/{regime_id}/deploy", tags=["Regime Deployments"], status_code=201)
+async def deploy_regime_subresource(
+    regime_id: str, body: RegimeDeployParams = RegimeDeployParams(),
+    _: str = Depends(verify_api_key),
+):
+    """Deploy a regime for live monitoring (sub-resource pattern — regime_id in URL).
+
+    Preferred over the legacy POST /regimes/deploy endpoint.
+    """
     try:
-        result = _deploy_regime(body.regime_id, body.name)
-        return result
+        return _deploy_regime(regime_id, body.name)
     except ValueError as e:
         raise HTTPException(404, str(e))
     except Exception as e:
         raise HTTPException(500, f"Regime deploy failed: {e}")
 
 
-@app.get("/regimes/deployments", tags=["Regime Deployments"])
-async def list_regime_deployments_endpoint(
+@app.get("/regime-deployments", tags=["Regime Deployments"])
+async def list_regime_deployments_unified(
     include_stopped: bool = Query(False),
     _: str = Depends(verify_api_key),
 ):
-    """List regime deployments with current active/inactive state."""
-    deployments = _list_regime_deploys(include_stopped=include_stopped)
-    return _sanitize_floats(deployments)
+    """List regime deployments. Preferred over /regimes/deployments."""
+    return _sanitize_floats(_list_regime_deploys(include_stopped=include_stopped))
 
 
-@app.get("/regimes/deployments/{deploy_id}", tags=["Regime Deployments"])
-async def get_regime_deployment_endpoint(
+@app.get("/regime-deployments/{deploy_id}", tags=["Regime Deployments"])
+async def get_regime_deployment_unified(
     deploy_id: str,
-    include_history: bool = Query(False, description="Include daily state history for charts"),
+    include_history: bool = Query(False, description="Include daily state history"),
     _: str = Depends(verify_api_key),
 ):
-    """Get regime deployment state with evaluation detail, stats, and optional state history."""
+    """Get regime deployment detail. Preferred over /regimes/deployments/{id}."""
     d = _get_regime_deploy(deploy_id, include_history=include_history)
     if not d:
         raise HTTPException(404, f"Regime deployment {deploy_id} not found")
     return _sanitize_floats(d)
 
 
-@app.post("/regimes/deployments/{deploy_id}/evaluate", tags=["Regime Deployments"])
-async def evaluate_regime_deployment(deploy_id: str, _: str = Depends(verify_api_key)):
-    """Force re-evaluation of a regime deployment."""
+@app.post("/regime-deployments/{deploy_id}/evaluate", tags=["Regime Deployments"])
+async def evaluate_regime_deployment_unified(deploy_id: str, _: str = Depends(verify_api_key)):
+    """Force re-evaluation. Preferred over /regimes/deployments/{id}/evaluate."""
     result = _eval_regime_one(deploy_id)
     if not result:
         raise HTTPException(404, f"Regime deployment {deploy_id} not found or not active")
     return result
 
 
-@app.post("/regimes/deployments/{deploy_id}/stop", tags=["Regime Deployments"])
-async def stop_regime_deployment_endpoint(deploy_id: str, _: str = Depends(verify_api_key)):
+@app.post("/regime-deployments/{deploy_id}/stop", tags=["Regime Deployments"])
+async def stop_regime_deployment_unified(deploy_id: str, _: str = Depends(verify_api_key)):
     _stop_regime_deploy(deploy_id)
     return {"deploy_id": deploy_id, "status": "stopped"}
 
 
-@app.delete("/regimes/deployments/{deploy_id}", tags=["Regime Deployments"])
-async def delete_regime_deployment_endpoint(deploy_id: str, _: str = Depends(verify_api_key)):
-    """Delete a regime deployment and its state history and alerts."""
+@app.post("/regime-deployments/{deploy_id}/pause", tags=["Regime Deployments"])
+async def pause_regime_deployment_unified(deploy_id: str, _: str = Depends(verify_api_key)):
+    _pause_regime_deploy(deploy_id)
+    return {"deploy_id": deploy_id, "status": "paused"}
+
+
+@app.post("/regime-deployments/{deploy_id}/resume", tags=["Regime Deployments"])
+async def resume_regime_deployment_unified(deploy_id: str, _: str = Depends(verify_api_key)):
+    _resume_regime_deploy(deploy_id)
+    return {"deploy_id": deploy_id, "status": "active"}
+
+
+@app.delete("/regime-deployments/{deploy_id}", tags=["Regime Deployments"])
+async def delete_regime_deployment_unified(deploy_id: str, _: str = Depends(verify_api_key)):
+    """Delete a stopped regime deployment and its history/alerts."""
     with get_db() as conn:
         row = conn.execute("SELECT id, status FROM regime_deployments WHERE id = ?", (deploy_id,)).fetchone()
         if not row:
@@ -3456,41 +3652,141 @@ async def delete_regime_deployment_endpoint(deploy_id: str, _: str = Depends(ver
     return {"deleted": deploy_id}
 
 
-@app.post("/regimes/deployments/{deploy_id}/pause", tags=["Regime Deployments"])
-async def pause_regime_deployment_endpoint(deploy_id: str, _: str = Depends(verify_api_key)):
-    _pause_regime_deploy(deploy_id)
-    return {"deploy_id": deploy_id, "status": "paused"}
-
-
-@app.post("/regimes/deployments/{deploy_id}/resume", tags=["Regime Deployments"])
-async def resume_regime_deployment_endpoint(deploy_id: str, _: str = Depends(verify_api_key)):
-    _resume_regime_deploy(deploy_id)
-    return {"deploy_id": deploy_id, "status": "active"}
-
-
-@app.post("/regimes/deployments/{deploy_id}/alerts/enable", tags=["Regime Alerts"])
-async def enable_regime_alerts(deploy_id: str, _: str = Depends(verify_api_key)):
-    """Enable transition alerts for a regime deployment."""
+@app.post("/regime-deployments/{deploy_id}/alerts/enable", tags=["Regime Alerts"])
+async def enable_regime_alerts_unified(deploy_id: str, _: str = Depends(verify_api_key)):
+    """Enable transition alerts."""
     result = _set_regime_alert_mode(deploy_id, True)
     if "error" in result:
         raise HTTPException(404, result["error"])
     return result
 
 
-@app.post("/regimes/deployments/{deploy_id}/alerts/disable", tags=["Regime Alerts"])
-async def disable_regime_alerts(deploy_id: str, _: str = Depends(verify_api_key)):
-    """Disable transition alerts for a regime deployment."""
+@app.post("/regime-deployments/{deploy_id}/alerts/disable", tags=["Regime Alerts"])
+async def disable_regime_alerts_unified(deploy_id: str, _: str = Depends(verify_api_key)):
+    """Disable transition alerts."""
     result = _set_regime_alert_mode(deploy_id, False)
     if "error" in result:
         raise HTTPException(404, result["error"])
     return result
 
 
-@app.get("/regimes/deployments/{deploy_id}/alerts", tags=["Regime Alerts"])
+@app.get("/regime-deployments/{deploy_id}/alerts", tags=["Regime Alerts"])
+async def get_regime_alerts_unified(deploy_id: str,
+                                     date: Optional[str] = Query(None, description="Filter by date (YYYY-MM-DD)"),
+                                     _: str = Depends(verify_api_key)):
+    """Get transition alerts."""
+    alerts = _get_regime_alerts(deploy_id=deploy_id, date=date)
+    return {"total": len(alerts), "data": [_sanitize_floats(a) for a in alerts]}
+
+
+# ---------------------------------------------------------------------------
+# Regime Deployments — Legacy routes (deprecated)
+# ---------------------------------------------------------------------------
+
+@app.post("/regimes/deploy", tags=["Regime Deployments"], status_code=201, deprecated=True)
+async def deploy_regime_endpoint(body: RegimeDeployRequest, _: str = Depends(verify_api_key)):
+    """[DEPRECATED] Use POST /regimes/{regime_id}/deploy instead."""
+    try:
+        result = _deploy_regime(body.regime_id, body.name)
+        return result
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Regime deploy failed: {e}")
+
+
+@app.get("/regimes/deployments", tags=["Regime Deployments"], deprecated=True)
+async def list_regime_deployments_endpoint(
+    include_stopped: bool = Query(False),
+    _: str = Depends(verify_api_key),
+):
+    """[DEPRECATED] Use GET /regime-deployments instead."""
+    deployments = _list_regime_deploys(include_stopped=include_stopped)
+    return _sanitize_floats(deployments)
+
+
+@app.get("/regimes/deployments/{deploy_id}", tags=["Regime Deployments"], deprecated=True)
+async def get_regime_deployment_endpoint(
+    deploy_id: str,
+    include_history: bool = Query(False, description="Include daily state history for charts"),
+    _: str = Depends(verify_api_key),
+):
+    """[DEPRECATED] Use GET /regime-deployments/{deploy_id} instead."""
+    d = _get_regime_deploy(deploy_id, include_history=include_history)
+    if not d:
+        raise HTTPException(404, f"Regime deployment {deploy_id} not found")
+    return _sanitize_floats(d)
+
+
+@app.post("/regimes/deployments/{deploy_id}/evaluate", tags=["Regime Deployments"], deprecated=True)
+async def evaluate_regime_deployment(deploy_id: str, _: str = Depends(verify_api_key)):
+    """[DEPRECATED] Use POST /regime-deployments/{deploy_id}/evaluate instead."""
+    result = _eval_regime_one(deploy_id)
+    if not result:
+        raise HTTPException(404, f"Regime deployment {deploy_id} not found or not active")
+    return result
+
+
+@app.post("/regimes/deployments/{deploy_id}/stop", tags=["Regime Deployments"], deprecated=True)
+async def stop_regime_deployment_endpoint(deploy_id: str, _: str = Depends(verify_api_key)):
+    """[DEPRECATED] Use POST /regime-deployments/{deploy_id}/stop instead."""
+    _stop_regime_deploy(deploy_id)
+    return {"deploy_id": deploy_id, "status": "stopped"}
+
+
+@app.delete("/regimes/deployments/{deploy_id}", tags=["Regime Deployments"], deprecated=True)
+async def delete_regime_deployment_endpoint(deploy_id: str, _: str = Depends(verify_api_key)):
+    """[DEPRECATED] Use DELETE /regime-deployments/{deploy_id} instead."""
+    with get_db() as conn:
+        row = conn.execute("SELECT id, status FROM regime_deployments WHERE id = ?", (deploy_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, f"Regime deployment '{deploy_id}' not found")
+        if row["status"] == "active":
+            raise HTTPException(409, "Cannot delete an active regime deployment. Stop it first.")
+        conn.execute("DELETE FROM regime_alerts WHERE deployment_id = ?", (deploy_id,))
+        conn.execute("DELETE FROM regime_state_history WHERE deployment_id = ?", (deploy_id,))
+        conn.execute("DELETE FROM regime_deployments WHERE id = ?", (deploy_id,))
+        conn.commit()
+    return {"deleted": deploy_id}
+
+
+@app.post("/regimes/deployments/{deploy_id}/pause", tags=["Regime Deployments"], deprecated=True)
+async def pause_regime_deployment_endpoint(deploy_id: str, _: str = Depends(verify_api_key)):
+    """[DEPRECATED] Use POST /regime-deployments/{deploy_id}/pause instead."""
+    _pause_regime_deploy(deploy_id)
+    return {"deploy_id": deploy_id, "status": "paused"}
+
+
+@app.post("/regimes/deployments/{deploy_id}/resume", tags=["Regime Deployments"], deprecated=True)
+async def resume_regime_deployment_endpoint(deploy_id: str, _: str = Depends(verify_api_key)):
+    """[DEPRECATED] Use POST /regime-deployments/{deploy_id}/resume instead."""
+    _resume_regime_deploy(deploy_id)
+    return {"deploy_id": deploy_id, "status": "active"}
+
+
+@app.post("/regimes/deployments/{deploy_id}/alerts/enable", tags=["Regime Alerts"], deprecated=True)
+async def enable_regime_alerts(deploy_id: str, _: str = Depends(verify_api_key)):
+    """[DEPRECATED] Use POST /regime-deployments/{deploy_id}/alerts/enable instead."""
+    result = _set_regime_alert_mode(deploy_id, True)
+    if "error" in result:
+        raise HTTPException(404, result["error"])
+    return result
+
+
+@app.post("/regimes/deployments/{deploy_id}/alerts/disable", tags=["Regime Alerts"], deprecated=True)
+async def disable_regime_alerts(deploy_id: str, _: str = Depends(verify_api_key)):
+    """[DEPRECATED] Use POST /regime-deployments/{deploy_id}/alerts/disable instead."""
+    result = _set_regime_alert_mode(deploy_id, False)
+    if "error" in result:
+        raise HTTPException(404, result["error"])
+    return result
+
+
+@app.get("/regimes/deployments/{deploy_id}/alerts", tags=["Regime Alerts"], deprecated=True)
 async def get_regime_alerts_endpoint(deploy_id: str,
                                      date: Optional[str] = Query(None, description="Filter by date (YYYY-MM-DD)"),
                                      _: str = Depends(verify_api_key)):
-    """Get transition alerts for a regime deployment."""
+    """[DEPRECATED] Use GET /regime-deployments/{deploy_id}/alerts instead."""
     alerts = _get_regime_alerts(deploy_id=deploy_id, date=date)
     return {"total": len(alerts), "data": [_sanitize_floats(a) for a in alerts]}
 
