@@ -10,7 +10,7 @@ Used by: API validation, backtest engine, deploy engine, portfolio engine.
 from __future__ import annotations
 
 from typing import Annotated, Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -194,13 +194,28 @@ ExitCondition = Annotated[
 
 class UniverseConfig(BaseModel):
     """Defines which stocks the strategy can trade."""
-    type: Literal["sector", "tickers", "all"] = Field(
-        default="tickers",
-        description="'sector' selects all tickers in a GICS sector; 'tickers' uses an explicit list; 'all' trades the full universe.",
+    type: Literal["sector", "symbols", "all"] = Field(
+        default="symbols",
+        description="'sector' selects all tickers in a GICS sector; 'symbols' uses an explicit list; 'all' trades the full universe.",
     )
     sector: str | None = Field(default=None, description="GICS sector name. Required when type='sector'.")
-    tickers: list[str] | None = Field(default=None, description="Explicit ticker list. Required when type='tickers'.")
+    symbols: list[str] | None = Field(default=None, description="Explicit ticker list. Required when type='symbols'.")
     exclude: list[str] = Field(default_factory=list, description="Tickers to exclude.")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_legacy_fields(cls, data):
+        """Accept legacy 'tickers' field name and type value from old API clients / stored data."""
+        if isinstance(data, dict):
+            # "tickers" field → "symbols"
+            if "tickers" in data and "symbols" not in data:
+                data["symbols"] = data.pop("tickers")
+            elif "tickers" in data:
+                data.pop("tickers")
+            # type value "tickers" → "symbols"
+            if data.get("type") == "tickers":
+                data["type"] = "symbols"
+        return data
 
 
 class EntryConfig(BaseModel):
@@ -212,23 +227,51 @@ class EntryConfig(BaseModel):
         description="How to rank candidates when multiple stocks trigger simultaneously.",
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_legacy_trigger(cls, data):
+        """Accept legacy trigger/confirm format from old configs."""
+        if isinstance(data, dict):
+            if "trigger" in data and "conditions" not in data:
+                trigger = data.pop("trigger")
+                conditions = [trigger]
+                confirm = data.pop("confirm", None) or []
+                conditions.extend(confirm)
+                data["conditions"] = conditions
+                data["logic"] = "all"
+            else:
+                data.pop("trigger", None)
+                data.pop("confirm", None)
+        return data
+
 
 class StopLossConfig(BaseModel):
     """Stop loss configuration."""
-    type: Literal["drawdown_from_entry", "fundamental"] = Field(default="drawdown_from_entry")
+    type: Literal["drawdown_from_entry"] = Field(default="drawdown_from_entry")
     value: float = Field(default=-35, description="Negative %. e.g. -35 = exit at 35% loss.")
     cooldown_days: int = Field(ge=0, default=90, description="Days before re-entering same ticker after stop.")
 
 
 class TakeProfitConfig(BaseModel):
     """Take profit configuration."""
-    type: Literal["gain_from_entry", "above_peak", "target_price"] = Field(default="gain_from_entry")
+    type: Literal["gain_from_entry", "above_peak"] = Field(default="gain_from_entry")
     value: float = Field(default=60, description="Positive %. e.g. 60 = sell at 60% profit.")
 
 
 class TimeStopConfig(BaseModel):
     """Time-based exit."""
-    days: int = Field(ge=1, description="Max holding period in calendar days.")
+    max_days: int = Field(ge=1, description="Max holding period in calendar days.")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_legacy_fields(cls, data):
+        """Accept legacy 'days' field name from old API clients / stored data."""
+        if isinstance(data, dict):
+            if "days" in data and "max_days" not in data:
+                data["max_days"] = data.pop("days")
+            elif "days" in data:
+                data.pop("days")
+        return data
 
 
 class RankingConfig(BaseModel):
@@ -268,6 +311,7 @@ class BacktestParams(BaseModel):
     """Backtest simulation parameters (not part of live strategy logic)."""
     start: str = Field(default="2015-01-01", description="YYYY-MM-DD.")
     end: str = Field(default="2025-12-31", description="YYYY-MM-DD.")
+    initial_capital: float = Field(default=1_000_000, ge=0, description="Starting capital in USD.")
     entry_price: Literal["next_close", "next_open"] = Field(default="next_close")
     slippage_bps: int = Field(ge=0, default=10, description="Slippage in basis points.")
 

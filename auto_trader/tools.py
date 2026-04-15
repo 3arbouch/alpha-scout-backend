@@ -145,81 +145,45 @@ def execute_query(sql: str) -> dict:
 
 def validate_portfolio(config: dict) -> dict:
     """
-    Validate a full portfolio config: portfolio-level params + each sleeve's strategy.
+    Validate a full portfolio config against the Pydantic PortfolioConfig model.
 
     Returns:
         {"valid": True} or {"valid": False, "error": "description of what's wrong"}
     """
     try:
-        # Portfolio-level checks
-        if not isinstance(config, dict):
-            return {"valid": False, "error": "Config must be a dict"}
+        sys.path.insert(0, str(Path(__file__).parent.parent / "server"))
+        from pydantic import ValidationError
+        from models.portfolio import PortfolioConfig
 
-        if "sleeves" not in config and "strategies" not in config:
-            return {"valid": False, "error": "Missing 'sleeves' field"}
+        # Parse through Pydantic — catches all type/field/constraint errors
+        PortfolioConfig.model_validate(config)
 
-        sleeves = config.get("sleeves", config.get("strategies", []))
+        # Cross-field check: regime_gate IDs must reference regime_definitions keys
+        regime_defs = config.get("regime_definitions") or {}
+        for i, sleeve in enumerate(config.get("sleeves", [])):
+            label = sleeve.get("label", f"sleeve_{i}")
+            for gate_id in sleeve.get("regime_gate", []):
+                if gate_id != "*" and gate_id not in regime_defs:
+                    return {
+                        "valid": False,
+                        "error": f"Sleeve '{label}': regime_gate references '{gate_id}' "
+                                 f"but it is not defined in regime_definitions. "
+                                 f"Add it to regime_definitions or use '*' for always-active.",
+                    }
 
-        if not isinstance(sleeves, list) or len(sleeves) == 0:
-            return {"valid": False, "error": "sleeves must be a non-empty list"}
-
-        if len(sleeves) > 5:
-            return {"valid": False, "error": f"Too many sleeves ({len(sleeves)}). Maximum is 5."}
-
-        # Check weights sum to ~1.0
-        weights = [s.get("weight", 0) for s in sleeves]
+        # Cross-field check: weights must sum to ~1.0
+        weights = [s.get("weight", 0) for s in config.get("sleeves", [])]
         total_weight = sum(weights)
         if abs(total_weight - 1.0) > 0.01:
             return {"valid": False, "error": f"Sleeve weights sum to {total_weight:.2f}, must sum to 1.0"}
 
-        # Check capital_when_gated_off
-        capital_flow = config.get("capital_when_gated_off", config.get("capital_flow", "to_cash"))
-        if capital_flow not in ("to_cash", "redistribute"):
-            return {"valid": False, "error": f"Invalid capital_when_gated_off: '{capital_flow}'. Must be 'to_cash' or 'redistribute'."}
-
-        # Validate each sleeve
-        from backtest_engine import validate_strategy
-
-        for i, sleeve in enumerate(sleeves):
-            label = sleeve.get("label", f"sleeve_{i}")
-
-            # Check weight
-            w = sleeve.get("weight")
-            if w is None or not isinstance(w, (int, float)) or w <= 0 or w > 1:
-                return {"valid": False, "error": f"Sleeve '{label}': weight must be between 0 and 1, got {w}"}
-
-            # Check regime_gate format
-            rg = sleeve.get("regime_gate", ["*"])
-            if not isinstance(rg, list):
-                return {"valid": False, "error": f"Sleeve '{label}': regime_gate must be a list, got {type(rg).__name__}"}
-            for gate in rg:
-                if not isinstance(gate, str):
-                    return {"valid": False, "error": f"Sleeve '{label}': regime_gate entries must be strings (regime IDs), got {type(gate).__name__}: {gate}"}
-
-            # Check strategy config exists
-            sc = sleeve.get("strategy_config", sleeve.get("config"))
-            if not sc:
-                if not sleeve.get("strategy_id") and not sleeve.get("config_path"):
-                    return {"valid": False, "error": f"Sleeve '{label}': must have strategy_config, strategy_id, or config_path"}
-                continue  # strategy_id or config_path — can't validate without DB lookup
-
-            if not isinstance(sc, dict):
-                return {"valid": False, "error": f"Sleeve '{label}': strategy_config must be a dict"}
-
-            # Ensure backtest block exists (portfolio engine injects it later, but validate_strategy requires it)
-            if "backtest" not in sc:
-                sc["backtest"] = {
-                    "start": "2015-01-01", "end": "2024-12-31",
-                    "entry_price": "next_close", "slippage_bps": 10,
-                }
-
-            # Validate the strategy config
-            try:
-                validate_strategy(sc)
-            except ValueError as e:
-                return {"valid": False, "error": f"Sleeve '{label}': {str(e)}"}
-
         return {"valid": True}
+
+    except ValidationError as e:
+        # Return first error in a readable format
+        first = e.errors()[0]
+        loc = " -> ".join(str(x) for x in first["loc"])
+        return {"valid": False, "error": f"{loc}: {first['msg']}"}
 
     except Exception as e:
         return {"valid": False, "error": f"Validation error: {str(e)}"}

@@ -254,7 +254,8 @@ def main():
     if args.reindex:
         conn.execute("DROP TABLE IF EXISTS backtest_runs")
 
-    conn.executescript(SCHEMA)
+    from schema import init_db
+    init_db(conn)
     index_all(conn)
     show_status(conn)
     conn.close()

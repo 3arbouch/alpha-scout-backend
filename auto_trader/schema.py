@@ -6,6 +6,7 @@ Stores the thesis, portfolio config, backtest metrics, and KEEP/DISCARD decision
 """
 
 import os
+import sys
 import json
 import sqlite3
 import hashlib
@@ -15,69 +16,13 @@ from pathlib import Path
 APP_DB_PATH = Path(os.environ.get("APP_DB_PATH",
     os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "app.db")))
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS experiments (
-    id TEXT PRIMARY KEY,
-    run_id TEXT NOT NULL,
-    iteration INTEGER NOT NULL,
-
-    -- The agent's output
-    thesis TEXT,
-    assumptions TEXT,
-    portfolio_config TEXT,
-
-    -- Optimization target
-    target_metric TEXT,
-    target_value REAL,
-    conditions TEXT,
-    conditions_met INTEGER,
-
-    -- Full backtest metrics
-    total_return_pct REAL,
-    annualized_return_pct REAL,
-    sharpe_ratio REAL,
-    sortino_ratio REAL,
-    max_drawdown_pct REAL,
-    annualized_volatility_pct REAL,
-    alpha_ann_pct REAL,
-    alpha_vs_market_pct REAL,
-    alpha_vs_sector_pct REAL,
-    market_benchmark_return_pct REAL,
-    market_benchmark_ann_return_pct REAL,
-    sector_benchmark_return_pct REAL,
-    sector_benchmark_ann_return_pct REAL,
-    profit_factor REAL,
-    win_rate_pct REAL,
-    total_trades INTEGER,
-
-    -- Decision
-    decision TEXT NOT NULL,
-    best_value_so_far REAL,
-    improvement_pct REAL,
-
-    -- Backtest config
-    backtest_start TEXT,
-    backtest_end TEXT,
-    initial_capital REAL,
-
-    -- Meta
-    model TEXT,
-    session_id TEXT,
-    tokens_used INTEGER,
-    duration_seconds REAL,
-    error TEXT,
-    created_at TEXT NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_experiments_run ON experiments(run_id, iteration);
-CREATE INDEX IF NOT EXISTS idx_experiments_decision ON experiments(run_id, decision);
-"""
-
-
 def get_db():
+    """Get a connection to the app database with all tables ensured."""
+    sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
+    from schema import init_db
     conn = sqlite3.connect(str(APP_DB_PATH))
     conn.row_factory = sqlite3.Row
-    conn.executescript(SCHEMA)
+    init_db(conn)
     return conn
 
 
@@ -107,6 +52,7 @@ def log_experiment(
     tokens_used: int = None,
     duration_seconds: float = None,
     error: str = None,
+    portfolio_id: str = None,
 ) -> str:
     """Log a single experiment. Returns the experiment ID."""
     exp_id = generate_experiment_id(run_id, iteration)
@@ -119,7 +65,7 @@ def log_experiment(
     conn = get_db()
     conn.execute(
         """INSERT INTO experiments
-           (id, run_id, iteration, thesis, assumptions, portfolio_config,
+           (id, run_id, iteration, thesis, assumptions, portfolio_id, portfolio_config,
             target_metric, target_value, conditions, conditions_met,
             total_return_pct, annualized_return_pct, sharpe_ratio, sortino_ratio,
             max_drawdown_pct, annualized_volatility_pct, alpha_ann_pct,
@@ -130,9 +76,9 @@ def log_experiment(
             decision, best_value_so_far, improvement_pct,
             backtest_start, backtest_end, initial_capital,
             model, session_id, tokens_used, duration_seconds, error, created_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (exp_id, run_id, iteration,
-         thesis, json.dumps(assumptions), json.dumps(portfolio_config),
+         thesis, json.dumps(assumptions), portfolio_id, json.dumps(portfolio_config),
          target_metric, target_value, json.dumps(conditions), 1 if conditions_met else 0,
          metrics.get("total_return_pct"), metrics.get("annualized_return_pct"),
          metrics.get("sharpe_ratio"), metrics.get("sortino_ratio"),
