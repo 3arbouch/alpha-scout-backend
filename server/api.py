@@ -1825,6 +1825,100 @@ async def evaluate_deployment_unified(deploy_id: str, _: str = Depends(verify_ap
     })
 
 
+def _build_position_book(sleeves: list[dict], final_nav: float) -> list[dict]:
+    """Merge open positions + closed trades across sleeves into per-ticker book."""
+    book: dict[str, dict] = {}
+
+    def _ensure(sym: str) -> dict:
+        if sym not in book:
+            book[sym] = {
+                "symbol": sym,
+                "shares_held": 0, "current_price": 0,
+                "market_value": 0, "cost_basis_open": 0,
+                "unrealized_pnl": 0, "realized_pnl": 0,
+                "realized_cost": 0,  # total capital deployed in closed round-trips
+                "num_round_trips": 0, "sleeves": [],
+            }
+        return book[sym]
+
+    for sleeve in sleeves or []:
+        label = sleeve.get("label", "")
+
+        for pos in sleeve.get("open_positions") or []:
+            b = _ensure(pos["symbol"])
+            shares = pos.get("shares", 0)
+            entry = pos.get("entry_price", 0)
+            cost = pos.get("cost_basis", shares * entry)
+            mv = pos.get("market_value", shares * pos.get("current_price", 0))
+            b["shares_held"] += shares
+            b["cost_basis_open"] += cost
+            b["market_value"] += mv
+            b["current_price"] = pos.get("current_price", b["current_price"])
+            b["unrealized_pnl"] += mv - cost
+            if label and label not in b["sleeves"]:
+                b["sleeves"].append(label)
+
+        for ct in sleeve.get("closed_trades") or []:
+            b = _ensure(ct["symbol"])
+            b["realized_pnl"] += ct.get("pnl", 0)
+            b["realized_cost"] += ct.get("shares", 0) * ct.get("entry_price", 0)
+            b["num_round_trips"] += 1
+            if label and label not in b["sleeves"]:
+                b["sleeves"].append(label)
+
+    positions = []
+    for b in book.values():
+        has_open = b["shares_held"] > 0
+        has_closed = b["num_round_trips"] > 0
+        b["status"] = "partial" if (has_open and has_closed) else ("open" if has_open else "closed")
+        b["avg_entry"] = (b["cost_basis_open"] / b["shares_held"]) if b["shares_held"] else 0
+        b["total_pnl"] = b["realized_pnl"] + b["unrealized_pnl"]
+        total_cost = b["cost_basis_open"] + b["realized_cost"]
+        b["total_pnl_pct"] = (b["total_pnl"] / total_cost * 100) if total_cost else 0
+        b["weight_pct"] = (b["market_value"] / final_nav * 100) if final_nav and b["market_value"] else 0
+        # Drop internal accounting fields
+        del b["cost_basis_open"]
+        del b["realized_cost"]
+        positions.append(b)
+
+    positions.sort(key=lambda p: p["total_pnl"], reverse=True)
+    return positions
+
+
+@app.get("/deployments/{deploy_id}/positions", tags=["Deployments (Unified)"])
+async def get_deployment_positions(deploy_id: str, _: str = Depends(verify_api_key)):
+    """Per-ticker position book for a deployment.
+
+    Merges open positions (unrealized P&L) and closed trades (realized P&L)
+    across all sleeves into a single per-ticker summary.
+    """
+    from deploy_engine import get_deployment as _get
+
+    d = _get(deploy_id)
+    if not d:
+        raise HTTPException(404, f"Deployment '{deploy_id}' not found")
+
+    final_nav = (d.get("metrics") or {}).get("final_nav", 0)
+    initial_capital = d.get("initial_capital", 0) or 0
+    positions = _build_position_book(d.get("sleeves") or [], final_nav)
+
+    total_realized = sum(p["realized_pnl"] for p in positions)
+    total_unrealized = sum(p["unrealized_pnl"] for p in positions)
+
+    return _sanitize_floats({
+        "deployment_id": deploy_id,
+        "initial_capital": initial_capital,
+        "final_nav": final_nav,
+        "nav_gain": final_nav - initial_capital,
+        "total_realized_pnl": total_realized,
+        "total_unrealized_pnl": total_unrealized,
+        "total_pnl": total_realized + total_unrealized,
+        "open_count": sum(1 for p in positions if p["status"] in ("open", "partial")),
+        "closed_count": sum(1 for p in positions if p["status"] == "closed"),
+        "positions": positions,
+    })
+
+
 @app.post("/deployments/{deploy_id}/stop", tags=["Deployments (Unified)"])
 async def stop_deployment_unified(deploy_id: str, _: str = Depends(verify_api_key)):
     """Stop a deployment."""
@@ -2451,6 +2545,77 @@ async def get_backtest_trades(
         date_from=None, date_to=None,
         limit=limit, offset=offset, _=_,
     )
+
+
+@app.get("/backtests/{run_id}/positions", tags=["Backtests"])
+async def get_backtest_positions(run_id: str, _: str = Depends(verify_api_key)):
+    """Per-ticker position book for a backtest run.
+
+    Same structure as GET /deployments/{id}/positions — merges open positions
+    and closed trades across all sleeves.
+    """
+    from portfolio_engine import _ensure_portfolio_backtest_table
+    _ensure_portfolio_backtest_table()
+
+    # Try portfolio backtest first (has sleeve_results)
+    data = None
+    with get_db() as conn:
+        prow = conn.execute(
+            "SELECT results_path FROM portfolio_backtest_runs WHERE run_id = ?", (run_id,)
+        ).fetchone()
+    if prow:
+        path = Path(prow["results_path"]) if prow["results_path"] else None
+        if path and path.exists():
+            data = json.loads(path.read_text())
+
+    # Fallback to strategy backtest
+    if not data:
+        path = BACKTEST_RESULTS_DIR / f"{run_id}.json"
+        if not path.exists():
+            raise HTTPException(404, f"Backtest run '{run_id}' not found")
+        data = json.loads(path.read_text())
+
+    final_nav = (data.get("metrics") or {}).get("final_nav", 0)
+    initial_capital = (data.get("metrics") or {}).get("initial_capital") or (
+        (data.get("config") or {}).get("backtest_params", {}).get("initial_capital", 0)
+    )
+
+    # Build sleeves list — portfolio backtests have sleeve_results, strategy has top-level
+    sleeves = []
+    for i, sr in enumerate(data.get("sleeve_results") or []):
+        label = ""
+        ps = data.get("per_sleeve", [])
+        if i < len(ps):
+            label = ps[i].get("label", "")
+        sleeves.append({
+            "label": label,
+            "open_positions": sr.get("open_positions", []),
+            "closed_trades": sr.get("closed_trades", []),
+        })
+    if not sleeves:
+        # Strategy backtest — single sleeve at top level
+        sleeves.append({
+            "label": "",
+            "open_positions": data.get("open_positions", []),
+            "closed_trades": data.get("closed_trades", []),
+        })
+
+    positions = _build_position_book(sleeves, final_nav)
+    total_realized = sum(p["realized_pnl"] for p in positions)
+    total_unrealized = sum(p["unrealized_pnl"] for p in positions)
+
+    return _sanitize_floats({
+        "run_id": run_id,
+        "initial_capital": initial_capital,
+        "final_nav": final_nav,
+        "nav_gain": final_nav - (initial_capital or 0),
+        "total_realized_pnl": total_realized,
+        "total_unrealized_pnl": total_unrealized,
+        "total_pnl": total_realized + total_unrealized,
+        "open_count": sum(1 for p in positions if p["status"] in ("open", "partial")),
+        "closed_count": sum(1 for p in positions if p["status"] == "closed"),
+        "positions": positions,
+    })
 
 
 # ---------------------------------------------------------------------------
