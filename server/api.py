@@ -1898,21 +1898,46 @@ async def get_deployment_positions(deploy_id: str, _: str = Depends(verify_api_k
     if not d:
         raise HTTPException(404, f"Deployment '{deploy_id}' not found")
 
-    final_nav = (d.get("metrics") or {}).get("final_nav", 0)
     initial_capital = d.get("initial_capital", 0) or 0
-    positions = _build_position_book(d.get("sleeves") or [], final_nav)
+    portfolio_nav = (d.get("metrics") or {}).get("final_nav", 0)
+
+    # Compute sleeve-level NAV from actual positions (the number that reconciles
+    # with per-ticker P&L). Portfolio-level NAV may differ due to regime gating.
+    sleeves = d.get("sleeves") or []
+    sleeve_cash = 0
+    sleeve_positions_value = 0
+    for sl in sleeves:
+        for pos in sl.get("open_positions") or []:
+            sleeve_positions_value += pos.get("market_value", 0)
+        # Try to get cash from last nav_history entry; fall back to 0
+        nav_hist = sl.get("nav_history") or sl.get("metrics", {}).get("nav_history") or []
+        if nav_hist and isinstance(nav_hist[-1], dict):
+            sleeve_cash += nav_hist[-1].get("cash", 0)
+
+    # If we couldn't get sleeve cash, derive it: sleeve_nav = initial_capital + total_pnl
+    # so cash = sleeve_nav - positions_value. Use portfolio_nav as fallback.
+    trading_nav = sleeve_cash + sleeve_positions_value if sleeve_cash else portfolio_nav
+
+    positions = _build_position_book(sleeves, trading_nav)
 
     total_realized = sum(p["realized_pnl"] for p in positions)
     total_unrealized = sum(p["unrealized_pnl"] for p in positions)
+    total_pnl = total_realized + total_unrealized
+    # trading_nav derived from actual P&L — always reconciles
+    trading_nav = initial_capital + total_pnl if initial_capital else trading_nav
+    regime_gating_impact = portfolio_nav - trading_nav if portfolio_nav else None
 
     return _sanitize_floats({
         "deployment_id": deploy_id,
         "initial_capital": initial_capital,
-        "final_nav": final_nav,
-        "nav_gain": final_nav - initial_capital,
+        "trading_nav": trading_nav,
+        "trading_gain": total_pnl,
+        "portfolio_nav": portfolio_nav,
+        "portfolio_gain": portfolio_nav - initial_capital if portfolio_nav else None,
+        "regime_gating_impact": regime_gating_impact,
         "total_realized_pnl": total_realized,
         "total_unrealized_pnl": total_unrealized,
-        "total_pnl": total_realized + total_unrealized,
+        "total_pnl": total_pnl,
         "open_count": sum(1 for p in positions if p["status"] in ("open", "partial")),
         "closed_count": sum(1 for p in positions if p["status"] == "closed"),
         "positions": positions,
@@ -2575,7 +2600,7 @@ async def get_backtest_positions(run_id: str, _: str = Depends(verify_api_key)):
             raise HTTPException(404, f"Backtest run '{run_id}' not found")
         data = json.loads(path.read_text())
 
-    final_nav = (data.get("metrics") or {}).get("final_nav", 0)
+    portfolio_nav = (data.get("metrics") or {}).get("final_nav", 0)
     initial_capital = (data.get("metrics") or {}).get("initial_capital") or (
         (data.get("config") or {}).get("backtest_params", {}).get("initial_capital", 0)
     )
@@ -2600,18 +2625,24 @@ async def get_backtest_positions(run_id: str, _: str = Depends(verify_api_key)):
             "closed_trades": data.get("closed_trades", []),
         })
 
-    positions = _build_position_book(sleeves, final_nav)
+    positions = _build_position_book(sleeves, portfolio_nav)
     total_realized = sum(p["realized_pnl"] for p in positions)
     total_unrealized = sum(p["unrealized_pnl"] for p in positions)
+    total_pnl = total_realized + total_unrealized
+    trading_nav = initial_capital + total_pnl if initial_capital else portfolio_nav
+    regime_gating_impact = portfolio_nav - trading_nav if portfolio_nav else None
 
     return _sanitize_floats({
         "run_id": run_id,
         "initial_capital": initial_capital,
-        "final_nav": final_nav,
-        "nav_gain": final_nav - (initial_capital or 0),
+        "trading_nav": trading_nav,
+        "trading_gain": total_pnl,
+        "portfolio_nav": portfolio_nav,
+        "portfolio_gain": portfolio_nav - initial_capital if portfolio_nav else None,
+        "regime_gating_impact": regime_gating_impact,
         "total_realized_pnl": total_realized,
         "total_unrealized_pnl": total_unrealized,
-        "total_pnl": total_realized + total_unrealized,
+        "total_pnl": total_pnl,
         "open_count": sum(1 for p in positions if p["status"] in ("open", "partial")),
         "closed_count": sum(1 for p in positions if p["status"] == "closed"),
         "positions": positions,
