@@ -3,6 +3,8 @@ Custom tools for the auto-trader agent.
 
 query_market_data — run SQL against market.db with date filtering (no future data leakage).
 validate_portfolio — validate a portfolio config against the engine schema.
+evaluate_signal — test how a signal performed historically (forward returns).
+rank_signals — find the optimal combination of candidate signals via forward selection.
 
 Registered as MCP server tools for the Claude Agent SDK.
 """
@@ -25,6 +27,7 @@ MARKET_DB_PATH = Path(os.environ.get("MARKET_DB_PATH",
 
 # Filters — set by create_auto_trader_tools() at runtime
 _STOP_DATE: str | None = None
+_START_DATE: str | None = None
 _SECTOR: str | None = None
 
 # Tables that have a date column (for silent filtering)
@@ -223,19 +226,101 @@ async def validate_portfolio_tool(args: dict[str, Any]) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": json.dumps(result)}]}
 
 
-def create_auto_trader_tools(stop_date: str | None = None, sector: str | None = None):
+@tool(
+    "evaluate_signal",
+    "Test how a single entry signal performed historically. "
+    "Scans the full universe over the given period, finds every time the signal fired, "
+    "and measures forward returns at the target horizon. "
+    "Use this during research to investigate whether a signal pattern actually predicts returns. "
+    "Returns trigger count, win rate, average return, Sharpe, and sample events (best/worst).\n\n"
+    "signal_config: An entry condition config dict. Same format as portfolio entry conditions. "
+    "Examples:\n"
+    '  {"type": "momentum_rank", "lookback": 63, "operator": ">=", "value": 80}\n'
+    '  {"type": "earnings_momentum", "lookback_quarters": 4, "min_beats": 3}\n'
+    '  {"type": "pe_percentile", "max_percentile": 20}\n'
+    '  {"type": "current_drop", "threshold": -15, "window_days": 90}\n'
+    '  {"type": "rsi", "period": 14, "operator": "<=", "value": 30}\n\n'
+    "target_horizon: Forward return horizon. e.g. '3m', '6m', '12m'.",
+    {"signal_config": dict, "target_horizon": str},
+)
+async def evaluate_signal_tool(args: dict[str, Any]) -> dict[str, Any]:
+    from signal_ranker import evaluate_signal
+
+    signal_config = args.get("signal_config", {})
+    target_horizon = args.get("target_horizon", "6m")
+
+    result = evaluate_signal(
+        signal_config=signal_config,
+        target_horizon=target_horizon,
+        db_path=str(MARKET_DB_PATH),
+        start=_START_DATE or "2015-01-01",
+        end=_STOP_DATE or "2025-12-31",
+        sector=_SECTOR,
+    )
+
+    text = json.dumps(result, default=str)
+    if len(text) > 50000:
+        # Truncate sample events to fit context
+        result["sample_events"] = result.get("sample_events", [])[:10]
+        result["truncated"] = True
+        text = json.dumps(result, default=str)
+    return {"content": [{"type": "text", "text": text}]}
+
+
+@tool(
+    "rank_signals",
+    "Rank multiple candidate entry signals and find the optimal combination. "
+    "Tests each signal independently, then runs forward selection: starts with the best single signal, "
+    "greedily adds the next best, stops when adding hurts Sharpe. "
+    "Combination = intersection (trigger counts only when ALL signals agree on the same stock+date). "
+    "Use this after investigating signals with evaluate_signal to decide the final signal set.\n\n"
+    "candidate_signals: List of entry condition config dicts (same format as evaluate_signal). "
+    "Provide 2-8 candidates for meaningful results.\n\n"
+    "target_horizon: Forward return horizon. e.g. '3m', '6m', '12m'.",
+    {"candidate_signals": list, "target_horizon": str},
+)
+async def rank_signals_tool(args: dict[str, Any]) -> dict[str, Any]:
+    from signal_ranker import rank_signals
+
+    candidates = args.get("candidate_signals", [])
+    target_horizon = args.get("target_horizon", "6m")
+
+    result = rank_signals(
+        candidate_signals=candidates,
+        target_horizon=target_horizon,
+        db_path=str(MARKET_DB_PATH),
+        start=_START_DATE or "2015-01-01",
+        end=_STOP_DATE or "2025-12-31",
+        sector=_SECTOR,
+    )
+
+    text = json.dumps(result, default=str)
+    if len(text) > 50000:
+        # Trim individual signal sample events
+        for sig in result.get("individual_signals", []):
+            sig.pop("sample_events", None)
+        result["truncated"] = True
+        text = json.dumps(result, default=str)
+    return {"content": [{"type": "text", "text": text}]}
+
+
+def create_auto_trader_tools(stop_date: str | None = None, sector: str | None = None,
+                             start_date: str | None = None):
     """Create the MCP server with auto-trader tools.
 
     Args:
         stop_date: If set, silently filters all query results to dates <= stop_date.
         sector: If set, silently filters stock data to only this sector.
+        start_date: If set, used as the start date for signal evaluation/ranking.
     """
-    global _STOP_DATE, _SECTOR
+    global _STOP_DATE, _SECTOR, _START_DATE
     _STOP_DATE = stop_date
+    _START_DATE = start_date
     _SECTOR = sector
 
     return create_sdk_mcp_server(
         name="auto_trader",
         version="1.0.0",
-        tools=[query_market_data_tool, validate_portfolio_tool],
+        tools=[query_market_data_tool, validate_portfolio_tool,
+               evaluate_signal_tool, rank_signals_tool],
     )

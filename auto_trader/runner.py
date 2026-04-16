@@ -407,7 +407,8 @@ Remember: query the data first, don't guess. Explore before you commit."""
     agent_output = []
     tool_calls = 0
     session_id = None
-    auto_trader_tools = create_auto_trader_tools(stop_date=backtest_end, sector=sector)
+    auto_trader_tools = create_auto_trader_tools(
+        stop_date=backtest_end, sector=sector, start_date=backtest_start)
     try:
         async for message in query(
             prompt=prompt,
@@ -420,6 +421,8 @@ Remember: query the data first, don't guess. Explore before you commit."""
                     "Skill", "Read",
                     "mcp__auto_trader__query_market_data",
                     "mcp__auto_trader__validate_portfolio",
+                    "mcp__auto_trader__evaluate_signal",
+                    "mcp__auto_trader__rank_signals",
                 ],
                 mcp_servers={"auto_trader": auto_trader_tools},
                 permission_mode="acceptEdits",
