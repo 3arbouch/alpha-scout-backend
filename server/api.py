@@ -1879,9 +1879,7 @@ def _build_position_book(sleeves: list[dict], initial_capital: float) -> dict:
     positions = []
 
     for b in book.values():
-        has_open = b["shares_held"] > 0
-        has_closed = b["num_round_trips"] > 0
-        b["status"] = "partial" if (has_open and has_closed) else ("open" if has_open else "closed")
+        b["status"] = "open" if b["shares_held"] > 0 else "closed"
         b["avg_entry"] = (b["cost_basis_open"] / b["shares_held"]) if b["shares_held"] else 0
         b["total_pnl"] = b["realized_pnl"] + b["unrealized_pnl"]
         total_cost = b["cost_basis_open"] + b["realized_cost"]
@@ -1915,7 +1913,7 @@ def _build_position_book(sleeves: list[dict], initial_capital: float) -> dict:
         "total_pnl": total_pnl,
         "total_realized_pnl": total_realized,
         "total_unrealized_pnl": total_unrealized,
-        "open_count": sum(1 for p in positions if p["status"] in ("open", "partial")),
+        "open_count": sum(1 for p in positions if p["status"] == "open"),
         "closed_count": sum(1 for p in positions if p["status"] == "closed"),
     }
 
