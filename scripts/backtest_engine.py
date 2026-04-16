@@ -1455,7 +1455,8 @@ def is_rebalance_date(date: str, last_rebal: str, frequency: str) -> bool:
 # Main Backtest Loop
 # ---------------------------------------------------------------------------
 def run_backtest(config: dict, force_close_at_end: bool = True,
-                 shared_price_index: tuple = None) -> dict:
+                 shared_price_index: tuple = None,
+                 gate_dates: set = None) -> dict:
     """
     Execute the backtest.
 
@@ -1464,6 +1465,10 @@ def run_backtest(config: dict, force_close_at_end: bool = True,
         force_close_at_end: Close all positions on last day (True for backtests, False for deployments).
         shared_price_index: Optional (price_index, trading_dates) tuple pre-built by the portfolio engine.
             When provided, skips building the price index and uses these instead.
+        gate_dates: Optional set of date strings where new entries are allowed.
+            When provided, the engine skips new entries on dates not in this set.
+            Exits (stop-loss, take-profit, time-stop) still fire regardless.
+            When None, all dates are allowed (no gating).
 
     Returns dict with:
         - trades: list of all trades
@@ -1555,8 +1560,14 @@ def run_backtest(config: dict, force_close_at_end: bool = True,
     print(f"Running simulation with ${initial_cash:,.0f}...")
     print()
 
+    _gated = gate_dates is not None  # regime gating active?
+
     for i, date in enumerate(trading_dates):
-        # --- Execute pending entries from previous day ---
+        _gate_on = (not _gated) or (date in gate_dates)
+
+        # --- Execute pending entries from previous day (only if gated on) ---
+        if not _gate_on:
+            pending_entries = []
         for symbol, peak_price, sig_detail in pending_entries:
             if symbol in portfolio.positions:
                 continue  # Already in portfolio
@@ -1634,9 +1645,9 @@ def run_backtest(config: dict, force_close_at_end: bool = True,
                 closed_today.append(symbol)
                 continue
 
-        # --- Check rebalancing ---
+        # --- Check rebalancing (only if regime gate is on) ---
         rebal_freq = config.get("rebalancing", {}).get("frequency", "none")
-        if is_rebalance_date(date, last_rebal_date, rebal_freq):
+        if _gate_on and is_rebalance_date(date, last_rebal_date, rebal_freq):
             rebal_mode = config.get("rebalancing", {}).get("mode", "trim")
             if rebal_mode == "equal_weight":
                 _do_equal_weight_rebalance(portfolio, price_index, date, config,
@@ -1648,10 +1659,10 @@ def run_backtest(config: dict, force_close_at_end: bool = True,
         elif last_rebal_date is None and len(portfolio.positions) > 0:
             last_rebal_date = date
 
-        # --- Check new entries ---
+        # --- Check new entries (only if regime gate is on) ---
         # Collect all candidates with active signals today
         available_slots = max_positions - len(portfolio.positions) - len(pending_entries)
-        if available_slots > 0:
+        if available_slots > 0 and _gate_on:
             candidates = []
             # Build trading day index for cooldown check
             date_idx = trading_dates.index(date) if date in trading_dates else -1
