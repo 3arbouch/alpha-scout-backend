@@ -1825,9 +1825,16 @@ async def evaluate_deployment_unified(deploy_id: str, _: str = Depends(verify_ap
     })
 
 
-def _build_position_book(sleeves: list[dict], final_nav: float) -> list[dict]:
-    """Merge open positions + closed trades across sleeves into per-ticker book."""
+def _build_position_book(sleeves: list[dict], initial_capital: float) -> dict:
+    """Merge open positions + closed trades across sleeves into per-ticker book.
+
+    Returns a dict with ``positions``, ``positions_value``, ``cash``,
+    ``portfolio_value``, and P&L totals.  The accounting identity
+    ``cash + positions_value == portfolio_value`` always holds, and
+    ``total_realized + total_unrealized == portfolio_value - initial_capital``.
+    """
     book: dict[str, dict] = {}
+    total_open_cost = 0  # capital currently tied up in open positions
 
     def _ensure(sym: str) -> dict:
         if sym not in book:
@@ -1836,7 +1843,7 @@ def _build_position_book(sleeves: list[dict], final_nav: float) -> list[dict]:
                 "shares_held": 0, "current_price": 0,
                 "market_value": 0, "cost_basis_open": 0,
                 "unrealized_pnl": 0, "realized_pnl": 0,
-                "realized_cost": 0,  # total capital deployed in closed round-trips
+                "realized_cost": 0,
                 "num_round_trips": 0, "sleeves": [],
             }
         return book[sym]
@@ -1866,7 +1873,11 @@ def _build_position_book(sleeves: list[dict], final_nav: float) -> list[dict]:
             if label and label not in b["sleeves"]:
                 b["sleeves"].append(label)
 
+    total_realized = 0
+    total_unrealized = 0
+    positions_value = 0
     positions = []
+
     for b in book.values():
         has_open = b["shares_held"] > 0
         has_closed = b["num_round_trips"] > 0
@@ -1875,14 +1886,38 @@ def _build_position_book(sleeves: list[dict], final_nav: float) -> list[dict]:
         b["total_pnl"] = b["realized_pnl"] + b["unrealized_pnl"]
         total_cost = b["cost_basis_open"] + b["realized_cost"]
         b["total_pnl_pct"] = (b["total_pnl"] / total_cost * 100) if total_cost else 0
-        b["weight_pct"] = (b["market_value"] / final_nav * 100) if final_nav and b["market_value"] else 0
-        # Drop internal accounting fields
+
+        total_realized += b["realized_pnl"]
+        total_unrealized += b["unrealized_pnl"]
+        positions_value += b["market_value"]
+        total_open_cost += b["cost_basis_open"]
+
         del b["cost_basis_open"]
         del b["realized_cost"]
         positions.append(b)
 
+    # cash = initial_capital - cost_of_open_positions + realized_pnl
+    cash = initial_capital - total_open_cost + total_realized
+    portfolio_value = cash + positions_value
+    total_pnl = total_realized + total_unrealized
+
+    # weight_pct relative to portfolio_value
+    for p in positions:
+        p["weight_pct"] = (p["market_value"] / portfolio_value * 100) if portfolio_value and p["market_value"] else 0
+
     positions.sort(key=lambda p: p["total_pnl"], reverse=True)
-    return positions
+
+    return {
+        "positions": positions,
+        "cash": cash,
+        "positions_value": positions_value,
+        "portfolio_value": portfolio_value,
+        "total_pnl": total_pnl,
+        "total_realized_pnl": total_realized,
+        "total_unrealized_pnl": total_unrealized,
+        "open_count": sum(1 for p in positions if p["status"] in ("open", "partial")),
+        "closed_count": sum(1 for p in positions if p["status"] == "closed"),
+    }
 
 
 @app.get("/deployments/{deploy_id}/positions", tags=["Deployments (Unified)"])
@@ -1890,7 +1925,9 @@ async def get_deployment_positions(deploy_id: str, _: str = Depends(verify_api_k
     """Per-ticker position book for a deployment.
 
     Merges open positions (unrealized P&L) and closed trades (realized P&L)
-    across all sleeves into a single per-ticker summary.
+    across all sleeves.  Numbers always reconcile:
+    ``cash + positions_value = portfolio_value`` and
+    ``total_realized + total_unrealized = portfolio_value - initial_capital``.
     """
     from deploy_engine import get_deployment as _get
 
@@ -1899,48 +1936,12 @@ async def get_deployment_positions(deploy_id: str, _: str = Depends(verify_api_k
         raise HTTPException(404, f"Deployment '{deploy_id}' not found")
 
     initial_capital = d.get("initial_capital", 0) or 0
-    portfolio_nav = (d.get("metrics") or {}).get("final_nav", 0)
-
-    # Compute sleeve-level NAV from actual positions (the number that reconciles
-    # with per-ticker P&L). Portfolio-level NAV may differ due to regime gating.
-    sleeves = d.get("sleeves") or []
-    sleeve_cash = 0
-    sleeve_positions_value = 0
-    for sl in sleeves:
-        for pos in sl.get("open_positions") or []:
-            sleeve_positions_value += pos.get("market_value", 0)
-        # Try to get cash from last nav_history entry; fall back to 0
-        nav_hist = sl.get("nav_history") or sl.get("metrics", {}).get("nav_history") or []
-        if nav_hist and isinstance(nav_hist[-1], dict):
-            sleeve_cash += nav_hist[-1].get("cash", 0)
-
-    # If we couldn't get sleeve cash, derive it: sleeve_nav = initial_capital + total_pnl
-    # so cash = sleeve_nav - positions_value. Use portfolio_nav as fallback.
-    trading_nav = sleeve_cash + sleeve_positions_value if sleeve_cash else portfolio_nav
-
-    positions = _build_position_book(sleeves, trading_nav)
-
-    total_realized = sum(p["realized_pnl"] for p in positions)
-    total_unrealized = sum(p["unrealized_pnl"] for p in positions)
-    total_pnl = total_realized + total_unrealized
-    # trading_nav derived from actual P&L — always reconciles
-    trading_nav = initial_capital + total_pnl if initial_capital else trading_nav
-    regime_gating_impact = portfolio_nav - trading_nav if portfolio_nav else None
+    result = _build_position_book(d.get("sleeves") or [], initial_capital)
 
     return _sanitize_floats({
         "deployment_id": deploy_id,
         "initial_capital": initial_capital,
-        "trading_nav": trading_nav,
-        "trading_gain": total_pnl,
-        "portfolio_nav": portfolio_nav,
-        "portfolio_gain": portfolio_nav - initial_capital if portfolio_nav else None,
-        "regime_gating_impact": regime_gating_impact,
-        "total_realized_pnl": total_realized,
-        "total_unrealized_pnl": total_unrealized,
-        "total_pnl": total_pnl,
-        "open_count": sum(1 for p in positions if p["status"] in ("open", "partial")),
-        "closed_count": sum(1 for p in positions if p["status"] == "closed"),
-        "positions": positions,
+        **result,
     })
 
 
@@ -2600,7 +2601,6 @@ async def get_backtest_positions(run_id: str, _: str = Depends(verify_api_key)):
             raise HTTPException(404, f"Backtest run '{run_id}' not found")
         data = json.loads(path.read_text())
 
-    portfolio_nav = (data.get("metrics") or {}).get("final_nav", 0)
     initial_capital = (data.get("metrics") or {}).get("initial_capital") or (
         (data.get("config") or {}).get("backtest_params", {}).get("initial_capital", 0)
     )
@@ -2625,27 +2625,12 @@ async def get_backtest_positions(run_id: str, _: str = Depends(verify_api_key)):
             "closed_trades": data.get("closed_trades", []),
         })
 
-    positions = _build_position_book(sleeves, portfolio_nav)
-    total_realized = sum(p["realized_pnl"] for p in positions)
-    total_unrealized = sum(p["unrealized_pnl"] for p in positions)
-    total_pnl = total_realized + total_unrealized
-    trading_nav = initial_capital + total_pnl if initial_capital else portfolio_nav
-    regime_gating_impact = portfolio_nav - trading_nav if portfolio_nav else None
+    result = _build_position_book(sleeves, initial_capital)
 
     return _sanitize_floats({
         "run_id": run_id,
         "initial_capital": initial_capital,
-        "trading_nav": trading_nav,
-        "trading_gain": total_pnl,
-        "portfolio_nav": portfolio_nav,
-        "portfolio_gain": portfolio_nav - initial_capital if portfolio_nav else None,
-        "regime_gating_impact": regime_gating_impact,
-        "total_realized_pnl": total_realized,
-        "total_unrealized_pnl": total_unrealized,
-        "total_pnl": total_pnl,
-        "open_count": sum(1 for p in positions if p["status"] in ("open", "partial")),
-        "closed_count": sum(1 for p in positions if p["status"] == "closed"),
-        "positions": positions,
+        **result,
     })
 
 
