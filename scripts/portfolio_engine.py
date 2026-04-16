@@ -389,7 +389,28 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
                 print(f"    {rname}: {cnt} days ({cnt/total_days*100:.1f}%)")
 
     # -----------------------------------------------------------------------
-    # Step 2.5: Build shared price index for all sleeve universes
+    # Step 2.5: Pre-compute per-sleeve gate dates for execution-level gating
+    # -----------------------------------------------------------------------
+    # Each sleeve gets a set of dates where new entries are allowed.
+    # When regime_gate is ["*"] or regime is disabled, gate_dates is None (always on).
+    sleeve_gate_dates = []
+    for sleeve in sleeves:
+        gate = sleeve["regime_gate"]
+        if not regime_enabled or gate == ["*"]:
+            sleeve_gate_dates.append(None)  # no gating — always active
+        else:
+            gated_names = {regime_id_to_name.get(rid, rid) for rid in gate}
+            dates_on = set()
+            for date, active in regime_series.items():
+                if gated_names & set(active):
+                    dates_on.add(date)
+            sleeve_gate_dates.append(dates_on)
+            total = len(regime_series)
+            on = len(dates_on)
+            print(f"  Sleeve '{sleeve['label']}' gate: {on}/{total} days active ({on/total*100:.1f}%)")
+
+    # -----------------------------------------------------------------------
+    # Step 2.6: Build shared price index for all sleeve universes
     # -----------------------------------------------------------------------
     all_sleeve_symbols = set()
     conn = get_connection()
@@ -415,7 +436,8 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
         print(f"{'─' * 60}")
 
         result = run_backtest(sleeve["config"], force_close_at_end=force_close_at_end,
-                              shared_price_index=shared_pi)
+                              shared_price_index=shared_pi,
+                              gate_dates=sleeve_gate_dates[i])
         sleeve_results.append(result)
 
     # -----------------------------------------------------------------------
@@ -449,15 +471,13 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
     sleeve_gated_off_days = [0] * len(sleeves)
     prev_profile_name = None
 
-    # --- Per-sleeve adjusted NAV ---
-    # Sleeve backtests run independently (without regime awareness). Instead of
-    # tracking "phantom gains" to subtract later, we track an adjusted NAV per
-    # sleeve that only compounds daily returns when the sleeve is active.
-    # When gated off, the adjusted NAV freezes (to_cash) or moves to a
-    # redistribute balance pool.
+    # --- Per-sleeve tracking ---
+    # Sleeve backtests now execute with regime gating (gate_dates), so their
+    # raw NAV histories already reflect gated execution. For fixed-weight mode,
+    # the combined NAV is simply the sum of sleeve NAVs.
+    # For redistribute mode, capital from gated-off sleeves earns active sleeves' return.
     n_sleeves = len(sleeves)
-    sleeve_adj_nav = [s["allocated_capital"] for s in sleeves]
-    sleeve_frozen_capital = [0.0] * n_sleeves  # capital put into redistribute at gateoff
+    sleeve_frozen_capital = [0.0] * n_sleeves
 
     # --- Redistribute tracking ---
     redistribute_balance = 0.0
@@ -660,32 +680,27 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
         sleeve_navs = []
         use_redistribute = capital_flow == "redistribute"
 
-        # --- Handle gate transitions ---
-        if prev_gate_status is not None:
-            for i in range(n_sleeves):
-                if prev_gate_status[i] and not gate_status[i]:
-                    # Sleeve just gated OFF — freeze its adjusted NAV
-                    if use_redistribute:
-                        sleeve_frozen_capital[i] = sleeve_adj_nav[i]
-                        redistribute_balance += sleeve_adj_nav[i]
-                elif not prev_gate_status[i] and gate_status[i]:
-                    # Sleeve just gated ON — restore frozen capital
-                    if use_redistribute and sleeve_frozen_capital[i] > 0:
-                        redistribute_balance = max(0, redistribute_balance - sleeve_frozen_capital[i])
-                        sleeve_frozen_capital[i] = 0.0
-        else:
-            # First day: sleeves that start gated off
-            for i in range(n_sleeves):
-                if not gate_status[i] and use_redistribute:
-                    sleeve_frozen_capital[i] = sleeve_adj_nav[i]
-                    redistribute_balance += sleeve_adj_nav[i]
-
-        # --- Compound active sleeves' adjusted NAV ---
-        for i in range(n_sleeves):
-            if gate_status[i] and prev_date is not None:
-                daily_ret = _sleeve_daily_return(i, date, prev_date)
-                sleeve_adj_nav[i] *= (1 + daily_ret)
-            # If gated off: sleeve_adj_nav[i] stays frozen
+        # --- Handle gate transitions for redistribute mode ---
+        if use_redistribute:
+            if prev_gate_status is not None:
+                for i in range(n_sleeves):
+                    sleeve_nav_today = sleeve_nav_lookup[i].get(date, sleeves[i]["allocated_capital"])
+                    if prev_gate_status[i] and not gate_status[i]:
+                        # Sleeve just gated OFF — track its capital for redistribution
+                        sleeve_frozen_capital[i] = sleeve_nav_today
+                        redistribute_balance += sleeve_nav_today
+                    elif not prev_gate_status[i] and gate_status[i]:
+                        # Sleeve just gated ON — restore frozen capital
+                        if sleeve_frozen_capital[i] > 0:
+                            redistribute_balance = max(0, redistribute_balance - sleeve_frozen_capital[i])
+                            sleeve_frozen_capital[i] = 0.0
+            else:
+                # First day: sleeves that start gated off
+                for i in range(n_sleeves):
+                    if not gate_status[i]:
+                        sleeve_nav_today = sleeve_nav_lookup[i].get(date, sleeves[i]["allocated_capital"])
+                        sleeve_frozen_capital[i] = sleeve_nav_today
+                        redistribute_balance += sleeve_nav_today
 
         # --- Compound redistribute balance with active sleeves' avg return ---
         if use_redistribute and redistribute_balance > 0 and prev_date is not None:
@@ -751,26 +766,25 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
                 })
 
         else:
-            # FIXED WEIGHT MODE: sum of per-sleeve adjusted NAVs
+            # FIXED WEIGHT MODE: sum of raw sleeve NAVs (sleeves already gated)
             for i, sleeve in enumerate(sleeves):
-                if gate_status[i]:
-                    combined_nav += sleeve_adj_nav[i]
-                    sleeve_active_days[i] += 1
-                else:
-                    if not use_redistribute:
-                        # to_cash: frozen capital still counts toward NAV
-                        combined_nav += sleeve_adj_nav[i]
-                    # redistribute: gated-off capital is in redistribute_balance
-                    sleeve_gated_off_days[i] += 1
-
-                # Compute positions_value: scale raw PV by adj_nav/raw_nav ratio
                 raw_nav = sleeve_nav_lookup[i].get(date, sleeves[i]["allocated_capital"])
                 raw_pv = sleeve_pv_lookup[i].get(date, 0)
-                sleeve_pv = sleeve_adj_nav[i] * (raw_pv / raw_nav) if raw_nav > 0 and gate_status[i] else 0
+
+                if gate_status[i]:
+                    sleeve_active_days[i] += 1
+                else:
+                    sleeve_gated_off_days[i] += 1
+
+                if not use_redistribute or gate_status[i]:
+                    # Active sleeve or to_cash mode: NAV counts directly
+                    combined_nav += raw_nav
+                # redistribute: gated-off capital is in redistribute_balance
+
                 sleeve_navs.append({
                     "label": sleeve["label"],
-                    "nav": round(sleeve_adj_nav[i], 2),
-                    "positions_value": round(sleeve_pv, 2),
+                    "nav": round(raw_nav, 2),
+                    "positions_value": round(raw_pv, 2),
                     "active": gate_status[i],
                     "weight": round(day_weights[i], 4),
                 })
