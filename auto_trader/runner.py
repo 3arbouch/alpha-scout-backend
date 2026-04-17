@@ -72,6 +72,25 @@ def _load_schemas() -> str:
 
 _custom_prompt = None
 
+
+def _resolve_model_api_id(model_id: str) -> str:
+    """Map a short model id ('opus', 'opus-4-7') to its full Anthropic API id.
+
+    If the input is already a full API id (contains 'claude-'), returns as-is.
+    Unknown short ids also pass through unchanged — the SDK will either resolve
+    a slug alias or error with a clear message.
+    """
+    if not model_id or "claude-" in model_id:
+        return model_id
+    # Keep in sync with AVAILABLE_MODELS in auto_trader/api.py
+    mapping = {
+        "haiku": "claude-haiku-4-5-20251001",
+        "sonnet": "claude-sonnet-4-6",
+        "opus": "claude-opus-4-6",
+        "opus-4-7": "claude-opus-4-7",
+    }
+    return mapping.get(model_id, model_id)
+
 def load_program(agent_prompt: str | None = None) -> str:
     """Build the full system prompt: system.md + agent prompt + schemas.
 
@@ -522,13 +541,17 @@ Remember: query the data first, don't guess. Explore before you commit."""
     auto_trader_tools = create_auto_trader_tools(
         stop_date=backtest_end, sector=sector, start_date=backtest_start,
         run_id=run_id)
+    # Resolve short id (e.g. "opus-4-7") to the full API id so the SDK
+    # dispatches to the exact model regardless of its slug aliasing.
+    resolved_model = _resolve_model_api_id(model)
+
     try:
         async for message in query(
             prompt=prompt,
             options=ClaudeAgentOptions(
                 system_prompt=program,
                 cwd=str(PROJECT_ROOT / "auto_trader"),
-                model=model,
+                model=resolved_model,
                 setting_sources=["project"],
                 allowed_tools=[
                     "Skill", "Read",
