@@ -545,26 +545,33 @@ Remember: query the data first, don't guess. Explore before you commit."""
     # dispatches to the exact model regardless of its slug aliasing.
     resolved_model = _resolve_model_api_id(model)
 
+    agent_opts = dict(
+        system_prompt=program,
+        cwd=str(PROJECT_ROOT / "auto_trader"),
+        model=resolved_model,
+        setting_sources=["project"],
+        allowed_tools=[
+            "Skill", "Read",
+            "mcp__auto_trader__query_market_data",
+            "mcp__auto_trader__validate_portfolio",
+            "mcp__auto_trader__evaluate_signal",
+            "mcp__auto_trader__rank_signals",
+            "mcp__auto_trader__get_experiment_trades",
+        ],
+        mcp_servers={"auto_trader": auto_trader_tools},
+        permission_mode="acceptEdits",
+        max_turns=50,
+    )
+    # Opus 4.7 rejects the legacy thinking.type='enabled' shape the CLI
+    # defaults to. Force adaptive thinking for 4.7 only; leave other
+    # models on their defaults so we don't alter working behavior.
+    if resolved_model == "claude-opus-4-7":
+        agent_opts["thinking"] = {"type": "adaptive"}
+
     try:
         async for message in query(
             prompt=prompt,
-            options=ClaudeAgentOptions(
-                system_prompt=program,
-                cwd=str(PROJECT_ROOT / "auto_trader"),
-                model=resolved_model,
-                setting_sources=["project"],
-                allowed_tools=[
-                    "Skill", "Read",
-                    "mcp__auto_trader__query_market_data",
-                    "mcp__auto_trader__validate_portfolio",
-                    "mcp__auto_trader__evaluate_signal",
-                    "mcp__auto_trader__rank_signals",
-                    "mcp__auto_trader__get_experiment_trades",
-                ],
-                mcp_servers={"auto_trader": auto_trader_tools},
-                permission_mode="acceptEdits",
-                max_turns=50,
-            ),
+            options=ClaudeAgentOptions(**agent_opts),
         ):
             msg_type = type(message).__name__
             # Capture session_id from any message that has it
