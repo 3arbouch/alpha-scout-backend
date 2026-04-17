@@ -29,6 +29,7 @@ MARKET_DB_PATH = Path(os.environ.get("MARKET_DB_PATH",
 _STOP_DATE: str | None = None
 _START_DATE: str | None = None
 _SECTOR: str | None = None
+_RUN_ID: str | None = None
 
 # Tables that have a date column (for silent filtering)
 DATE_COLUMN_MAP = {
@@ -304,23 +305,112 @@ async def rank_signals_tool(args: dict[str, Any]) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": text}]}
 
 
+@tool(
+    "get_experiment_trades",
+    "Fetch the full trade log for a past experiment in this run. "
+    "Use this when a past experiment's summary suggests a pattern worth drilling into "
+    "(e.g., one large loser dragged the hit rate, a sleeve ran hot in one regime, "
+    "an exit reason dominates). "
+    "The experiment_id is shown in brackets in each past experiment's header in the history "
+    "(e.g., '### Experiment 4 [id: 50e63c54f604]'). Pass that hash as experiment_id.\n\n"
+    "Returns all BUYs and SELLs for the experiment's backtest, with each row tagged by "
+    "sleeve_label. SELL rows carry round-trip fields: pnl, pnl_pct, entry_date, "
+    "entry_price, days_held, reason. BUY rows have those fields as null.\n\n"
+    "Optional filters:\n"
+    "  sleeve_label: narrow to one sleeve\n"
+    "  action: 'BUY' or 'SELL' only\n"
+    "  winners_only: SELL trades with pnl > 0 only\n"
+    "  losers_only: SELL trades with pnl <= 0 only\n\n"
+    "Scope: experiments from the current run only. Cross-run access returns empty.",
+    {"experiment_id": str, "sleeve_label": str, "action": str,
+     "winners_only": bool, "losers_only": bool},
+)
+async def get_experiment_trades_tool(args: dict[str, Any]) -> dict[str, Any]:
+    from auto_trader.schema import get_db
+
+    experiment_id = args.get("experiment_id", "").strip()
+    if not experiment_id:
+        return {"content": [{"type": "text", "text": json.dumps({"error": "experiment_id is required"})}]}
+
+    # Build WHERE clause — scope enforced via run_id subquery
+    where = ["source_type = 'experiment'", "source_id = ?"]
+    params: list[Any] = [experiment_id]
+
+    if _RUN_ID:
+        where.append("source_id IN (SELECT id FROM experiments WHERE run_id = ?)")
+        params.append(_RUN_ID)
+
+    sleeve_label = args.get("sleeve_label")
+    if sleeve_label:
+        where.append("sleeve_label = ?")
+        params.append(sleeve_label)
+
+    action = args.get("action")
+    if action in ("BUY", "SELL"):
+        where.append("action = ?")
+        params.append(action)
+
+    if args.get("winners_only"):
+        where.append("action = 'SELL' AND pnl > 0")
+    elif args.get("losers_only"):
+        where.append("action = 'SELL' AND pnl <= 0")
+
+    sql = f"""
+        SELECT sleeve_label, date, action, symbol, shares, price, amount,
+               reason, signal_detail, entry_date, entry_price,
+               pnl, pnl_pct, days_held
+        FROM trades
+        WHERE {' AND '.join(where)}
+        ORDER BY date, action, symbol
+        LIMIT 201
+    """
+
+    conn = get_db()
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+
+    truncated = len(rows) > 200
+    rows = rows[:200]
+
+    trades = []
+    for r in rows:
+        d = dict(r)
+        if d.get("signal_detail") and isinstance(d["signal_detail"], str):
+            try:
+                d["signal_detail"] = json.loads(d["signal_detail"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+        trades.append(d)
+
+    result = {
+        "experiment_id": experiment_id,
+        "trade_count": len(trades),
+        "trades": trades,
+        "truncated": truncated,
+    }
+    return {"content": [{"type": "text", "text": json.dumps(result, default=str)}]}
+
+
 def create_auto_trader_tools(stop_date: str | None = None, sector: str | None = None,
-                             start_date: str | None = None):
+                             start_date: str | None = None, run_id: str | None = None):
     """Create the MCP server with auto-trader tools.
 
     Args:
         stop_date: If set, silently filters all query results to dates <= stop_date.
         sector: If set, silently filters stock data to only this sector.
         start_date: If set, used as the start date for signal evaluation/ranking.
+        run_id: If set, scopes get_experiment_trades to this run's experiments only.
     """
-    global _STOP_DATE, _SECTOR, _START_DATE
+    global _STOP_DATE, _SECTOR, _START_DATE, _RUN_ID
     _STOP_DATE = stop_date
     _START_DATE = start_date
     _SECTOR = sector
+    _RUN_ID = run_id
 
     return create_sdk_mcp_server(
         name="auto_trader",
         version="1.0.0",
         tools=[query_market_data_tool, validate_portfolio_tool,
-               evaluate_signal_tool, rank_signals_tool],
+               evaluate_signal_tool, rank_signals_tool,
+               get_experiment_trades_tool],
     )

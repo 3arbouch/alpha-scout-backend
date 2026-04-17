@@ -12,6 +12,7 @@ Two tools help you discover which entry signals actually predict returns, instea
 
 - `evaluate_signal` — test a single candidate signal across the full universe. Returns trigger count, win rate, forward-return stats, yearly breakdown, and top/bottom 20 stocks. Use it to investigate whether a pattern you suspect actually works.
 - `rank_signals` — given 2–8 candidate signals, runs forward selection (greedy intersection) to find the combination with the best risk-adjusted returns. Use it once you have a shortlist of signals that individually look promising, to decide the final set.
+- `get_experiment_trades` — fetch the full trade log for any past experiment in this run. The `experiment_id` is shown in brackets in each past experiment's header (e.g. `### Experiment 4 [id: 50e63c54f604]`). Use when a past experiment's trade summary suggests a pattern worth drilling into — one big loser, a sleeve that ran hot in one regime, a dominant exit reason.
 
 These are optional — use them when your thesis needs empirical validation. For simple or well-established strategies, direct `query_market_data` exploration may be enough.
 

@@ -194,7 +194,7 @@ def build_history_context(run_id: str, target_metric: str, limit: int = 20) -> s
     lines = [f"## Past Experiments ({len(history)} most recent)\n"]
     for exp in reversed(history):  # oldest first
         status = "KEEP" if exp["decision"] == "keep" else "DISCARD"
-        lines.append(f"### Experiment {exp['iteration']} — {status}")
+        lines.append(f"### Experiment {exp['iteration']} [id: {exp['id']}] — {status}")
 
         # Full thesis
         lines.append(f"**Thesis:** {exp.get('thesis', 'N/A')}")
@@ -520,7 +520,8 @@ Remember: query the data first, don't guess. Explore before you commit."""
     tool_calls = 0
     session_id = None
     auto_trader_tools = create_auto_trader_tools(
-        stop_date=backtest_end, sector=sector, start_date=backtest_start)
+        stop_date=backtest_end, sector=sector, start_date=backtest_start,
+        run_id=run_id)
     try:
         async for message in query(
             prompt=prompt,
@@ -535,6 +536,7 @@ Remember: query the data first, don't guess. Explore before you commit."""
                     "mcp__auto_trader__validate_portfolio",
                     "mcp__auto_trader__evaluate_signal",
                     "mcp__auto_trader__rank_signals",
+                    "mcp__auto_trader__get_experiment_trades",
                 ],
                 mcp_servers={"auto_trader": auto_trader_tools},
                 permission_mode="acceptEdits",
