@@ -646,6 +646,14 @@ async def delete_run(run_id: str):
         raise HTTPException(409, "Cannot delete a running run. Stop it first.")
 
     conn = get_db()
+    # Cascade delete trades for all experiments in this run before removing the
+    # experiment rows themselves. Single transaction via the implicit BEGIN.
+    conn.execute(
+        """DELETE FROM trades
+           WHERE source_type = 'experiment'
+             AND source_id IN (SELECT id FROM experiments WHERE run_id = ?)""",
+        (run_id,),
+    )
     conn.execute("DELETE FROM experiments WHERE run_id = ?", (run_id,))
     conn.execute("DELETE FROM auto_trader_runs WHERE id = ?", (run_id,))
     conn.commit()
@@ -869,6 +877,53 @@ async def get_experiment(run_id: str, experiment_id: str):
                 pass
 
     return result
+
+
+@router.get("/runs/{run_id}/experiments/{experiment_id}/trades")
+async def get_experiment_trades(run_id: str, experiment_id: str):
+    """Get all trades executed during this experiment's backtest.
+
+    Returns every BUY and SELL across every sleeve of the portfolio, tagged
+    with sleeve_label. SELL rows carry round-trip fields (pnl, pnl_pct,
+    entry_date, days_held, reason); BUY rows have those fields as null.
+    """
+    conn = get_db()
+    # Verify the experiment belongs to this run (404 if not found)
+    exp_row = conn.execute(
+        "SELECT id FROM experiments WHERE id = ? AND run_id = ?",
+        (experiment_id, run_id),
+    ).fetchone()
+    if not exp_row:
+        conn.close()
+        raise HTTPException(404, f"Experiment '{experiment_id}' not found in run '{run_id}'")
+
+    rows = conn.execute(
+        """SELECT id, sleeve_label, date, action, symbol, shares, price, amount,
+                  reason, signal_detail, entry_date, entry_price, pnl, pnl_pct,
+                  days_held, linked_trade_id
+           FROM trades
+           WHERE source_type = 'experiment' AND source_id = ?
+           ORDER BY date, action, symbol""",
+        (experiment_id,),
+    ).fetchall()
+    conn.close()
+
+    trades = []
+    for r in rows:
+        d = dict(r)
+        if d.get("signal_detail") and isinstance(d["signal_detail"], str):
+            try:
+                d["signal_detail"] = json.loads(d["signal_detail"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+        trades.append(d)
+
+    return {
+        "experiment_id": experiment_id,
+        "run_id": run_id,
+        "trade_count": len(trades),
+        "trades": trades,
+    }
 
 
 @router.get("/runs/{run_id}/experiments/{experiment_id}/session")
