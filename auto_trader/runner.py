@@ -118,6 +118,73 @@ def parse_thesis(agent_output: str) -> dict | None:
     return None
 
 
+def _get_trade_summary(exp_id: str) -> dict | None:
+    """Pull compact trade aggregates for an experiment.
+
+    Returns None if no trades (backtest generated no executions, or trade
+    persist failed for this experiment).
+    """
+    from auto_trader.schema import get_db
+    conn = get_db()
+    # Aggregate stats — only SELL rows carry pnl
+    agg = conn.execute(
+        """SELECT
+               COUNT(*) AS total_events,
+               SUM(CASE WHEN action='BUY' THEN 1 ELSE 0 END) AS buys,
+               SUM(CASE WHEN action='SELL' THEN 1 ELSE 0 END) AS sells,
+               SUM(CASE WHEN action='SELL' AND pnl > 0 THEN 1 ELSE 0 END) AS winners,
+               SUM(CASE WHEN action='SELL' AND pnl <= 0 THEN 1 ELSE 0 END) AS losers,
+               AVG(CASE WHEN action='SELL' AND pnl > 0 THEN pnl_pct END) AS avg_win_pct,
+               AVG(CASE WHEN action='SELL' AND pnl <= 0 THEN pnl_pct END) AS avg_loss_pct,
+               AVG(CASE WHEN action='SELL' THEN days_held END) AS avg_days_held
+           FROM trades WHERE source_type='experiment' AND source_id = ?""",
+        (exp_id,),
+    ).fetchone()
+    if not agg or (agg["total_events"] or 0) == 0:
+        conn.close()
+        return None
+
+    # Exit-reason histogram
+    reasons = conn.execute(
+        """SELECT reason, COUNT(*) AS n FROM trades
+           WHERE source_type='experiment' AND source_id=? AND action='SELL' AND reason IS NOT NULL
+           GROUP BY reason ORDER BY n DESC""",
+        (exp_id,),
+    ).fetchall()
+
+    # Top 3 winners and worst 3 losers by pnl_pct
+    winners_rows = conn.execute(
+        """SELECT symbol, pnl_pct, days_held FROM trades
+           WHERE source_type='experiment' AND source_id=? AND action='SELL' AND pnl > 0
+           ORDER BY pnl_pct DESC LIMIT 3""",
+        (exp_id,),
+    ).fetchall()
+    losers_rows = conn.execute(
+        """SELECT symbol, pnl_pct, days_held FROM trades
+           WHERE source_type='experiment' AND source_id=? AND action='SELL' AND pnl <= 0
+           ORDER BY pnl_pct ASC LIMIT 3""",
+        (exp_id,),
+    ).fetchall()
+    conn.close()
+
+    sells = agg["sells"] or 0
+    winners = agg["winners"] or 0
+    hit_rate = (winners / sells * 100) if sells else 0.0
+
+    return {
+        "sells": sells,
+        "winners": winners,
+        "losers": agg["losers"] or 0,
+        "hit_rate_pct": round(hit_rate, 1),
+        "avg_win_pct": round(agg["avg_win_pct"], 2) if agg["avg_win_pct"] is not None else None,
+        "avg_loss_pct": round(agg["avg_loss_pct"], 2) if agg["avg_loss_pct"] is not None else None,
+        "avg_days_held": round(agg["avg_days_held"], 1) if agg["avg_days_held"] is not None else None,
+        "exit_reasons": [(r["reason"], r["n"]) for r in reasons],
+        "top_winners": [(r["symbol"], r["pnl_pct"], r["days_held"]) for r in winners_rows],
+        "worst_losers": [(r["symbol"], r["pnl_pct"], r["days_held"]) for r in losers_rows],
+    }
+
+
 def build_history_context(run_id: str, target_metric: str, limit: int = 20) -> str:
     """Build full history of past experiments for the agent to learn from."""
     history = get_experiment_history(run_id, limit=limit)
@@ -180,6 +247,30 @@ def build_history_context(run_id: str, target_metric: str, limit: int = 20) -> s
                     lines.append(f"- {label} ({weight*100:.0f}%): universe={universe.get('type','?')} "
                                  f"sector={universe.get('sector','all')} "
                                  f"entry=[{', '.join(cond_types)}]")
+
+        # Compact trade summary pulled from persisted trades
+        try:
+            summary = _get_trade_summary(exp["id"])
+        except Exception:
+            summary = None
+        if summary and summary["sells"] > 0:
+            win_str = f"{summary['avg_win_pct']:+.1f}%" if summary["avg_win_pct"] is not None else "n/a"
+            loss_str = f"{summary['avg_loss_pct']:+.1f}%" if summary["avg_loss_pct"] is not None else "n/a"
+            days_str = f"{summary['avg_days_held']:.0f}d" if summary["avg_days_held"] is not None else "n/a"
+            lines.append(
+                f"**Trades:** {summary['sells']} closed "
+                f"({summary['winners']}W/{summary['losers']}L, hit={summary['hit_rate_pct']:.0f}%, "
+                f"avg_win={win_str}, avg_loss={loss_str}, avg_hold={days_str})"
+            )
+            if summary["exit_reasons"]:
+                reasons_str = ", ".join(f"{r}:{n}" for r, n in summary["exit_reasons"])
+                lines.append(f"**Exit reasons:** {reasons_str}")
+            if summary["top_winners"]:
+                top_str = ", ".join(f"{s} {p:+.1f}%/{d}d" for s, p, d in summary["top_winners"])
+                lines.append(f"**Top winners:** {top_str}")
+            if summary["worst_losers"]:
+                bot_str = ", ".join(f"{s} {p:+.1f}%/{d}d" for s, p, d in summary["worst_losers"])
+                lines.append(f"**Worst losers:** {bot_str}")
 
         lines.append("")
 
@@ -301,7 +392,16 @@ def save_portfolio(portfolio_config: dict) -> str | None:
 
 def run_backtest(portfolio_config: dict, start: str, end: str, capital: float,
                  sector: str | None = None) -> dict | None:
-    """Run a portfolio backtest. Returns metrics dict with both market and sector alpha."""
+    """Run a portfolio backtest.
+
+    Returns:
+        {"metrics": {...}, "sleeve_trades": [{"label": str, "trades": [...]}, ...]}
+        or None on failure.
+
+    sleeve_trades mirrors the engine's per-sleeve grouping — each sleeve's full
+    BUY+SELL event log in chronological order. Portfolio-level trades = union of
+    all sleeve lists.
+    """
     try:
         from portfolio_engine import run_portfolio_backtest
         from backtest_engine import compute_benchmark, SECTOR_ETF_MAP
@@ -341,7 +441,18 @@ def run_backtest(portfolio_config: dict, start: str, end: str, capital: float,
                     metrics["sector_benchmark_return_pct"] = sector_bench["metrics"]["total_return_pct"]
                     metrics["sector_benchmark_ann_return_pct"] = sector_bench["metrics"]["annualized_return_pct"]
 
-        return metrics
+        # Build per-sleeve trade groups with labels attached
+        sleeve_results = result.get("sleeve_results", [])
+        per_sleeve = result.get("per_sleeve", [])
+        sleeve_trades = [
+            {
+                "label": per_sleeve[i].get("label") if i < len(per_sleeve) else f"sleeve_{i}",
+                "trades": sr.get("trades", []),
+            }
+            for i, sr in enumerate(sleeve_results)
+        ]
+
+        return {"metrics": metrics, "sleeve_trades": sleeve_trades}
     except Exception as e:
         print(f"  Backtest failed: {e}")
         import traceback
@@ -520,7 +631,13 @@ Remember: query the data first, don't guess. Explore before you commit."""
     # Run backtest
     print(f"  Running backtest ({backtest_start} to {backtest_end})...")
     emit_event(run_id, "backtest_started", {"experiment_number": iteration})
-    metrics = run_backtest(portfolio_config, backtest_start, backtest_end, initial_capital, sector=sector)
+    bt_result = run_backtest(portfolio_config, backtest_start, backtest_end, initial_capital, sector=sector)
+
+    if bt_result is None:
+        metrics = None
+    else:
+        metrics = bt_result["metrics"]
+        sleeve_trades = bt_result["sleeve_trades"]
 
     if metrics is None:
         exp_id = log_experiment(
@@ -568,6 +685,20 @@ Remember: query the data first, don't guess. Explore before you commit."""
         session_id=session_id, duration_seconds=duration_total,
         portfolio_id=portfolio_id,
     )
+
+    # Persist trades per sleeve under source_type='experiment'.
+    # Failure here is enrichment loss only — the experiment row is already saved.
+    try:
+        from deploy_engine import persist_trades
+        total = 0
+        for sleeve in sleeve_trades:
+            if sleeve["trades"]:
+                total += persist_trades("experiment", exp_id, sleeve["trades"],
+                                        sleeve_label=sleeve["label"])
+        if total:
+            print(f"  💾 {total} trade(s) persisted for {exp_id}")
+    except Exception as e:
+        print(f"  ⚠ Trade persist failed for {exp_id}: {e}")
 
     print(f"  {target_metric}: {target_value:.4f}" if target_value else f"  {target_metric}: N/A")
     print(f"  Conditions met: {conditions_met}")
@@ -689,15 +820,17 @@ async def main():
             print(f"  Portfolio: {sp_name} ({len(sleeves)} sleeves)")
             print(f"  Running backtest ({args.start} to {args.end})...")
 
-            metrics = run_backtest(sp_config, args.start, args.end, args.capital)
+            bt_result = run_backtest(sp_config, args.start, args.end, args.capital)
 
-            if metrics:
+            if bt_result:
+                metrics = bt_result["metrics"]
+                sp_sleeve_trades = bt_result["sleeve_trades"]
                 target_value = metrics.get(args.metric)
                 conditions_met_flag, cond_detail = check_conditions(metrics, conditions)
 
                 decision = "keep" if conditions_met_flag and target_value is not None else "discard"
 
-                log_experiment(
+                exp_id = log_experiment(
                     run_id=run_id, iteration=0,
                     thesis=f"User-provided starting portfolio: {sp_name}",
                     assumptions=["Starting point for optimization"],
@@ -709,6 +842,16 @@ async def main():
                     backtest_start=args.start, backtest_end=args.end,
                     initial_capital=args.capital, model="none",
                 )
+
+                # Persist trades for the starting portfolio experiment
+                try:
+                    from deploy_engine import persist_trades
+                    for sleeve in sp_sleeve_trades:
+                        if sleeve["trades"]:
+                            persist_trades("experiment", exp_id, sleeve["trades"],
+                                           sleeve_label=sleeve["label"])
+                except Exception as e:
+                    print(f"  ⚠ Trade persist failed for {exp_id}: {e}")
 
                 if decision == "keep":
                     best_value = target_value
