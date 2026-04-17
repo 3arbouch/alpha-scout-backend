@@ -72,19 +72,20 @@ def _load_schemas() -> str:
 
 _custom_prompt = None
 
-def load_program() -> str:
-    """Build the full system prompt: system.md + agent prompt + schemas."""
-    # Fixed system instructions
+def load_program(agent_prompt: str | None = None) -> str:
+    """Build the full system prompt: system.md + agent prompt + schemas.
+
+    Resolution order for the agent prompt:
+    1. explicit `agent_prompt` arg (used by the API for per-agent preview)
+    2. module-level `_custom_prompt` (set via CLI --prompt-file)
+    3. fallback to program.md on disk
+    """
     system_path = Path(__file__).parent / "system.md"
     system_instructions = system_path.read_text()
 
-    # Agent prompt (custom or default)
-    if _custom_prompt:
-        agent_prompt = _custom_prompt
-    else:
-        agent_prompt = (Path(__file__).parent / "program.md").read_text()
+    if agent_prompt is None:
+        agent_prompt = _custom_prompt or (Path(__file__).parent / "program.md").read_text()
 
-    # Dynamic schemas
     schemas = _load_schemas()
 
     return system_instructions + "\n\n---\n\n" + agent_prompt + "\n\n---\n\n" + schemas

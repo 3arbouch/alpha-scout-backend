@@ -355,6 +355,24 @@ async def get_agent(agent_id: str):
     return agent
 
 
+@router.get("/agents/{agent_id}/system-prompt")
+async def get_agent_system_prompt(agent_id: str):
+    """Return the full assembled system prompt that this agent's runs see.
+
+    Mirrors what runner.load_program() builds: system.md + agent prompt + schemas.
+    Useful for UI transparency — shows the complete context the model receives.
+    """
+    agent = _get_agent(agent_id)
+    from auto_trader.runner import load_program
+    system_prompt = load_program(agent_prompt=agent["prompt"])
+    return {
+        "agent_id": agent_id,
+        "agent_name": agent["name"],
+        "system_prompt": system_prompt,
+        "length": len(system_prompt),
+    }
+
+
 @router.put("/agents/{agent_id}")
 async def update_agent(agent_id: str, body: UpdateAgentRequest):
     """Update an agent's name or prompt."""
