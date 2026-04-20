@@ -2054,6 +2054,16 @@ SECTOR_ETF_MAP = {
 }
 
 
+# Minimum trading-day sample required to annualize a return without
+# misleading the reader. 60d ≈ 3 calendar months — standard convention
+# below which Sharpe/Sortino/ann return have CIs on the order of the
+# point estimate itself. Below this we report only realized period metrics.
+MIN_TRADING_DAYS_FOR_ANNUALIZATION = 60
+
+# Minimum to compute *any* benchmark output (need ≥2 prices to compute a return).
+MIN_TRADING_DAYS_FOR_BENCHMARK = 2
+
+
 def compute_benchmark(trading_dates: list[str], initial_cash: float,
                       conn=None, sector: str = None) -> dict:
     """
@@ -2062,8 +2072,12 @@ def compute_benchmark(trading_dates: list[str], initial_cash: float,
     If sector is provided, uses the sector ETF (e.g. XLK for Technology).
     Falls back to SPY / S&P 500 index for multi-sector or unknown sectors.
 
-    Returns:
-        {symbol, nav_history: [{date, nav, daily_pnl_pct}], metrics: {...}}
+    Returns a dict with always-honest realized period metrics. Annualized
+    metrics are only included when the sample is statistically meaningful
+    (>= MIN_TRADING_DAYS_FOR_ANNUALIZATION); otherwise they are explicitly
+    set to None so the UI can render "—" rather than a fabricated number.
+
+    Returns None only when there isn't enough data to compute a return at all.
     """
     price_dict = {}
     bench_symbol = None
@@ -2080,7 +2094,7 @@ def compute_benchmark(trading_dates: list[str], initial_cash: float,
         conn = get_connection()
     for sym in candidates:
         prices = get_prices(sym, start=trading_dates[0], end=trading_dates[-1], conn=conn)
-        if prices and len(prices) > 10:
+        if prices and len(prices) >= MIN_TRADING_DAYS_FOR_BENCHMARK:
             bench_symbol = sym
             price_dict = {d: c for d, c in prices}
             break
@@ -2102,13 +2116,13 @@ def compute_benchmark(trading_dates: list[str], initial_cash: float,
                             c = r.get("close")
                             if d and c and trading_dates[0] <= d <= trading_dates[-1]:
                                 price_dict[d] = c
-                        if len(price_dict) > 10:
+                        if len(price_dict) >= MIN_TRADING_DAYS_FOR_BENCHMARK:
                             bench_symbol = label
                             break
                 except (json.JSONDecodeError, KeyError):
                     continue
 
-    if not bench_symbol or len(price_dict) < 10:
+    if not bench_symbol or len(price_dict) < MIN_TRADING_DAYS_FOR_BENCHMARK:
         return None
 
     # Buy-and-hold: invest initial_cash on day 1
@@ -2134,17 +2148,16 @@ def compute_benchmark(trading_dates: list[str], initial_cash: float,
         })
         prev_nav = nav
 
-    if not nav_history:
+    if len(nav_history) < MIN_TRADING_DAYS_FOR_BENCHMARK:
         return None
 
+    # ---- Realized period metrics (always honest, regardless of sample size) ----
     final_nav = nav_history[-1]["nav"]
     total_return = ((final_nav - initial_cash) / initial_cash) * 100
-    calendar_days = (datetime.strptime(trading_dates[-1], "%Y-%m-%d") -
-                     datetime.strptime(trading_dates[0], "%Y-%m-%d")).days
-    years = max(calendar_days / 365.25, 0.01)
-    ann_return = ((final_nav / initial_cash) ** (1 / years) - 1) * 100 if years > 0 else 0
 
-    # Max drawdown
+    # Max drawdown is a realized observation (worst peak-to-trough that
+    # actually occurred in the window), not a statistical estimate, so it's
+    # safe to report at any sample size — just label the window in the UI.
     peak = 0
     max_dd = 0
     for point in nav_history:
@@ -2154,14 +2167,37 @@ def compute_benchmark(trading_dates: list[str], initial_cash: float,
         if dd < max_dd:
             max_dd = dd
 
+    n = len(nav_history)
+
+    # ---- Statistical / projection metrics (gated by sample size) ----
+    # Annualized return is a projection: it scales the period return up to a
+    # full year. On short windows a single noisy day swings it wildly. Hide
+    # it (return None) until the sample is large enough that the projection
+    # is at least directionally meaningful.
+    if n >= MIN_TRADING_DAYS_FOR_ANNUALIZATION:
+        # Annualize using *trading* days, not calendar days, to stay
+        # consistent with how Sharpe et al. are conventionally annualized
+        # (sqrt(252)). Calendar-day annualization mixes incompatible units
+        # with the Sharpe denominator.
+        years = n / 252.0
+        ann_return = ((final_nav / initial_cash) ** (1 / years) - 1) * 100
+        ann_return_out = round(ann_return, 2)
+    else:
+        ann_return_out = None
+
     return {
         "symbol": bench_symbol,
         "nav_history": nav_history,
+        "trading_days": n,
+        "min_days_for_annualization": MIN_TRADING_DAYS_FOR_ANNUALIZATION,
+        "partial": n < MIN_TRADING_DAYS_FOR_ANNUALIZATION,
         "metrics": {
+            # Realized period metrics — always populated when benchmark exists.
             "total_return_pct": round(total_return, 2),
-            "annualized_return_pct": round(ann_return, 2),
             "max_drawdown_pct": round(max_dd, 2),
             "final_nav": round(final_nav, 2),
+            # Statistical metrics — None when sample is too short to be honest.
+            "annualized_return_pct": ann_return_out,
         },
     }
 

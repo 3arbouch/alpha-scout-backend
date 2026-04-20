@@ -1001,20 +1001,41 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
     bench_sector = _infer_portfolio_sector(sleeves)
     from backtest_engine import SECTOR_ETF_MAP
 
-    ann_return = portfolio_metrics.get("annualized_return_pct", 0)
+    ann_return = portfolio_metrics.get("annualized_return_pct")
+    portfolio_total_return = portfolio_metrics.get("total_return_pct")
+
+    def _populate_benchmark_fields(bench: dict | None, prefix: str):
+        """Copy realized period metrics always; annualized alpha only when both
+        portfolio and benchmark have a meaningful annualized return."""
+        if not bench:
+            return
+        bm = bench["metrics"]
+        bench_total = bm.get("total_return_pct")
+        bench_ann = bm.get("annualized_return_pct")
+
+        # Realized period metrics — always set when benchmark exists.
+        portfolio_metrics[f"{prefix}_benchmark_return_pct"] = bench_total
+        if portfolio_total_return is not None and bench_total is not None:
+            portfolio_metrics[f"period_excess_vs_{prefix}_pct"] = round(
+                portfolio_total_return - bench_total, 2)
+
+        # Annualized stats — only when both sides cleared the sample-size gate.
+        if bench_ann is not None and ann_return is not None:
+            portfolio_metrics[f"alpha_vs_{prefix}_pct"] = round(ann_return - bench_ann, 2)
+            portfolio_metrics[f"{prefix}_benchmark_ann_return_pct"] = bench_ann
+        else:
+            portfolio_metrics[f"alpha_vs_{prefix}_pct"] = None
+            portfolio_metrics[f"{prefix}_benchmark_ann_return_pct"] = None
 
     # Market benchmark (SPY) — always compute
     print(f"\nComputing benchmark (S&P 500)...")
     market_benchmark = compute_benchmark(all_dates, initial_capital, sector=None)
+    _populate_benchmark_fields(market_benchmark, "market")
     if market_benchmark:
-        market_ann = market_benchmark["metrics"]["annualized_return_pct"]
-        portfolio_metrics["alpha_vs_market_pct"] = round(ann_return - market_ann, 2)
-        portfolio_metrics["market_benchmark_return_pct"] = market_benchmark["metrics"]["total_return_pct"]
-        portfolio_metrics["market_benchmark_ann_return_pct"] = market_benchmark["metrics"]["annualized_return_pct"]
-        # Keep backward compat fields
-        portfolio_metrics["benchmark_return_pct"] = market_benchmark["metrics"]["total_return_pct"]
-        portfolio_metrics["benchmark_ann_return_pct"] = market_benchmark["metrics"]["annualized_return_pct"]
-        portfolio_metrics["alpha_ann_pct"] = portfolio_metrics["alpha_vs_market_pct"]
+        # Backward-compat aliases for older readers (experiments table, UIs).
+        portfolio_metrics["benchmark_return_pct"] = market_benchmark["metrics"].get("total_return_pct")
+        portfolio_metrics["benchmark_ann_return_pct"] = market_benchmark["metrics"].get("annualized_return_pct")
+        portfolio_metrics["alpha_ann_pct"] = portfolio_metrics.get("alpha_vs_market_pct")
 
     # Sector benchmark — compute if single-sector portfolio
     benchmark = market_benchmark
@@ -1022,11 +1043,8 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
     if bench_sector and bench_sector in SECTOR_ETF_MAP:
         print(f"Computing benchmark ({SECTOR_ETF_MAP[bench_sector]})...")
         sector_benchmark = compute_benchmark(all_dates, initial_capital, sector=bench_sector)
+        _populate_benchmark_fields(sector_benchmark, "sector")
         if sector_benchmark:
-            sector_ann = sector_benchmark["metrics"]["annualized_return_pct"]
-            portfolio_metrics["alpha_vs_sector_pct"] = round(ann_return - sector_ann, 2)
-            portfolio_metrics["sector_benchmark_return_pct"] = sector_benchmark["metrics"]["total_return_pct"]
-            portfolio_metrics["sector_benchmark_ann_return_pct"] = sector_benchmark["metrics"]["annualized_return_pct"]
             benchmark = sector_benchmark
 
     # -----------------------------------------------------------------------
@@ -1035,16 +1053,26 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
     print(f"\n{'=' * 70}")
     print(f"PORTFOLIO RESULTS: {name}")
     print(f"{'=' * 70}")
-    print(f"  Total Return:     {portfolio_metrics.get('total_return_pct', 0):+.2f}%")
-    print(f"  Annualized:       {portfolio_metrics.get('annualized_return_pct', 0):+.2f}%")
-    print(f"  Max Drawdown:     {portfolio_metrics.get('max_drawdown_pct', 0):.2f}%")
-    print(f"  Sharpe Ratio:     {portfolio_metrics.get('sharpe_ratio', 0):.2f}")
+    def _fmt(v, spec="+.2f", suffix="%"):
+        return "—" if v is None else f"{v:{spec}}{suffix}"
+
+    print(f"  Total Return:     {_fmt(portfolio_metrics.get('total_return_pct'))}")
+    print(f"  Annualized:       {_fmt(portfolio_metrics.get('annualized_return_pct'))}")
+    print(f"  Max Drawdown:     {_fmt(portfolio_metrics.get('max_drawdown_pct'), '.2f')}")
+    print(f"  Sharpe Ratio:     {_fmt(portfolio_metrics.get('sharpe_ratio'), '.2f', '')}")
     if market_benchmark:
-        print(f"  Benchmark (SPY):  {portfolio_metrics.get('market_benchmark_return_pct', 0):+.2f}%")
-        print(f"  Alpha vs Market:  {portfolio_metrics.get('alpha_vs_market_pct', 0):+.2f}%")
-    if portfolio_metrics.get("alpha_vs_sector_pct") is not None:
-        print(f"  Benchmark ({SECTOR_ETF_MAP.get(bench_sector, '?')}):  {portfolio_metrics.get('sector_benchmark_return_pct', 0):+.2f}%")
-        print(f"  Alpha vs Sector:  {portfolio_metrics.get('alpha_vs_sector_pct', 0):+.2f}%")
+        print(f"  Benchmark (SPY):  {_fmt(portfolio_metrics.get('market_benchmark_return_pct'))}")
+        if portfolio_metrics.get("period_excess_vs_market_pct") is not None:
+            print(f"  Excess vs Market: {_fmt(portfolio_metrics.get('period_excess_vs_market_pct'))} (period)")
+        if portfolio_metrics.get("alpha_vs_market_pct") is not None:
+            print(f"  Alpha vs Market:  {_fmt(portfolio_metrics.get('alpha_vs_market_pct'))} (annualized)")
+    if sector_benchmark:
+        print(f"  Benchmark ({SECTOR_ETF_MAP.get(bench_sector, '?')}):  "
+              f"{_fmt(portfolio_metrics.get('sector_benchmark_return_pct'))}")
+        if portfolio_metrics.get("period_excess_vs_sector_pct") is not None:
+            print(f"  Excess vs Sector: {_fmt(portfolio_metrics.get('period_excess_vs_sector_pct'))} (period)")
+        if portfolio_metrics.get("alpha_vs_sector_pct") is not None:
+            print(f"  Alpha vs Sector:  {_fmt(portfolio_metrics.get('alpha_vs_sector_pct'))} (annualized)")
 
     print(f"\n  Per-Sleeve Breakdown:")
     for s in per_sleeve_summary:
