@@ -394,7 +394,8 @@ async def get_experiment_trades_tool(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def create_auto_trader_tools(stop_date: str | None = None, sector: str | None = None,
-                             start_date: str | None = None, run_id: str | None = None):
+                             start_date: str | None = None, run_id: str | None = None,
+                             allowed_tool_names: list[str] | None = None):
     """Create the MCP server with auto-trader tools.
 
     Args:
@@ -402,6 +403,9 @@ def create_auto_trader_tools(stop_date: str | None = None, sector: str | None = 
         sector: If set, silently filters stock data to only this sector.
         start_date: If set, used as the start date for signal evaluation/ranking.
         run_id: If set, scopes get_experiment_trades to this run's experiments only.
+        allowed_tool_names: If set, only these tool names are registered on the
+            server — the model's tool catalog for this run cannot include any
+            forbidden tools. If None, all tools are registered (CLI convenience).
     """
     global _STOP_DATE, _SECTOR, _START_DATE, _RUN_ID
     _STOP_DATE = stop_date
@@ -409,10 +413,16 @@ def create_auto_trader_tools(stop_date: str | None = None, sector: str | None = 
     _SECTOR = sector
     _RUN_ID = run_id
 
+    if allowed_tool_names is None:
+        tools = ALL_TOOLS
+    else:
+        allow = set(allowed_tool_names)
+        tools = [t for t in ALL_TOOLS if t.name in allow]
+
     return create_sdk_mcp_server(
         name=MCP_SERVER_NAME,
         version="1.0.0",
-        tools=ALL_TOOLS,
+        tools=tools,
     )
 
 

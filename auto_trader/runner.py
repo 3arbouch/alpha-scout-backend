@@ -567,7 +567,11 @@ Remember: query the data first, don't guess. Explore before you commit."""
     session_id = None
     auto_trader_tools = create_auto_trader_tools(
         stop_date=backtest_end, sector=sector, start_date=backtest_start,
-        run_id=run_id)
+        run_id=run_id,
+        # Enforce the agent's allowlist at the MCP server boundary so forbidden
+        # tools don't appear in the model's tool catalog at all.
+        allowed_tool_names=_allowed_tools,
+    )
     # Resolve short id (e.g. "opus-4-7") to the full API id so the SDK
     # dispatches to the exact model regardless of its slug aliasing.
     resolved_model = _resolve_model_api_id(model)
