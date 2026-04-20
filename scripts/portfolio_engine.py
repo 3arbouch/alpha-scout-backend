@@ -951,7 +951,7 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
             "avg_utilized_capital": round(avg_utilized_capital, 2),
             "return_on_utilized_capital_pct": return_on_utilized_capital_pct,
             "trading_days": len(all_dates),
-            "years": round(years, 2),
+            "years": round(n_nav / 252.0, 2),
         }
     else:
         portfolio_metrics = {}
