@@ -618,6 +618,16 @@ Remember: query the data first, don't guess. Explore before you commit."""
                                 "experiment_number": iteration,
                                 "text": text[:300],
                             })
+                    elif block_type == "ThinkingBlock":
+                        # Extended-thinking content (Opus 4.6 explicit budget /
+                        # Opus 4.7 adaptive). Surface it so the live activity
+                        # reflects actual reasoning, not just narrative text.
+                        text = (getattr(block, "thinking", "") or "").strip()
+                        if text and len(text) > 10:
+                            emit_event(run_id, "agent_thinking", {
+                                "experiment_number": iteration,
+                                "text": text[:300],
+                            })
                     elif "ToolUse" in block_type:
                         tool_calls += 1
                         tool_name = getattr(block, "name", "?")
