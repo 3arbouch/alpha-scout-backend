@@ -197,11 +197,21 @@ _ensure_tables()
 class CreateAgentRequest(BaseModel):
     name: str = Field(description="Agent name, e.g. 'Energy Specialist', 'Conservative Alpha'")
     prompt: str | None = Field(default=None, description="Agent prompt. If omitted, uses the default prompt.")
+    allowed_tools: list[str] | None = Field(
+        default=None,
+        description="Subset of MCP tool names the agent may call. "
+                    "null (or omitted) = all current tools; [] = no MCP tools.",
+    )
 
 
 class UpdateAgentRequest(BaseModel):
     name: str | None = Field(default=None, description="Update agent name")
     prompt: str | None = Field(default=None, description="Update agent prompt")
+    allowed_tools: list[str] | None = Field(
+        default=None,
+        description="Replace the agent's tool allowlist. Omit to leave unchanged. "
+                    "null = all current tools; [] = no MCP tools.",
+    )
 
 
 class CreateRunRequest(BaseModel):
@@ -229,7 +239,24 @@ def _get_agent(agent_id: str) -> dict:
     conn.close()
     if not row:
         raise HTTPException(404, f"Agent '{agent_id}' not found")
-    return dict(row)
+    d = dict(row)
+    d["allowed_tools"] = json.loads(d["allowed_tools"]) if d.get("allowed_tools") else None
+    return d
+
+
+def _validate_allowed_tools(names: list[str] | None) -> str | None:
+    """Validate tool names against the current catalog and return the JSON-serialized
+    value to store (None -> NULL, [] -> '[]', ['x',...] -> '["x",...]')."""
+    if names is None:
+        return None
+    from auto_trader.tools import TOOL_NAMES
+    unknown = [n for n in names if n not in TOOL_NAMES]
+    if unknown:
+        raise HTTPException(400, f"Unknown tool name(s): {unknown}. Valid: {sorted(TOOL_NAMES)}")
+    # De-dup while preserving order
+    seen: set[str] = set()
+    deduped = [n for n in names if not (n in seen or seen.add(n))]
+    return json.dumps(deduped)
 
 
 def _get_run(run_id: str) -> dict:
@@ -259,6 +286,17 @@ def _stop_file(run_id: str) -> Path:
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
+
+@router.get("/tools")
+async def list_tools():
+    """Return the catalog of MCP tools available for per-agent configuration.
+
+    Built-in primitives (Skill, Read) are always on and intentionally excluded.
+    """
+    from auto_trader.tools import list_available_tools
+    tools = list_available_tools()
+    return {"total": len(tools), "data": tools}
+
 
 @router.get("/config")
 async def get_config():
@@ -309,30 +347,37 @@ async def create_agent(body: CreateAgentRequest):
     agent_id = _generate_run_id(body.name)  # reuse the slug+hash generator
     now = datetime.now(timezone.utc).isoformat()
     prompt = body.prompt or DEFAULT_PROMPT
+    allowed_tools_json = _validate_allowed_tools(body.allowed_tools)
 
     conn = get_db()
     conn.execute(
-        "INSERT INTO auto_trader_agents (id, name, prompt, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-        (agent_id, body.name, prompt, now, now),
+        "INSERT INTO auto_trader_agents (id, name, prompt, allowed_tools, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (agent_id, body.name, prompt, allowed_tools_json, now, now),
     )
     conn.commit()
     conn.close()
 
-    return {"id": agent_id, "name": body.name, "prompt_length": len(prompt)}
+    return {
+        "id": agent_id,
+        "name": body.name,
+        "prompt_length": len(prompt),
+        "allowed_tools": body.allowed_tools,
+    }
 
 
 @router.get("/agents")
 async def list_agents():
     """List all auto-trader agents."""
     conn = get_db()
-    rows = conn.execute("SELECT id, name, created_at, updated_at FROM auto_trader_agents ORDER BY created_at").fetchall()
-    conn.close()
+    rows = conn.execute(
+        "SELECT id, name, allowed_tools, created_at, updated_at FROM auto_trader_agents ORDER BY created_at"
+    ).fetchall()
 
-    # Count runs per agent
     results = []
-    conn = get_db()
     for r in rows:
         d = dict(r)
+        d["allowed_tools"] = json.loads(d["allowed_tools"]) if d.get("allowed_tools") else None
         d["run_count"] = conn.execute(
             "SELECT COUNT(*) FROM auto_trader_runs WHERE agent_id = ?", (r["id"],)
         ).fetchone()[0]
@@ -376,10 +421,18 @@ async def get_agent_system_prompt(agent_id: str):
 
 @router.put("/agents/{agent_id}")
 async def update_agent(agent_id: str, body: UpdateAgentRequest):
-    """Update an agent's name or prompt."""
+    """Update an agent's name, prompt, or tool allowlist.
+
+    `allowed_tools` semantics:
+      - field omitted from request: no change
+      - explicit null: reset to "all current tools"
+      - []: disable all MCP tools
+      - list of names: explicit subset (validated against catalog)
+    """
     _get_agent(agent_id)  # verify exists
 
     now = datetime.now(timezone.utc).isoformat()
+    fields_set = body.model_fields_set
     conn = get_db()
     if body.name is not None:
         conn.execute("UPDATE auto_trader_agents SET name = ?, updated_at = ? WHERE id = ?",
@@ -387,6 +440,10 @@ async def update_agent(agent_id: str, body: UpdateAgentRequest):
     if body.prompt is not None:
         conn.execute("UPDATE auto_trader_agents SET prompt = ?, updated_at = ? WHERE id = ?",
                      (body.prompt, now, agent_id))
+    if "allowed_tools" in fields_set:
+        stored = _validate_allowed_tools(body.allowed_tools)
+        conn.execute("UPDATE auto_trader_agents SET allowed_tools = ?, updated_at = ? WHERE id = ?",
+                     (stored, now, agent_id))
     conn.commit()
     conn.close()
 
@@ -568,6 +625,10 @@ async def start_run(run_id: str, body: StartRunRequest = StartRunRequest()):
     ]
     for cond in config.get("conditions", []):
         cmd.extend(["--condition", cond])
+
+    # Forward the agent's MCP tool allowlist (None = all current tools).
+    if agent.get("allowed_tools") is not None:
+        cmd.extend(["--allowed-tools", json.dumps(agent["allowed_tools"])])
 
     if config.get("sector"):
         cmd.extend(["--sector", config["sector"]])

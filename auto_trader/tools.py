@@ -20,7 +20,9 @@ from typing import Any
 # Add scripts to path for engine imports
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
-from claude_agent_sdk import tool, create_sdk_mcp_server
+from claude_agent_sdk import SdkMcpTool, tool, create_sdk_mcp_server
+
+MCP_SERVER_NAME = "auto_trader"
 
 MARKET_DB_PATH = Path(os.environ.get("MARKET_DB_PATH",
     str(Path(__file__).parent.parent / "data" / "market.db")))
@@ -408,9 +410,23 @@ def create_auto_trader_tools(stop_date: str | None = None, sector: str | None = 
     _RUN_ID = run_id
 
     return create_sdk_mcp_server(
-        name="auto_trader",
+        name=MCP_SERVER_NAME,
         version="1.0.0",
-        tools=[query_market_data_tool, validate_portfolio_tool,
-               evaluate_signal_tool, rank_signals_tool,
-               get_experiment_trades_tool],
+        tools=ALL_TOOLS,
     )
+
+
+ALL_TOOLS: list[SdkMcpTool] = [
+    v for v in list(globals().values()) if isinstance(v, SdkMcpTool)
+]
+TOOL_NAMES: set[str] = {t.name for t in ALL_TOOLS}
+
+
+def list_available_tools() -> list[dict]:
+    """Return the catalog of user-configurable MCP tools as [{name, description}]."""
+    return [{"name": t.name, "description": t.description} for t in ALL_TOOLS]
+
+
+def mcp_tool_id(name: str) -> str:
+    """Prefix a tool name with the MCP server namespace the SDK expects."""
+    return f"mcp__{MCP_SERVER_NAME}__{name}"

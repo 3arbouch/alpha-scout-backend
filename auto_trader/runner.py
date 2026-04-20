@@ -71,6 +71,28 @@ def _load_schemas() -> str:
 
 
 _custom_prompt = None
+# None = use all current MCP tools; list = explicit allowlist (possibly empty).
+_allowed_tools: list[str] | None = None
+
+
+def _resolve_allowed_mcp_tools() -> list[str]:
+    """Map the per-agent allowlist to the names the SDK expects, dropping unknowns.
+
+    None  -> all current tool names.
+    []    -> no MCP tools.
+    list  -> explicit subset; unknown names are skipped with a warning.
+    """
+    from auto_trader.tools import ALL_TOOLS, TOOL_NAMES, mcp_tool_id
+    if _allowed_tools is None:
+        names = [t.name for t in ALL_TOOLS]
+    else:
+        names = []
+        for n in _allowed_tools:
+            if n in TOOL_NAMES:
+                names.append(n)
+            else:
+                print(f"  [warn] agent allowlist references unknown tool '{n}' — skipping")
+    return [mcp_tool_id(n) for n in names]
 
 
 def _resolve_model_api_id(model_id: str) -> str:
@@ -93,6 +115,9 @@ def _resolve_model_api_id(model_id: str) -> str:
 
 def load_program(agent_prompt: str | None = None) -> str:
     """Build the full system prompt: system.md + agent prompt + schemas.
+
+    Tool definitions are NOT injected here — the SDK transmits them automatically
+    via the API tools channel (filtered by ClaudeAgentOptions.allowed_tools).
 
     Resolution order for the agent prompt:
     1. explicit `agent_prompt` arg (used by the API for per-agent preview)
@@ -550,14 +575,7 @@ Remember: query the data first, don't guess. Explore before you commit."""
         cwd=str(PROJECT_ROOT / "auto_trader"),
         model=resolved_model,
         setting_sources=["project"],
-        allowed_tools=[
-            "Skill", "Read",
-            "mcp__auto_trader__query_market_data",
-            "mcp__auto_trader__validate_portfolio",
-            "mcp__auto_trader__evaluate_signal",
-            "mcp__auto_trader__rank_signals",
-            "mcp__auto_trader__get_experiment_trades",
-        ],
+        allowed_tools=["Skill", "Read"] + _resolve_allowed_mcp_tools(),
         mcp_servers={"auto_trader": auto_trader_tools},
         permission_mode="acceptEdits",
         max_turns=50,
@@ -791,6 +809,9 @@ async def main():
     parser.add_argument("--model", type=str, default="sonnet", help="Claude model (sonnet, opus, haiku)")
     parser.add_argument("--history", type=int, default=10, help="Past experiments to show agent")
     parser.add_argument("--prompt-file", type=str, default=None, help="Path to prompt file (from API)")
+    parser.add_argument("--allowed-tools", type=str, default=None,
+                        help="JSON array of MCP tool names this agent may call. "
+                             "Omit (or pass empty) for 'all current tools'. '[]' disables all MCP tools.")
     parser.add_argument("--starting-portfolio", type=str, default=None, help="Path to starting portfolio config JSON")
     parser.add_argument("--sector", type=str, default=None, help="Restrict data queries to this sector")
     parser.add_argument("--alpha-benchmark", type=str, default="market", help="Benchmark: sector or market")
@@ -808,6 +829,19 @@ async def main():
     if args.prompt_file and Path(args.prompt_file).exists():
         global _custom_prompt
         _custom_prompt = Path(args.prompt_file).read_text()
+
+    # Per-agent MCP tool allowlist. None = all current tools.
+    if args.allowed_tools:
+        global _allowed_tools
+        try:
+            parsed = json.loads(args.allowed_tools)
+        except json.JSONDecodeError as e:
+            print(f"Invalid --allowed-tools JSON: {e}")
+            return
+        if not isinstance(parsed, list) or not all(isinstance(n, str) for n in parsed):
+            print(f"--allowed-tools must be a JSON array of strings; got {parsed!r}")
+            return
+        _allowed_tools = parsed
 
     # Stop flag path
     stop_flag = PROJECT_ROOT / "auto_trader" / f".stop_{run_id}"

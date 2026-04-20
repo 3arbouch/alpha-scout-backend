@@ -415,6 +415,7 @@ CREATE TABLE IF NOT EXISTS auto_trader_agents (
     id              TEXT PRIMARY KEY,
     name            TEXT NOT NULL,
     prompt          TEXT NOT NULL,
+    allowed_tools   TEXT,
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
@@ -628,6 +629,8 @@ def _apply_migrations(conn: sqlite3.Connection):
         _add_column_if_missing(conn, "experiments", "portfolio_id", "TEXT")
     if "deployments" in existing_tables:
         _add_column_if_missing(conn, "deployments", "portfolio_id", "TEXT")
+    if "auto_trader_agents" in existing_tables:
+        _add_column_if_missing(conn, "auto_trader_agents", "allowed_tools", "TEXT")
 
 
 def init_db(conn: sqlite3.Connection):
