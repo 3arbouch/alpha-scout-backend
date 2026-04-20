@@ -200,7 +200,7 @@ class CreateAgentRequest(BaseModel):
     allowed_tools: list[str] | None = Field(
         default=None,
         description="Subset of MCP tool names the agent may call. "
-                    "null (or omitted) = all current tools; [] = no MCP tools.",
+                    "Omit to default to the full current catalog; [] = no MCP tools.",
     )
 
 
@@ -210,7 +210,7 @@ class UpdateAgentRequest(BaseModel):
     allowed_tools: list[str] | None = Field(
         default=None,
         description="Replace the agent's tool allowlist. Omit to leave unchanged. "
-                    "null = all current tools; [] = no MCP tools.",
+                    "Must be a list (possibly empty); null is rejected.",
     )
 
 
@@ -240,15 +240,19 @@ def _get_agent(agent_id: str) -> dict:
     if not row:
         raise HTTPException(404, f"Agent '{agent_id}' not found")
     d = dict(row)
-    d["allowed_tools"] = json.loads(d["allowed_tools"]) if d.get("allowed_tools") else None
+    # allowed_tools is always a list. Legacy NULL rows have been backfilled.
+    d["allowed_tools"] = json.loads(d["allowed_tools"]) if d.get("allowed_tools") else []
     return d
 
 
-def _validate_allowed_tools(names: list[str] | None) -> str | None:
+def _validate_allowed_tools(names: list[str]) -> str:
     """Validate tool names against the current catalog and return the JSON-serialized
-    value to store (None -> NULL, [] -> '[]', ['x',...] -> '["x",...]')."""
+    list to store. Rejects None — every agent must have an explicit (possibly empty) list
+    so capability changes are always tied to an explicit human action."""
     if names is None:
-        return None
+        raise HTTPException(400,
+            "allowed_tools must be a list (possibly empty), not null. "
+            "Use [] to disable all MCP tools.")
     from auto_trader.tools import TOOL_NAMES
     unknown = [n for n in names if n not in TOOL_NAMES]
     if unknown:
@@ -343,11 +347,19 @@ async def get_config():
 
 @router.post("/agents", status_code=201)
 async def create_agent(body: CreateAgentRequest):
-    """Create a new auto-trader agent with a custom prompt."""
+    """Create a new auto-trader agent with a custom prompt.
+
+    `allowed_tools` defaults to the full current catalog when omitted, so a brand-new
+    agent is functional with no extra config. Pass [] to start with no MCP tools.
+    """
+    from auto_trader.tools import ALL_TOOLS
+
     agent_id = _generate_run_id(body.name)  # reuse the slug+hash generator
     now = datetime.now(timezone.utc).isoformat()
     prompt = body.prompt or DEFAULT_PROMPT
-    allowed_tools_json = _validate_allowed_tools(body.allowed_tools)
+
+    tools = body.allowed_tools if body.allowed_tools is not None else [t.name for t in ALL_TOOLS]
+    allowed_tools_json = _validate_allowed_tools(tools)
 
     conn = get_db()
     conn.execute(
@@ -362,7 +374,7 @@ async def create_agent(body: CreateAgentRequest):
         "id": agent_id,
         "name": body.name,
         "prompt_length": len(prompt),
-        "allowed_tools": body.allowed_tools,
+        "allowed_tools": tools,
     }
 
 
@@ -377,7 +389,7 @@ async def list_agents():
     results = []
     for r in rows:
         d = dict(r)
-        d["allowed_tools"] = json.loads(d["allowed_tools"]) if d.get("allowed_tools") else None
+        d["allowed_tools"] = json.loads(d["allowed_tools"]) if d.get("allowed_tools") else []
         d["run_count"] = conn.execute(
             "SELECT COUNT(*) FROM auto_trader_runs WHERE agent_id = ?", (r["id"],)
         ).fetchone()[0]
@@ -425,9 +437,9 @@ async def update_agent(agent_id: str, body: UpdateAgentRequest):
 
     `allowed_tools` semantics:
       - field omitted from request: no change
-      - explicit null: reset to "all current tools"
       - []: disable all MCP tools
       - list of names: explicit subset (validated against catalog)
+      - null: rejected (400) — capability changes must be explicit
     """
     _get_agent(agent_id)  # verify exists
 
@@ -626,9 +638,8 @@ async def start_run(run_id: str, body: StartRunRequest = StartRunRequest()):
     for cond in config.get("conditions", []):
         cmd.extend(["--condition", cond])
 
-    # Forward the agent's MCP tool allowlist (None = all current tools).
-    if agent.get("allowed_tools") is not None:
-        cmd.extend(["--allowed-tools", json.dumps(agent["allowed_tools"])])
+    # Forward the agent's explicit MCP tool allowlist (always a list post-backfill).
+    cmd.extend(["--allowed-tools", json.dumps(agent.get("allowed_tools", []))])
 
     if config.get("sector"):
         cmd.extend(["--sector", config["sector"]])

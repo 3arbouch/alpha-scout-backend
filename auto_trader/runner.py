@@ -71,16 +71,18 @@ def _load_schemas() -> str:
 
 
 _custom_prompt = None
-# None = use all current MCP tools; list = explicit allowlist (possibly empty).
+# Explicit allowlist for this run. None means the API/CLI didn't supply one,
+# in which case we fall back to the full current catalog (CLI convenience).
 _allowed_tools: list[str] | None = None
 
 
 def _resolve_allowed_mcp_tools() -> list[str]:
-    """Map the per-agent allowlist to the names the SDK expects, dropping unknowns.
+    """Map the per-agent allowlist to the SDK tool ids, dropping any unknowns.
 
-    None  -> all current tool names.
-    []    -> no MCP tools.
-    list  -> explicit subset; unknown names are skipped with a warning.
+    None  -> no allowlist supplied; fall back to the full current catalog.
+             (API runs always supply one; this only triggers for ad-hoc CLI use.)
+    list  -> explicit subset; unknown names are skipped with a warning so a
+             tool that's been deleted from the codebase doesn't crash a backtest.
     """
     from auto_trader.tools import ALL_TOOLS, TOOL_NAMES, mcp_tool_id
     if _allowed_tools is None:
