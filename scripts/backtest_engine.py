@@ -755,12 +755,14 @@ def _precompute_fundamental_condition(condition_config: dict, symbols: list[str]
                     symbol,
                     threshold=condition_config.get("threshold", 50.0),
                     start=start, end=end,
+                    conn=conn,
                 )
             elif ctype == "revenue_accelerating":
                 raw = find_revenue_acceleration(
                     symbol,
                     min_quarters=condition_config.get("min_quarters", 2),
                     start=start, end=end,
+                    conn=conn,
                 )
             elif ctype == "margin_expanding":
                 raw = find_margin_expansion(
@@ -768,6 +770,7 @@ def _precompute_fundamental_condition(condition_config: dict, symbols: list[str]
                     metric=condition_config.get("metric", "net_margin"),
                     min_quarters=condition_config.get("min_quarters", 2),
                     start=start, end=end,
+                    conn=conn,
                 )
             elif ctype == "margin_turnaround":
                 raw = find_margin_turnaround(
@@ -776,6 +779,7 @@ def _precompute_fundamental_condition(condition_config: dict, symbols: list[str]
                     threshold_bps=condition_config.get("threshold_bps", 1000.0),
                     min_quarters=condition_config.get("min_quarters", 2),
                     start=start, end=end,
+                    conn=conn,
                 )
             elif ctype == "relative_performance":
                 raw = find_relative_outperformance(
@@ -955,6 +959,7 @@ def _precompute_exit_signals(config: dict, symbols: list[str], conn) -> dict:
                         require_margin_compression=cond.get("require_margin_compression", True),
                         margin_metric=cond.get("metric", "net_margin"),
                         start=bt_start, end=bt_end,
+                        conn=conn,
                     )
                 elif ctype == "margin_collapse":
                     raw = find_margin_collapse(
@@ -963,6 +968,7 @@ def _precompute_exit_signals(config: dict, symbols: list[str], conn) -> dict:
                         threshold_bps=cond.get("threshold_bps", -500),
                         min_quarters=cond.get("min_quarters", 2),
                         start=bt_start, end=bt_end,
+                        conn=conn,
                     )
                 else:
                     continue
