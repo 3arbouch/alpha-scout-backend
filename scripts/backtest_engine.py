@@ -1751,31 +1751,47 @@ def run_backtest(config: dict, force_close_at_end: bool = True,
 
     # --- Compute benchmarks ---
     universe_sector = config.get("universe", {}).get("sector")
-    ann_return = metrics["annualized_return_pct"]
+    ann_return = metrics.get("annualized_return_pct")
+    period_total_return = metrics.get("total_return_pct")
+
+    def _populate(bench: dict | None, prefix: str):
+        """Always-honest period metrics; gated annualized alpha (None when
+        either side lacks an annualized value — short window or missing data)."""
+        if not bench:
+            return
+        bm = bench["metrics"]
+        bench_total = bm.get("total_return_pct")
+        bench_ann = bm.get("annualized_return_pct")
+
+        metrics[f"{prefix}_benchmark_return_pct"] = bench_total
+        if period_total_return is not None and bench_total is not None:
+            metrics[f"period_excess_vs_{prefix}_pct"] = round(
+                period_total_return - bench_total, 2)
+
+        if bench_ann is not None and ann_return is not None:
+            metrics[f"alpha_vs_{prefix}_pct"] = round(ann_return - bench_ann, 2)
+            metrics[f"{prefix}_benchmark_ann_return_pct"] = bench_ann
+        else:
+            metrics[f"alpha_vs_{prefix}_pct"] = None
+            metrics[f"{prefix}_benchmark_ann_return_pct"] = None
 
     # Market benchmark (SPY) — always compute
     print("Computing benchmark (S&P 500)...")
     market_benchmark = compute_benchmark(trading_dates, initial_cash, sector=None)
+    _populate(market_benchmark, "market")
     if market_benchmark:
-        market_ann = market_benchmark["metrics"]["annualized_return_pct"]
-        metrics["alpha_vs_market_pct"] = round(ann_return - market_ann, 2)
-        metrics["market_benchmark_return_pct"] = market_benchmark["metrics"]["total_return_pct"]
-        metrics["market_benchmark_ann_return_pct"] = market_benchmark["metrics"]["annualized_return_pct"]
-        # Backward compat
-        metrics["benchmark_return_pct"] = market_benchmark["metrics"]["total_return_pct"]
-        metrics["benchmark_ann_return_pct"] = market_benchmark["metrics"]["annualized_return_pct"]
-        metrics["alpha_ann_pct"] = metrics["alpha_vs_market_pct"]
+        # Backward-compat aliases for older readers (experiments table, etc.)
+        metrics["benchmark_return_pct"] = market_benchmark["metrics"].get("total_return_pct")
+        metrics["benchmark_ann_return_pct"] = market_benchmark["metrics"].get("annualized_return_pct")
+        metrics["alpha_ann_pct"] = metrics.get("alpha_vs_market_pct")
 
     # Sector benchmark — compute if strategy has a sector universe
     benchmark = market_benchmark
     if universe_sector and universe_sector in SECTOR_ETF_MAP:
         print(f"Computing benchmark ({SECTOR_ETF_MAP[universe_sector]})...")
         sector_benchmark = compute_benchmark(trading_dates, initial_cash, sector=universe_sector)
+        _populate(sector_benchmark, "sector")
         if sector_benchmark:
-            sector_ann = sector_benchmark["metrics"]["annualized_return_pct"]
-            metrics["alpha_vs_sector_pct"] = round(ann_return - sector_ann, 2)
-            metrics["sector_benchmark_return_pct"] = sector_benchmark["metrics"]["total_return_pct"]
-            metrics["sector_benchmark_ann_return_pct"] = sector_benchmark["metrics"]["annualized_return_pct"]
             benchmark = sector_benchmark
 
     from datetime import datetime, timezone
