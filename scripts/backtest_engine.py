@@ -2231,11 +2231,15 @@ def compute_metrics(portfolio: Portfolio, initial_cash: float,
     final_nav = nav_series[-1]["nav"]
     total_return = ((final_nav - initial_cash) / initial_cash) * 100
 
-    # Annualized return (calendar days / 365.25, per GIPS/CFA standard)
-    calendar_days = (datetime.strptime(trading_dates[-1], "%Y-%m-%d") -
-                     datetime.strptime(trading_dates[0], "%Y-%m-%d")).days
-    years = max(calendar_days / 365.25, 0.01)
-    ann_return = ((final_nav / initial_cash) ** (1 / years) - 1) * 100 if years > 0 else 0
+    # Annualized return — only when the sample is statistically meaningful.
+    # Annualize using *trading* days (n/252) to stay consistent with the
+    # sqrt(252) convention used by Sharpe/vol below.
+    n_nav = len(nav_series)
+    if n_nav >= MIN_TRADING_DAYS_FOR_ANNUALIZATION:
+        years = n_nav / 252.0
+        ann_return = ((final_nav / initial_cash) ** (1 / years) - 1) * 100
+    else:
+        ann_return = None
 
     # Max drawdown
     peak_nav = 0
@@ -2283,46 +2287,43 @@ def compute_metrics(portfolio: Portfolio, initial_cash: float,
         if prev_nav > 0:
             daily_returns.append((nav_series[i]["nav"] - prev_nav) / prev_nav)
 
-    if daily_returns:
+    # Risk-free rate is used for Sharpe/Sortino. Loaded regardless so we can
+    # report it even when downstream stats are gated off.
+    risk_free_ann = 0.0
+    try:
+        treasury_path = Path(__file__).parent.parent / "data" / "macro" / "treasury-rates.json"
+        if treasury_path.exists():
+            treasury_data = json.loads(treasury_path.read_text())
+            t_rates = treasury_data.get("data", treasury_data) if isinstance(treasury_data, dict) else treasury_data
+            start_date = nav_series[0]["date"]
+            end_date = nav_series[-1]["date"]
+            period_rates = [r["month3"] for r in t_rates
+                           if start_date <= r["date"] <= end_date and r.get("month3") is not None]
+            if period_rates:
+                risk_free_ann = sum(period_rates) / len(period_rates)
+    except Exception:
+        risk_free_ann = 2.0
+
+    # Statistical risk metrics — gated by sample size for the same reason as
+    # ann_return above. With <60 daily returns, std() and Sharpe have CIs on
+    # the order of the point estimate; reporting them is misleading.
+    if daily_returns and ann_return is not None:
         import statistics
         import math
 
         daily_std = statistics.stdev(daily_returns) if len(daily_returns) > 1 else 0
         ann_vol = daily_std * (252 ** 0.5) * 100
-
-        # Load risk-free rate from treasury data (3-month T-bill)
-        # Use average rate over the backtest period for accuracy
-        risk_free_ann = 0.0
-        try:
-            treasury_path = Path(__file__).parent.parent / "data" / "macro" / "treasury-rates.json"
-            if treasury_path.exists():
-                treasury_data = json.loads(treasury_path.read_text())
-                t_rates = treasury_data.get("data", treasury_data) if isinstance(treasury_data, dict) else treasury_data
-                # Filter to backtest date range
-                start_date = nav_series[0]["date"]
-                end_date = nav_series[-1]["date"]
-                period_rates = [r["month3"] for r in t_rates
-                               if start_date <= r["date"] <= end_date and r.get("month3") is not None]
-                if period_rates:
-                    risk_free_ann = sum(period_rates) / len(period_rates)  # already in % terms
-        except Exception:
-            risk_free_ann = 2.0  # Conservative default when treasury data unavailable
-
-        # Sharpe = (annualized return - risk-free rate) / annualized volatility
         excess_return = ann_return - risk_free_ann
         sharpe = excess_return / ann_vol if ann_vol > 0 else 0
 
-        # Sortino = (annualized return - risk-free rate) / annualized downside deviation
-        # Downside deviation: use ALL returns, replace positives with 0
-        daily_rf = risk_free_ann / 100 / 252  # convert annual % to daily decimal
+        daily_rf = risk_free_ann / 100 / 252
         downside_sq = [min(r - daily_rf, 0) ** 2 for r in daily_returns]
         downside_dev = math.sqrt(sum(downside_sq) / len(downside_sq)) * math.sqrt(252) * 100
         sortino = excess_return / downside_dev if downside_dev > 0 else 0
     else:
-        ann_vol = 0
-        sharpe = 0
-        sortino = 0
-        risk_free_ann = 0.0
+        ann_vol = None
+        sharpe = None
+        sortino = None
 
     # Utilized capital metrics
     positions_values = [p["positions_value"] for p in nav_series]
@@ -2334,12 +2335,25 @@ def compute_metrics(portfolio: Portfolio, initial_cash: float,
     )
     utilization_pct = (avg_utilized_capital / initial_cash) * 100 if initial_cash > 0 else 0
 
+    def _r(v, ndigits=2):
+        return None if v is None else round(v, ndigits)
+
     return {
+        # Realized period metrics — always populated when there's NAV data.
         "total_return_pct": round(total_return, 2),
-        "annualized_return_pct": round(ann_return, 2),
         "max_drawdown_pct": round(max_dd, 2),
         "max_drawdown_date": max_dd_date,
         "final_nav": round(final_nav, 2),
+        # Statistical metrics — None when sample is too short to be honest.
+        "annualized_return_pct": _r(ann_return),
+        "annualized_volatility_pct": _r(ann_vol),
+        "sharpe_ratio": _r(sharpe),
+        "sortino_ratio": _r(sortino),
+        # Sample-size signal so consumers can render "—" with context.
+        "trading_days": n_nav,
+        "min_days_for_annualization": MIN_TRADING_DAYS_FOR_ANNUALIZATION,
+        "stats_partial": n_nav < MIN_TRADING_DAYS_FOR_ANNUALIZATION,
+        # Trade-based metrics — honest when there are trades.
         "total_entries": total_entries,
         "total_trades": len(real_trades),
         "wins": len(wins),
@@ -2350,9 +2364,7 @@ def compute_metrics(portfolio: Portfolio, initial_cash: float,
         "avg_loss_pct": round(avg_loss, 2),
         "avg_holding_days": round(avg_days, 1),
         "profit_factor": round(profit_factor, 2),
-        "annualized_volatility_pct": round(ann_vol, 2),
-        "sharpe_ratio": round(sharpe, 2),
-        "sortino_ratio": round(sortino, 2),
+        # Capital utilization — period observation, always honest.
         "risk_free_rate_pct": round(risk_free_ann, 2),
         "peak_utilized_capital": round(peak_utilized_capital, 2),
         "avg_utilized_capital": round(avg_utilized_capital, 2),
@@ -2468,19 +2480,22 @@ def print_report(result: dict):
     print(f"  BACKTEST REPORT: {config_name}")
     print("=" * 70)
 
+    def _fmt(v, spec=">8.2f", suffix="%"):
+        return f"{'—':>8}{suffix}" if v is None else f"{v:{spec}}{suffix}"
+
     print(f"\n  Performance")
-    print(f"  {'Total Return:':<25} {m['total_return_pct']:>8.2f}%")
-    print(f"  {'Annualized Return:':<25} {m['annualized_return_pct']:>8.2f}%")
-    print(f"  {'Max Drawdown:':<25} {m['max_drawdown_pct']:>8.2f}%  ({m['max_drawdown_date']})")
+    print(f"  {'Total Return:':<25} {_fmt(m.get('total_return_pct'))}")
+    print(f"  {'Annualized Return:':<25} {_fmt(m.get('annualized_return_pct'))}")
+    print(f"  {'Max Drawdown:':<25} {_fmt(m.get('max_drawdown_pct'))}  ({m.get('max_drawdown_date', '')})")
     print(f"  {'Final NAV:':<25} ${m['final_nav']:>12,.2f}")
     print(f"  {'Profit Factor:':<25} {m['profit_factor']:>8.2f}")
 
     # Benchmark comparison
-    if "benchmark_return_pct" in m:
+    if m.get("benchmark_return_pct") is not None:
         print(f"\n  Benchmark (S&P 500)")
-        print(f"  {'Benchmark Return:':<25} {m['benchmark_return_pct']:>8.2f}%")
-        print(f"  {'Benchmark Ann. Return:':<25} {m['benchmark_ann_return_pct']:>8.2f}%")
-        print(f"  {'Alpha (annualized):':<25} {m['alpha_ann_pct']:>8.2f}%")
+        print(f"  {'Benchmark Return:':<25} {_fmt(m.get('benchmark_return_pct'))}")
+        print(f"  {'Benchmark Ann. Return:':<25} {_fmt(m.get('benchmark_ann_return_pct'))}")
+        print(f"  {'Alpha (annualized):':<25} {_fmt(m.get('alpha_ann_pct'))}")
 
     print(f"\n  Trade Statistics")
     print(f"  {'Total Trades:':<25} {m['total_trades']:>8}")
