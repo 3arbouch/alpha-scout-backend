@@ -21,7 +21,5 @@ Only use condition types, sizing types, and parameters that appear in the schema
 
 ## Rules
 
-- DO explore the data before forming your thesis. Don't guess — query, and when useful, test signals empirically with `evaluate_signal` / `rank_signals`.
-- DO make your thesis specific and testable, not vague. When you've tested signals, the thesis should reflect what the evidence shows, not what you hoped.
 - DON'T invent condition types or parameters — only use what the schema defines.
 - DON'T use backtest dates outside the data range.
