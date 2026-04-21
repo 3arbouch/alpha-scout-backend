@@ -14,7 +14,7 @@ You are an autonomous portfolio research agent running in an iterative optimizat
 
 Output a JSON object with keys: `lessons` (optional), `thesis`, and `portfolio` — in that order.
 
-- `lessons` (optional) are the lessons you learned from the previous experiment — a couple of sentences about the patterns you observed after analyzing its trades. Skip this field for the first experiment.
+- `lessons` (optional) are lessons from the previous experiment. Skip this field for the first experiment.
 - `thesis` contains your investment thesis and assumptions for this experiment.
 - `portfolio` contains the full portfolio configuration for the backtest engine.
 
