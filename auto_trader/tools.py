@@ -309,23 +309,36 @@ async def rank_signals_tool(args: dict[str, Any]) -> dict[str, Any]:
 
 @tool(
     "get_experiment_trades",
-    "Fetch the full trade log for a past experiment in this run. "
-    "Use this when a past experiment's summary suggests a pattern worth drilling into "
-    "(e.g., one large loser dragged the hit rate, a sleeve ran hot in one regime, "
-    "an exit reason dominates). "
-    "The experiment_id is shown in brackets in each past experiment's header in the history "
+    "Drill into the trade log for a past experiment in this run. Call "
+    "get_experiment_stats FIRST to identify the dimension worth drilling into "
+    "(a reason, a month, a symbol, a tail), then use the filters here to pull "
+    "only the relevant rows — never dump without a narrowing filter on multi-year "
+    "backtests.\n\n"
+    "The experiment_id is the hash shown in brackets in each past experiment's header "
     "(e.g., '### Experiment 4 [id: 50e63c54f604]'). Pass that hash as experiment_id.\n\n"
-    "Returns all BUYs and SELLs for the experiment's backtest, with each row tagged by "
+    "Returns BUYs and SELLs for the experiment's backtest, with each row tagged by "
     "sleeve_label. SELL rows carry round-trip fields: pnl, pnl_pct, entry_date, "
     "entry_price, days_held, reason. BUY rows have those fields as null.\n\n"
-    "Optional filters:\n"
-    "  sleeve_label: narrow to one sleeve\n"
-    "  action: 'BUY' or 'SELL' only\n"
-    "  winners_only: SELL trades with pnl > 0 only\n"
-    "  losers_only: SELL trades with pnl <= 0 only\n\n"
+    "Filters (all optional, combined with AND):\n"
+    "  sleeve_label:    only trades from one sleeve (matches by_sleeve keys)\n"
+    "  action:          'BUY' or 'SELL' only\n"
+    "  winners_only:    SELL trades with pnl > 0\n"
+    "  losers_only:     SELL trades with pnl <= 0\n"
+    "  reason:          exit reason (matches by_exit_reason keys — e.g. 'stop_loss')\n"
+    "  symbol:          single ticker (matches top_symbols_by_contribution)\n"
+    "  start_date:      YYYY-MM-DD inclusive (matches monthly_pnl buckets)\n"
+    "  end_date:        YYYY-MM-DD inclusive\n"
+    "  min_abs_pnl:     only trades with |pnl| >= this number (tail inspection)\n"
+    "  min_days_held:   only SELLs held >= this many days\n"
+    "  max_days_held:   only SELLs held <= this many days\n\n"
+    "Results are capped at 200 rows. If truncated=true, add a narrower filter.\n"
     "Scope: experiments from the current run only. Cross-run access returns empty.",
     {"experiment_id": str, "sleeve_label": str, "action": str,
-     "winners_only": bool, "losers_only": bool},
+     "winners_only": bool, "losers_only": bool,
+     "reason": str, "symbol": str,
+     "start_date": str, "end_date": str,
+     "min_abs_pnl": float,
+     "min_days_held": int, "max_days_held": int},
 )
 async def get_experiment_trades_tool(args: dict[str, Any]) -> dict[str, Any]:
     from auto_trader.schema import get_db
@@ -356,6 +369,43 @@ async def get_experiment_trades_tool(args: dict[str, Any]) -> dict[str, Any]:
         where.append("action = 'SELL' AND pnl > 0")
     elif args.get("losers_only"):
         where.append("action = 'SELL' AND pnl <= 0")
+
+    reason = args.get("reason")
+    if reason:
+        where.append("reason = ?")
+        params.append(reason)
+
+    symbol = args.get("symbol")
+    if symbol:
+        where.append("symbol = ?")
+        params.append(symbol)
+
+    start_date = args.get("start_date")
+    if start_date:
+        where.append("date >= ?")
+        params.append(start_date)
+
+    end_date = args.get("end_date")
+    if end_date:
+        where.append("date <= ?")
+        params.append(end_date)
+
+    min_abs_pnl = args.get("min_abs_pnl")
+    if min_abs_pnl is not None:
+        # pnl is null on BUYs → ABS(NULL) is NULL → comparison is NULL → row excluded.
+        # This implicitly restricts to SELLs with pnl, which is the intended tail filter.
+        where.append("ABS(pnl) >= ?")
+        params.append(float(min_abs_pnl))
+
+    min_days_held = args.get("min_days_held")
+    if min_days_held is not None:
+        where.append("days_held >= ?")
+        params.append(int(min_days_held))
+
+    max_days_held = args.get("max_days_held")
+    if max_days_held is not None:
+        where.append("days_held <= ?")
+        params.append(int(max_days_held))
 
     sql = f"""
         SELECT sleeve_label, date, action, symbol, shares, price, amount,
