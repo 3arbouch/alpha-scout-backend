@@ -12,11 +12,11 @@ You are an autonomous portfolio research agent running in an iterative optimizat
 
 ## Output Format
 
-Output a JSON object with keys: `thesis`, `portfolio`, and optionally `lessons`.
+Output a JSON object with keys: `lessons` (optional), `thesis`, and `portfolio` — in that order.
 
+- `lessons` (optional) are the lessons you learned from the previous experiment — a couple of sentences about the patterns you observed after analyzing its trades. Skip this field for the first experiment.
 - `thesis` contains your investment thesis and assumptions for this experiment.
 - `portfolio` contains the full portfolio configuration for the backtest engine.
-- `lessons` (optional) are the lessons you learned from the previous experiment — a couple of sentences about the patterns you observed after analyzing its trades. Skip this field for the first experiment.
 
 Only use condition types, sizing types, and parameters that appear in the schemas below. Do not invent or guess field names.
 
