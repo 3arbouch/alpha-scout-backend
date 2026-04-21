@@ -485,12 +485,18 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
 
     # Helper: resolve active allocation profile for a given date
     def _resolve_profile(active_regimes_today):
-        """Walk profile_priority, return (profile_name, weights_dict)."""
+        """Walk profile_priority, return (profile_name, weights_dict).
+
+        Always returns the inner `.weights` sub-dict of a profile, never the
+        outer profile wrapper. Previously the "default" branch returned the
+        whole {trigger, weights, ...} dict, which both crashed the transition
+        summary printer and made per-sleeve weight lookups silently return 0.
+        """
         if not allocation_profiles or not profile_priority:
             return None, None
         for pname in profile_priority:
             if pname == "default":
-                return "default", allocation_profiles.get("default", {})
+                return "default", allocation_profiles.get("default", {}).get("weights", {})
             pdef = allocation_profiles.get(pname, {})
             triggers = pdef.get("trigger", [])
             if not triggers:
@@ -501,7 +507,7 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
                 return pname, pdef.get("weights", {})
         # Fallback to default
         if "default" in allocation_profiles:
-            return "default", allocation_profiles.get("default", {})
+            return "default", allocation_profiles.get("default", {}).get("weights", {})
         return None, None
 
     all_dates_index = {d: idx for idx, d in enumerate(all_dates)}
