@@ -597,8 +597,14 @@ Remember: query the data first, don't guess. Explore before you commit."""
     # Opus 4.7 rejects the legacy thinking.type='enabled' shape the CLI
     # defaults to. Force adaptive thinking for 4.7 only; leave other
     # models on their defaults so we don't alter working behavior.
+    #
+    # `display: "summarized"` explicitly overrides Opus 4.7's per-model
+    # default of `"omitted"` (which returns empty thinking with signature
+    # only). This gives us plaintext thinking summaries in the transcript
+    # and in our agent_thinking event stream — same behavior Opus 4.6
+    # and Sonnet 4.6 already ship with by default.
     if resolved_model == "claude-opus-4-7":
-        agent_opts["thinking"] = {"type": "adaptive"}
+        agent_opts["thinking"] = {"type": "adaptive", "display": "summarized"}
 
     try:
         async for message in query(
