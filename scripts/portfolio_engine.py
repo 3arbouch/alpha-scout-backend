@@ -392,11 +392,15 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
     # Step 2.5: Pre-compute per-sleeve gate dates for execution-level gating
     # -----------------------------------------------------------------------
     # Each sleeve gets a set of dates where new entries are allowed.
-    # When regime_gate is ["*"] or regime is disabled, gate_dates is None (always on).
+    # When regime_gate is ["*"], [], or regime is disabled, gate_dates is None
+    # (always on). Empty list is treated identically to ["*"] — matches the
+    # PortfolioSleeve schema contract and the natural reading of "no constraints
+    # specified". Without this, an agent emitting regime_gate=[] silently
+    # produced a portfolio that never traded (cash for the entire backtest).
     sleeve_gate_dates = []
     for sleeve in sleeves:
         gate = sleeve["regime_gate"]
-        if not regime_enabled or gate == ["*"]:
+        if not regime_enabled or gate == ["*"] or not gate:
             sleeve_gate_dates.append(None)  # no gating — always active
         else:
             gated_names = {regime_id_to_name.get(rid, rid) for rid in gate}
@@ -667,12 +671,15 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
                 w = sleeve["weight"]
             day_weights.append(w)
 
-        # Determine gate status per sleeve
+        # Determine gate status per sleeve.
+        # Empty list [] is treated as ["*"] (always on) — matches the schema
+        # contract ("Empty or ['*'] = always active") and the equivalent
+        # handling in the Step 2.5 gate-dates precompute above.
         gate_status = []
         for i, sleeve in enumerate(sleeves):
             gate = sleeve["regime_gate"]
             is_gated_on = False
-            if not regime_enabled or gate == ["*"]:
+            if not regime_enabled or gate == ["*"] or not gate:
                 is_gated_on = True
             else:
                 gated_names = {regime_id_to_name.get(rid, rid) for rid in gate}
