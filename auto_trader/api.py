@@ -29,7 +29,8 @@ router = APIRouter(prefix="/auto-trader", tags=["Auto-Trader"])
 AVAILABLE_MODELS = [
     {"id": "haiku", "name": "Claude Haiku 4.5", "api_id": "claude-haiku-4-5-20251001", "speed": "fast", "cost": "$1/$5 per MTok", "description": "Fastest. ~2-3 min per experiment. Good for quick experiments."},
     {"id": "sonnet", "name": "Claude Sonnet 4.6", "api_id": "claude-sonnet-4-6", "speed": "medium", "cost": "$3/$15 per MTok", "description": "Best balance of speed and quality. ~5-10 min per experiment."},
-    {"id": "opus", "name": "Claude Opus 4.6", "api_id": "claude-opus-4-6", "speed": "slow", "cost": "$5/$25 per MTok", "description": "Most intelligent. ~10-20 min per experiment. Deepest research."},
+    {"id": "opus", "name": "Claude Opus 4.6", "api_id": "claude-opus-4-6", "speed": "slow", "cost": "$5/$25 per MTok", "description": "Most intelligent (4.6). ~10-20 min per experiment. Deepest research."},
+    {"id": "opus-4-7", "name": "Claude Opus 4.7", "api_id": "claude-opus-4-7", "speed": "slow", "cost": "$5/$25 per MTok", "description": "Latest Opus (4.7). Stronger reasoning than 4.6 at similar speed. Best for hardest research."},
 ]
 
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -196,11 +197,21 @@ _ensure_tables()
 class CreateAgentRequest(BaseModel):
     name: str = Field(description="Agent name, e.g. 'Energy Specialist', 'Conservative Alpha'")
     prompt: str | None = Field(default=None, description="Agent prompt. If omitted, uses the default prompt.")
+    allowed_tools: list[str] | None = Field(
+        default=None,
+        description="Subset of MCP tool names the agent may call. "
+                    "Omit to default to the full current catalog; [] = no MCP tools.",
+    )
 
 
 class UpdateAgentRequest(BaseModel):
     name: str | None = Field(default=None, description="Update agent name")
     prompt: str | None = Field(default=None, description="Update agent prompt")
+    allowed_tools: list[str] | None = Field(
+        default=None,
+        description="Replace the agent's tool allowlist. Omit to leave unchanged. "
+                    "Must be a list (possibly empty); null is rejected.",
+    )
 
 
 class CreateRunRequest(BaseModel):
@@ -228,7 +239,28 @@ def _get_agent(agent_id: str) -> dict:
     conn.close()
     if not row:
         raise HTTPException(404, f"Agent '{agent_id}' not found")
-    return dict(row)
+    d = dict(row)
+    # allowed_tools is always a list. Legacy NULL rows have been backfilled.
+    d["allowed_tools"] = json.loads(d["allowed_tools"]) if d.get("allowed_tools") else []
+    return d
+
+
+def _validate_allowed_tools(names: list[str]) -> str:
+    """Validate tool names against the current catalog and return the JSON-serialized
+    list to store. Rejects None — every agent must have an explicit (possibly empty) list
+    so capability changes are always tied to an explicit human action."""
+    if names is None:
+        raise HTTPException(400,
+            "allowed_tools must be a list (possibly empty), not null. "
+            "Use [] to disable all MCP tools.")
+    from auto_trader.tools import TOOL_NAMES
+    unknown = [n for n in names if n not in TOOL_NAMES]
+    if unknown:
+        raise HTTPException(400, f"Unknown tool name(s): {unknown}. Valid: {sorted(TOOL_NAMES)}")
+    # De-dup while preserving order
+    seen: set[str] = set()
+    deduped = [n for n in names if not (n in seen or seen.add(n))]
+    return json.dumps(deduped)
 
 
 def _get_run(run_id: str) -> dict:
@@ -258,6 +290,17 @@ def _stop_file(run_id: str) -> Path:
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
+
+@router.get("/tools")
+async def list_tools():
+    """Return the catalog of MCP tools available for per-agent configuration.
+
+    Built-in primitives (Skill, Read) are always on and intentionally excluded.
+    """
+    from auto_trader.tools import list_available_tools
+    tools = list_available_tools()
+    return {"total": len(tools), "data": tools}
+
 
 @router.get("/config")
 async def get_config():
@@ -304,34 +347,49 @@ async def get_config():
 
 @router.post("/agents", status_code=201)
 async def create_agent(body: CreateAgentRequest):
-    """Create a new auto-trader agent with a custom prompt."""
+    """Create a new auto-trader agent with a custom prompt.
+
+    `allowed_tools` defaults to the full current catalog when omitted, so a brand-new
+    agent is functional with no extra config. Pass [] to start with no MCP tools.
+    """
+    from auto_trader.tools import ALL_TOOLS
+
     agent_id = _generate_run_id(body.name)  # reuse the slug+hash generator
     now = datetime.now(timezone.utc).isoformat()
     prompt = body.prompt or DEFAULT_PROMPT
 
+    tools = body.allowed_tools if body.allowed_tools is not None else [t.name for t in ALL_TOOLS]
+    allowed_tools_json = _validate_allowed_tools(tools)
+
     conn = get_db()
     conn.execute(
-        "INSERT INTO auto_trader_agents (id, name, prompt, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-        (agent_id, body.name, prompt, now, now),
+        "INSERT INTO auto_trader_agents (id, name, prompt, allowed_tools, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (agent_id, body.name, prompt, allowed_tools_json, now, now),
     )
     conn.commit()
     conn.close()
 
-    return {"id": agent_id, "name": body.name, "prompt_length": len(prompt)}
+    return {
+        "id": agent_id,
+        "name": body.name,
+        "prompt_length": len(prompt),
+        "allowed_tools": tools,
+    }
 
 
 @router.get("/agents")
 async def list_agents():
     """List all auto-trader agents."""
     conn = get_db()
-    rows = conn.execute("SELECT id, name, created_at, updated_at FROM auto_trader_agents ORDER BY created_at").fetchall()
-    conn.close()
+    rows = conn.execute(
+        "SELECT id, name, allowed_tools, created_at, updated_at FROM auto_trader_agents ORDER BY created_at"
+    ).fetchall()
 
-    # Count runs per agent
     results = []
-    conn = get_db()
     for r in rows:
         d = dict(r)
+        d["allowed_tools"] = json.loads(d["allowed_tools"]) if d.get("allowed_tools") else []
         d["run_count"] = conn.execute(
             "SELECT COUNT(*) FROM auto_trader_runs WHERE agent_id = ?", (r["id"],)
         ).fetchone()[0]
@@ -355,12 +413,38 @@ async def get_agent(agent_id: str):
     return agent
 
 
+@router.get("/agents/{agent_id}/system-prompt")
+async def get_agent_system_prompt(agent_id: str):
+    """Return the full assembled system prompt that this agent's runs see.
+
+    Mirrors what runner.load_program() builds: system.md + agent prompt + schemas.
+    Useful for UI transparency — shows the complete context the model receives.
+    """
+    agent = _get_agent(agent_id)
+    from auto_trader.runner import load_program
+    system_prompt = load_program(agent_prompt=agent["prompt"])
+    return {
+        "agent_id": agent_id,
+        "agent_name": agent["name"],
+        "system_prompt": system_prompt,
+        "length": len(system_prompt),
+    }
+
+
 @router.put("/agents/{agent_id}")
 async def update_agent(agent_id: str, body: UpdateAgentRequest):
-    """Update an agent's name or prompt."""
+    """Update an agent's name, prompt, or tool allowlist.
+
+    `allowed_tools` semantics:
+      - field omitted from request: no change
+      - []: disable all MCP tools
+      - list of names: explicit subset (validated against catalog)
+      - null: rejected (400) — capability changes must be explicit
+    """
     _get_agent(agent_id)  # verify exists
 
     now = datetime.now(timezone.utc).isoformat()
+    fields_set = body.model_fields_set
     conn = get_db()
     if body.name is not None:
         conn.execute("UPDATE auto_trader_agents SET name = ?, updated_at = ? WHERE id = ?",
@@ -368,6 +452,10 @@ async def update_agent(agent_id: str, body: UpdateAgentRequest):
     if body.prompt is not None:
         conn.execute("UPDATE auto_trader_agents SET prompt = ?, updated_at = ? WHERE id = ?",
                      (body.prompt, now, agent_id))
+    if "allowed_tools" in fields_set:
+        stored = _validate_allowed_tools(body.allowed_tools)
+        conn.execute("UPDATE auto_trader_agents SET allowed_tools = ?, updated_at = ? WHERE id = ?",
+                     (stored, now, agent_id))
     conn.commit()
     conn.close()
 
@@ -550,6 +638,9 @@ async def start_run(run_id: str, body: StartRunRequest = StartRunRequest()):
     for cond in config.get("conditions", []):
         cmd.extend(["--condition", cond])
 
+    # Forward the agent's explicit MCP tool allowlist (always a list post-backfill).
+    cmd.extend(["--allowed-tools", json.dumps(agent.get("allowed_tools", []))])
+
     if config.get("sector"):
         cmd.extend(["--sector", config["sector"]])
     if config.get("alpha_benchmark"):
@@ -628,6 +719,14 @@ async def delete_run(run_id: str):
         raise HTTPException(409, "Cannot delete a running run. Stop it first.")
 
     conn = get_db()
+    # Cascade delete trades for all experiments in this run before removing the
+    # experiment rows themselves. Single transaction via the implicit BEGIN.
+    conn.execute(
+        """DELETE FROM trades
+           WHERE source_type = 'experiment'
+             AND source_id IN (SELECT id FROM experiments WHERE run_id = ?)""",
+        (run_id,),
+    )
     conn.execute("DELETE FROM experiments WHERE run_id = ?", (run_id,))
     conn.execute("DELETE FROM auto_trader_runs WHERE id = ?", (run_id,))
     conn.commit()
@@ -851,6 +950,53 @@ async def get_experiment(run_id: str, experiment_id: str):
                 pass
 
     return result
+
+
+@router.get("/runs/{run_id}/experiments/{experiment_id}/trades")
+async def get_experiment_trades(run_id: str, experiment_id: str):
+    """Get all trades executed during this experiment's backtest.
+
+    Returns every BUY and SELL across every sleeve of the portfolio, tagged
+    with sleeve_label. SELL rows carry round-trip fields (pnl, pnl_pct,
+    entry_date, days_held, reason); BUY rows have those fields as null.
+    """
+    conn = get_db()
+    # Verify the experiment belongs to this run (404 if not found)
+    exp_row = conn.execute(
+        "SELECT id FROM experiments WHERE id = ? AND run_id = ?",
+        (experiment_id, run_id),
+    ).fetchone()
+    if not exp_row:
+        conn.close()
+        raise HTTPException(404, f"Experiment '{experiment_id}' not found in run '{run_id}'")
+
+    rows = conn.execute(
+        """SELECT id, sleeve_label, date, action, symbol, shares, price, amount,
+                  reason, signal_detail, entry_date, entry_price, pnl, pnl_pct,
+                  days_held, linked_trade_id
+           FROM trades
+           WHERE source_type = 'experiment' AND source_id = ?
+           ORDER BY date, action, symbol""",
+        (experiment_id,),
+    ).fetchall()
+    conn.close()
+
+    trades = []
+    for r in rows:
+        d = dict(r)
+        if d.get("signal_detail") and isinstance(d["signal_detail"], str):
+            try:
+                d["signal_detail"] = json.loads(d["signal_detail"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+        trades.append(d)
+
+    return {
+        "experiment_id": experiment_id,
+        "run_id": run_id,
+        "trade_count": len(trades),
+        "trades": trades,
+    }
 
 
 @router.get("/runs/{run_id}/experiments/{experiment_id}/session")

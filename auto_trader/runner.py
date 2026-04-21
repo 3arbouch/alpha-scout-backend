@@ -71,20 +71,67 @@ def _load_schemas() -> str:
 
 
 _custom_prompt = None
+# Explicit allowlist for this run. None means the API/CLI didn't supply one,
+# in which case we fall back to the full current catalog (CLI convenience).
+_allowed_tools: list[str] | None = None
 
-def load_program() -> str:
-    """Build the full system prompt: system.md + agent prompt + schemas."""
-    # Fixed system instructions
+
+def _resolve_allowed_mcp_tools() -> list[str]:
+    """Map the per-agent allowlist to the SDK tool ids, dropping any unknowns.
+
+    None  -> no allowlist supplied; fall back to the full current catalog.
+             (API runs always supply one; this only triggers for ad-hoc CLI use.)
+    list  -> explicit subset; unknown names are skipped with a warning so a
+             tool that's been deleted from the codebase doesn't crash a backtest.
+    """
+    from auto_trader.tools import ALL_TOOLS, TOOL_NAMES, mcp_tool_id
+    if _allowed_tools is None:
+        names = [t.name for t in ALL_TOOLS]
+    else:
+        names = []
+        for n in _allowed_tools:
+            if n in TOOL_NAMES:
+                names.append(n)
+            else:
+                print(f"  [warn] agent allowlist references unknown tool '{n}' — skipping")
+    return [mcp_tool_id(n) for n in names]
+
+
+def _resolve_model_api_id(model_id: str) -> str:
+    """Map a short model id ('opus', 'opus-4-7') to its full Anthropic API id.
+
+    If the input is already a full API id (contains 'claude-'), returns as-is.
+    Unknown short ids also pass through unchanged — the SDK will either resolve
+    a slug alias or error with a clear message.
+    """
+    if not model_id or "claude-" in model_id:
+        return model_id
+    # Keep in sync with AVAILABLE_MODELS in auto_trader/api.py
+    mapping = {
+        "haiku": "claude-haiku-4-5-20251001",
+        "sonnet": "claude-sonnet-4-6",
+        "opus": "claude-opus-4-6",
+        "opus-4-7": "claude-opus-4-7",
+    }
+    return mapping.get(model_id, model_id)
+
+def load_program(agent_prompt: str | None = None) -> str:
+    """Build the full system prompt: system.md + agent prompt + schemas.
+
+    Tool definitions are NOT injected here — the SDK transmits them automatically
+    via the API tools channel (filtered by ClaudeAgentOptions.allowed_tools).
+
+    Resolution order for the agent prompt:
+    1. explicit `agent_prompt` arg (used by the API for per-agent preview)
+    2. module-level `_custom_prompt` (set via CLI --prompt-file)
+    3. fallback to program.md on disk
+    """
     system_path = Path(__file__).parent / "system.md"
     system_instructions = system_path.read_text()
 
-    # Agent prompt (custom or default)
-    if _custom_prompt:
-        agent_prompt = _custom_prompt
-    else:
-        agent_prompt = (Path(__file__).parent / "program.md").read_text()
+    if agent_prompt is None:
+        agent_prompt = _custom_prompt or (Path(__file__).parent / "program.md").read_text()
 
-    # Dynamic schemas
     schemas = _load_schemas()
 
     return system_instructions + "\n\n---\n\n" + agent_prompt + "\n\n---\n\n" + schemas
@@ -117,8 +164,83 @@ def parse_thesis(agent_output: str) -> dict | None:
     return None
 
 
+def _get_trade_summary(exp_id: str) -> dict | None:
+    """Pull compact trade aggregates for an experiment.
+
+    Returns None if no trades (backtest generated no executions, or trade
+    persist failed for this experiment).
+    """
+    from auto_trader.schema import get_db
+    conn = get_db()
+    # Aggregate stats — only SELL rows carry pnl
+    agg = conn.execute(
+        """SELECT
+               COUNT(*) AS total_events,
+               SUM(CASE WHEN action='BUY' THEN 1 ELSE 0 END) AS buys,
+               SUM(CASE WHEN action='SELL' THEN 1 ELSE 0 END) AS sells,
+               SUM(CASE WHEN action='SELL' AND pnl > 0 THEN 1 ELSE 0 END) AS winners,
+               SUM(CASE WHEN action='SELL' AND pnl <= 0 THEN 1 ELSE 0 END) AS losers,
+               AVG(CASE WHEN action='SELL' AND pnl > 0 THEN pnl_pct END) AS avg_win_pct,
+               AVG(CASE WHEN action='SELL' AND pnl <= 0 THEN pnl_pct END) AS avg_loss_pct,
+               AVG(CASE WHEN action='SELL' THEN days_held END) AS avg_days_held
+           FROM trades WHERE source_type='experiment' AND source_id = ?""",
+        (exp_id,),
+    ).fetchone()
+    if not agg or (agg["total_events"] or 0) == 0:
+        conn.close()
+        return None
+
+    # Exit-reason histogram
+    reasons = conn.execute(
+        """SELECT reason, COUNT(*) AS n FROM trades
+           WHERE source_type='experiment' AND source_id=? AND action='SELL' AND reason IS NOT NULL
+           GROUP BY reason ORDER BY n DESC""",
+        (exp_id,),
+    ).fetchall()
+
+    # Top 3 winners and worst 3 losers by pnl_pct
+    winners_rows = conn.execute(
+        """SELECT symbol, pnl_pct, days_held FROM trades
+           WHERE source_type='experiment' AND source_id=? AND action='SELL' AND pnl > 0
+           ORDER BY pnl_pct DESC LIMIT 3""",
+        (exp_id,),
+    ).fetchall()
+    losers_rows = conn.execute(
+        """SELECT symbol, pnl_pct, days_held FROM trades
+           WHERE source_type='experiment' AND source_id=? AND action='SELL' AND pnl <= 0
+           ORDER BY pnl_pct ASC LIMIT 3""",
+        (exp_id,),
+    ).fetchall()
+    conn.close()
+
+    sells = agg["sells"] or 0
+    winners = agg["winners"] or 0
+    hit_rate = (winners / sells * 100) if sells else 0.0
+
+    return {
+        "sells": sells,
+        "winners": winners,
+        "losers": agg["losers"] or 0,
+        "hit_rate_pct": round(hit_rate, 1),
+        "avg_win_pct": round(agg["avg_win_pct"], 2) if agg["avg_win_pct"] is not None else None,
+        "avg_loss_pct": round(agg["avg_loss_pct"], 2) if agg["avg_loss_pct"] is not None else None,
+        "avg_days_held": round(agg["avg_days_held"], 1) if agg["avg_days_held"] is not None else None,
+        "exit_reasons": [(r["reason"], r["n"]) for r in reasons],
+        "top_winners": [(r["symbol"], r["pnl_pct"], r["days_held"]) for r in winners_rows],
+        "worst_losers": [(r["symbol"], r["pnl_pct"], r["days_held"]) for r in losers_rows],
+    }
+
+
 def build_history_context(run_id: str, target_metric: str, limit: int = 20) -> str:
-    """Build full history of past experiments for the agent to learn from."""
+    """Build full history of past experiments for the agent to learn from.
+
+    Deliberately excludes the `lessons` field. Lessons are the agent's own
+    interpretation of prior experiments and are persisted for UI display only;
+    surfacing them here would bias subsequent iterations by anchoring the
+    agent on its own past self-interpretation. `get_experiment_history()`
+    intentionally does not SELECT the column so the data isn't available
+    at this layer. Do not change either without reading the design rationale.
+    """
     history = get_experiment_history(run_id, limit=limit)
     if not history:
         return "No previous experiments. This is your first experiment."
@@ -126,7 +248,7 @@ def build_history_context(run_id: str, target_metric: str, limit: int = 20) -> s
     lines = [f"## Past Experiments ({len(history)} most recent)\n"]
     for exp in reversed(history):  # oldest first
         status = "KEEP" if exp["decision"] == "keep" else "DISCARD"
-        lines.append(f"### Experiment {exp['iteration']} — {status}")
+        lines.append(f"### Experiment {exp['iteration']} [id: {exp['id']}] — {status}")
 
         # Full thesis
         lines.append(f"**Thesis:** {exp.get('thesis', 'N/A')}")
@@ -179,6 +301,30 @@ def build_history_context(run_id: str, target_metric: str, limit: int = 20) -> s
                     lines.append(f"- {label} ({weight*100:.0f}%): universe={universe.get('type','?')} "
                                  f"sector={universe.get('sector','all')} "
                                  f"entry=[{', '.join(cond_types)}]")
+
+        # Compact trade summary pulled from persisted trades
+        try:
+            summary = _get_trade_summary(exp["id"])
+        except Exception:
+            summary = None
+        if summary and summary["sells"] > 0:
+            win_str = f"{summary['avg_win_pct']:+.1f}%" if summary["avg_win_pct"] is not None else "n/a"
+            loss_str = f"{summary['avg_loss_pct']:+.1f}%" if summary["avg_loss_pct"] is not None else "n/a"
+            days_str = f"{summary['avg_days_held']:.0f}d" if summary["avg_days_held"] is not None else "n/a"
+            lines.append(
+                f"**Trades:** {summary['sells']} closed "
+                f"({summary['winners']}W/{summary['losers']}L, hit={summary['hit_rate_pct']:.0f}%, "
+                f"avg_win={win_str}, avg_loss={loss_str}, avg_hold={days_str})"
+            )
+            if summary["exit_reasons"]:
+                reasons_str = ", ".join(f"{r}:{n}" for r, n in summary["exit_reasons"])
+                lines.append(f"**Exit reasons:** {reasons_str}")
+            if summary["top_winners"]:
+                top_str = ", ".join(f"{s} {p:+.1f}%/{d}d" for s, p, d in summary["top_winners"])
+                lines.append(f"**Top winners:** {top_str}")
+            if summary["worst_losers"]:
+                bot_str = ", ".join(f"{s} {p:+.1f}%/{d}d" for s, p, d in summary["worst_losers"])
+                lines.append(f"**Worst losers:** {bot_str}")
 
         lines.append("")
 
@@ -300,7 +446,16 @@ def save_portfolio(portfolio_config: dict) -> str | None:
 
 def run_backtest(portfolio_config: dict, start: str, end: str, capital: float,
                  sector: str | None = None) -> dict | None:
-    """Run a portfolio backtest. Returns metrics dict with both market and sector alpha."""
+    """Run a portfolio backtest.
+
+    Returns:
+        {"metrics": {...}, "sleeve_trades": [{"label": str, "trades": [...]}, ...]}
+        or None on failure.
+
+    sleeve_trades mirrors the engine's per-sleeve grouping — each sleeve's full
+    BUY+SELL event log in chronological order. Portfolio-level trades = union of
+    all sleeve lists.
+    """
     try:
         from portfolio_engine import run_portfolio_backtest
         from backtest_engine import compute_benchmark, SECTOR_ETF_MAP
@@ -340,7 +495,18 @@ def run_backtest(portfolio_config: dict, start: str, end: str, capital: float,
                     metrics["sector_benchmark_return_pct"] = sector_bench["metrics"]["total_return_pct"]
                     metrics["sector_benchmark_ann_return_pct"] = sector_bench["metrics"]["annualized_return_pct"]
 
-        return metrics
+        # Build per-sleeve trade groups with labels attached
+        sleeve_results = result.get("sleeve_results", [])
+        per_sleeve = result.get("per_sleeve", [])
+        sleeve_trades = [
+            {
+                "label": per_sleeve[i].get("label") if i < len(per_sleeve) else f"sleeve_{i}",
+                "trades": sr.get("trades", []),
+            }
+            for i, sr in enumerate(sleeve_results)
+        ]
+
+        return {"metrics": metrics, "sleeve_trades": sleeve_trades}
     except Exception as e:
         print(f"  Backtest failed: {e}")
         import traceback
@@ -407,24 +573,37 @@ Remember: query the data first, don't guess. Explore before you commit."""
     agent_output = []
     tool_calls = 0
     session_id = None
-    auto_trader_tools = create_auto_trader_tools(stop_date=backtest_end, sector=sector)
+    auto_trader_tools = create_auto_trader_tools(
+        stop_date=backtest_end, sector=sector, start_date=backtest_start,
+        run_id=run_id,
+        # Enforce the agent's allowlist at the MCP server boundary so forbidden
+        # tools don't appear in the model's tool catalog at all.
+        allowed_tool_names=_allowed_tools,
+    )
+    # Resolve short id (e.g. "opus-4-7") to the full API id so the SDK
+    # dispatches to the exact model regardless of its slug aliasing.
+    resolved_model = _resolve_model_api_id(model)
+
+    agent_opts = dict(
+        system_prompt=program,
+        cwd=str(PROJECT_ROOT / "auto_trader"),
+        model=resolved_model,
+        setting_sources=["project"],
+        allowed_tools=["Skill", "Read"] + _resolve_allowed_mcp_tools(),
+        mcp_servers={"auto_trader": auto_trader_tools},
+        permission_mode="acceptEdits",
+        max_turns=50,
+    )
+    # Opus 4.7 rejects the legacy thinking.type='enabled' shape the CLI
+    # defaults to. Force adaptive thinking for 4.7 only; leave other
+    # models on their defaults so we don't alter working behavior.
+    if resolved_model == "claude-opus-4-7":
+        agent_opts["thinking"] = {"type": "adaptive"}
+
     try:
         async for message in query(
             prompt=prompt,
-            options=ClaudeAgentOptions(
-                system_prompt=program,
-                cwd=str(PROJECT_ROOT / "auto_trader"),
-                model=model,
-                setting_sources=["project"],
-                allowed_tools=[
-                    "Skill", "Read",
-                    "mcp__auto_trader__query_market_data",
-                    "mcp__auto_trader__validate_portfolio",
-                ],
-                mcp_servers={"auto_trader": auto_trader_tools},
-                permission_mode="acceptEdits",
-                max_turns=50,
-            ),
+            options=ClaudeAgentOptions(**agent_opts),
         ):
             msg_type = type(message).__name__
             # Capture session_id from any message that has it
@@ -446,6 +625,16 @@ Remember: query the data first, don't guess. Explore before you commit."""
                         agent_output.append(block.text)
                         # Emit short reasoning snippets
                         text = block.text.strip()
+                        if text and len(text) > 10:
+                            emit_event(run_id, "agent_thinking", {
+                                "experiment_number": iteration,
+                                "text": text[:300],
+                            })
+                    elif block_type == "ThinkingBlock":
+                        # Extended-thinking content (Opus 4.6 explicit budget /
+                        # Opus 4.7 adaptive). Surface it so the live activity
+                        # reflects actual reasoning, not just narrative text.
+                        text = (getattr(block, "thinking", "") or "").strip()
                         if text and len(text) > 10:
                             emit_event(run_id, "agent_thinking", {
                                 "experiment_number": iteration,
@@ -504,6 +693,15 @@ Remember: query the data first, don't guess. Explore before you commit."""
         thesis = str(thesis_obj)
         assumptions = thesis_data.get("assumptions", [])
     portfolio_config = thesis_data.get("portfolio", {})
+    # Agent's reflection on prior experiments. Stored for UI display only —
+    # deliberately NOT surfaced in build_history_context to keep next
+    # iterations unbiased by prior self-interpretation.
+    lessons = thesis_data.get("lessons")
+    if isinstance(lessons, str):
+        lessons = lessons.strip() or None
+    elif lessons is not None:
+        # Agent emitted a non-string; coerce to string rather than dropping.
+        lessons = json.dumps(lessons, default=str)
 
     print(f"  Thesis: {thesis[:100]}...")
     print(f"  Sleeves: {len(portfolio_config.get('sleeves', []))}")
@@ -516,7 +714,13 @@ Remember: query the data first, don't guess. Explore before you commit."""
     # Run backtest
     print(f"  Running backtest ({backtest_start} to {backtest_end})...")
     emit_event(run_id, "backtest_started", {"experiment_number": iteration})
-    metrics = run_backtest(portfolio_config, backtest_start, backtest_end, initial_capital, sector=sector)
+    bt_result = run_backtest(portfolio_config, backtest_start, backtest_end, initial_capital, sector=sector)
+
+    if bt_result is None:
+        metrics = None
+    else:
+        metrics = bt_result["metrics"]
+        sleeve_trades = bt_result["sleeve_trades"]
 
     if metrics is None:
         exp_id = log_experiment(
@@ -528,6 +732,7 @@ Remember: query the data first, don't guess. Explore before you commit."""
             backtest_start=backtest_start, backtest_end=backtest_end,
             initial_capital=initial_capital, model=model,
             session_id=session_id, duration_seconds=time.time() - t0, error="Backtest failed",
+            lessons=lessons,
         )
         return {"decision": "discard", "error": "backtest_failed", "id": exp_id}
 
@@ -563,7 +768,22 @@ Remember: query the data first, don't guess. Explore before you commit."""
         initial_capital=initial_capital, model=model,
         session_id=session_id, duration_seconds=duration_total,
         portfolio_id=portfolio_id,
+        lessons=lessons,
     )
+
+    # Persist trades per sleeve under source_type='experiment'.
+    # Failure here is enrichment loss only — the experiment row is already saved.
+    try:
+        from deploy_engine import persist_trades
+        total = 0
+        for sleeve in sleeve_trades:
+            if sleeve["trades"]:
+                total += persist_trades("experiment", exp_id, sleeve["trades"],
+                                        sleeve_label=sleeve["label"])
+        if total:
+            print(f"  💾 {total} trade(s) persisted for {exp_id}")
+    except Exception as e:
+        print(f"  ⚠ Trade persist failed for {exp_id}: {e}")
 
     print(f"  {target_metric}: {target_value:.4f}" if target_value else f"  {target_metric}: N/A")
     print(f"  Conditions met: {conditions_met}")
@@ -624,6 +844,9 @@ async def main():
     parser.add_argument("--model", type=str, default="sonnet", help="Claude model (sonnet, opus, haiku)")
     parser.add_argument("--history", type=int, default=10, help="Past experiments to show agent")
     parser.add_argument("--prompt-file", type=str, default=None, help="Path to prompt file (from API)")
+    parser.add_argument("--allowed-tools", type=str, default=None,
+                        help="JSON array of MCP tool names this agent may call. "
+                             "Omit (or pass empty) for 'all current tools'. '[]' disables all MCP tools.")
     parser.add_argument("--starting-portfolio", type=str, default=None, help="Path to starting portfolio config JSON")
     parser.add_argument("--sector", type=str, default=None, help="Restrict data queries to this sector")
     parser.add_argument("--alpha-benchmark", type=str, default="market", help="Benchmark: sector or market")
@@ -641,6 +864,19 @@ async def main():
     if args.prompt_file and Path(args.prompt_file).exists():
         global _custom_prompt
         _custom_prompt = Path(args.prompt_file).read_text()
+
+    # Per-agent MCP tool allowlist. None = all current tools.
+    if args.allowed_tools:
+        global _allowed_tools
+        try:
+            parsed = json.loads(args.allowed_tools)
+        except json.JSONDecodeError as e:
+            print(f"Invalid --allowed-tools JSON: {e}")
+            return
+        if not isinstance(parsed, list) or not all(isinstance(n, str) for n in parsed):
+            print(f"--allowed-tools must be a JSON array of strings; got {parsed!r}")
+            return
+        _allowed_tools = parsed
 
     # Stop flag path
     stop_flag = PROJECT_ROOT / "auto_trader" / f".stop_{run_id}"
@@ -685,15 +921,17 @@ async def main():
             print(f"  Portfolio: {sp_name} ({len(sleeves)} sleeves)")
             print(f"  Running backtest ({args.start} to {args.end})...")
 
-            metrics = run_backtest(sp_config, args.start, args.end, args.capital)
+            bt_result = run_backtest(sp_config, args.start, args.end, args.capital)
 
-            if metrics:
+            if bt_result:
+                metrics = bt_result["metrics"]
+                sp_sleeve_trades = bt_result["sleeve_trades"]
                 target_value = metrics.get(args.metric)
                 conditions_met_flag, cond_detail = check_conditions(metrics, conditions)
 
                 decision = "keep" if conditions_met_flag and target_value is not None else "discard"
 
-                log_experiment(
+                exp_id = log_experiment(
                     run_id=run_id, iteration=0,
                     thesis=f"User-provided starting portfolio: {sp_name}",
                     assumptions=["Starting point for optimization"],
@@ -705,6 +943,16 @@ async def main():
                     backtest_start=args.start, backtest_end=args.end,
                     initial_capital=args.capital, model="none",
                 )
+
+                # Persist trades for the starting portfolio experiment
+                try:
+                    from deploy_engine import persist_trades
+                    for sleeve in sp_sleeve_trades:
+                        if sleeve["trades"]:
+                            persist_trades("experiment", exp_id, sleeve["trades"],
+                                           sleeve_label=sleeve["label"])
+                except Exception as e:
+                    print(f"  ⚠ Trade persist failed for {exp_id}: {e}")
 
                 if decision == "keep":
                     best_value = target_value

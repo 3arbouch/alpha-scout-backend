@@ -755,12 +755,14 @@ def _precompute_fundamental_condition(condition_config: dict, symbols: list[str]
                     symbol,
                     threshold=condition_config.get("threshold", 50.0),
                     start=start, end=end,
+                    conn=conn,
                 )
             elif ctype == "revenue_accelerating":
                 raw = find_revenue_acceleration(
                     symbol,
                     min_quarters=condition_config.get("min_quarters", 2),
                     start=start, end=end,
+                    conn=conn,
                 )
             elif ctype == "margin_expanding":
                 raw = find_margin_expansion(
@@ -768,6 +770,7 @@ def _precompute_fundamental_condition(condition_config: dict, symbols: list[str]
                     metric=condition_config.get("metric", "net_margin"),
                     min_quarters=condition_config.get("min_quarters", 2),
                     start=start, end=end,
+                    conn=conn,
                 )
             elif ctype == "margin_turnaround":
                 raw = find_margin_turnaround(
@@ -776,6 +779,7 @@ def _precompute_fundamental_condition(condition_config: dict, symbols: list[str]
                     threshold_bps=condition_config.get("threshold_bps", 1000.0),
                     min_quarters=condition_config.get("min_quarters", 2),
                     start=start, end=end,
+                    conn=conn,
                 )
             elif ctype == "relative_performance":
                 raw = find_relative_outperformance(
@@ -955,6 +959,7 @@ def _precompute_exit_signals(config: dict, symbols: list[str], conn) -> dict:
                         require_margin_compression=cond.get("require_margin_compression", True),
                         margin_metric=cond.get("metric", "net_margin"),
                         start=bt_start, end=bt_end,
+                        conn=conn,
                     )
                 elif ctype == "margin_collapse":
                     raw = find_margin_collapse(
@@ -963,6 +968,7 @@ def _precompute_exit_signals(config: dict, symbols: list[str], conn) -> dict:
                         threshold_bps=cond.get("threshold_bps", -500),
                         min_quarters=cond.get("min_quarters", 2),
                         start=bt_start, end=bt_end,
+                        conn=conn,
                     )
                 else:
                     continue
@@ -1745,31 +1751,47 @@ def run_backtest(config: dict, force_close_at_end: bool = True,
 
     # --- Compute benchmarks ---
     universe_sector = config.get("universe", {}).get("sector")
-    ann_return = metrics["annualized_return_pct"]
+    ann_return = metrics.get("annualized_return_pct")
+    period_total_return = metrics.get("total_return_pct")
+
+    def _populate(bench: dict | None, prefix: str):
+        """Always-honest period metrics; gated annualized alpha (None when
+        either side lacks an annualized value — short window or missing data)."""
+        if not bench:
+            return
+        bm = bench["metrics"]
+        bench_total = bm.get("total_return_pct")
+        bench_ann = bm.get("annualized_return_pct")
+
+        metrics[f"{prefix}_benchmark_return_pct"] = bench_total
+        if period_total_return is not None and bench_total is not None:
+            metrics[f"period_excess_vs_{prefix}_pct"] = round(
+                period_total_return - bench_total, 2)
+
+        if bench_ann is not None and ann_return is not None:
+            metrics[f"alpha_vs_{prefix}_pct"] = round(ann_return - bench_ann, 2)
+            metrics[f"{prefix}_benchmark_ann_return_pct"] = bench_ann
+        else:
+            metrics[f"alpha_vs_{prefix}_pct"] = None
+            metrics[f"{prefix}_benchmark_ann_return_pct"] = None
 
     # Market benchmark (SPY) — always compute
     print("Computing benchmark (S&P 500)...")
     market_benchmark = compute_benchmark(trading_dates, initial_cash, sector=None)
+    _populate(market_benchmark, "market")
     if market_benchmark:
-        market_ann = market_benchmark["metrics"]["annualized_return_pct"]
-        metrics["alpha_vs_market_pct"] = round(ann_return - market_ann, 2)
-        metrics["market_benchmark_return_pct"] = market_benchmark["metrics"]["total_return_pct"]
-        metrics["market_benchmark_ann_return_pct"] = market_benchmark["metrics"]["annualized_return_pct"]
-        # Backward compat
-        metrics["benchmark_return_pct"] = market_benchmark["metrics"]["total_return_pct"]
-        metrics["benchmark_ann_return_pct"] = market_benchmark["metrics"]["annualized_return_pct"]
-        metrics["alpha_ann_pct"] = metrics["alpha_vs_market_pct"]
+        # Backward-compat aliases for older readers (experiments table, etc.)
+        metrics["benchmark_return_pct"] = market_benchmark["metrics"].get("total_return_pct")
+        metrics["benchmark_ann_return_pct"] = market_benchmark["metrics"].get("annualized_return_pct")
+        metrics["alpha_ann_pct"] = metrics.get("alpha_vs_market_pct")
 
     # Sector benchmark — compute if strategy has a sector universe
     benchmark = market_benchmark
     if universe_sector and universe_sector in SECTOR_ETF_MAP:
         print(f"Computing benchmark ({SECTOR_ETF_MAP[universe_sector]})...")
         sector_benchmark = compute_benchmark(trading_dates, initial_cash, sector=universe_sector)
+        _populate(sector_benchmark, "sector")
         if sector_benchmark:
-            sector_ann = sector_benchmark["metrics"]["annualized_return_pct"]
-            metrics["alpha_vs_sector_pct"] = round(ann_return - sector_ann, 2)
-            metrics["sector_benchmark_return_pct"] = sector_benchmark["metrics"]["total_return_pct"]
-            metrics["sector_benchmark_ann_return_pct"] = sector_benchmark["metrics"]["annualized_return_pct"]
             benchmark = sector_benchmark
 
     from datetime import datetime, timezone
@@ -2048,6 +2070,16 @@ SECTOR_ETF_MAP = {
 }
 
 
+# Minimum trading-day sample required to annualize a return without
+# misleading the reader. 60d ≈ 3 calendar months — standard convention
+# below which Sharpe/Sortino/ann return have CIs on the order of the
+# point estimate itself. Below this we report only realized period metrics.
+MIN_TRADING_DAYS_FOR_ANNUALIZATION = 60
+
+# Minimum to compute *any* benchmark output (need ≥2 prices to compute a return).
+MIN_TRADING_DAYS_FOR_BENCHMARK = 2
+
+
 def compute_benchmark(trading_dates: list[str], initial_cash: float,
                       conn=None, sector: str = None) -> dict:
     """
@@ -2056,8 +2088,12 @@ def compute_benchmark(trading_dates: list[str], initial_cash: float,
     If sector is provided, uses the sector ETF (e.g. XLK for Technology).
     Falls back to SPY / S&P 500 index for multi-sector or unknown sectors.
 
-    Returns:
-        {symbol, nav_history: [{date, nav, daily_pnl_pct}], metrics: {...}}
+    Returns a dict with always-honest realized period metrics. Annualized
+    metrics are only included when the sample is statistically meaningful
+    (>= MIN_TRADING_DAYS_FOR_ANNUALIZATION); otherwise they are explicitly
+    set to None so the UI can render "—" rather than a fabricated number.
+
+    Returns None only when there isn't enough data to compute a return at all.
     """
     price_dict = {}
     bench_symbol = None
@@ -2074,7 +2110,7 @@ def compute_benchmark(trading_dates: list[str], initial_cash: float,
         conn = get_connection()
     for sym in candidates:
         prices = get_prices(sym, start=trading_dates[0], end=trading_dates[-1], conn=conn)
-        if prices and len(prices) > 10:
+        if prices and len(prices) >= MIN_TRADING_DAYS_FOR_BENCHMARK:
             bench_symbol = sym
             price_dict = {d: c for d, c in prices}
             break
@@ -2096,13 +2132,13 @@ def compute_benchmark(trading_dates: list[str], initial_cash: float,
                             c = r.get("close")
                             if d and c and trading_dates[0] <= d <= trading_dates[-1]:
                                 price_dict[d] = c
-                        if len(price_dict) > 10:
+                        if len(price_dict) >= MIN_TRADING_DAYS_FOR_BENCHMARK:
                             bench_symbol = label
                             break
                 except (json.JSONDecodeError, KeyError):
                     continue
 
-    if not bench_symbol or len(price_dict) < 10:
+    if not bench_symbol or len(price_dict) < MIN_TRADING_DAYS_FOR_BENCHMARK:
         return None
 
     # Buy-and-hold: invest initial_cash on day 1
@@ -2128,17 +2164,16 @@ def compute_benchmark(trading_dates: list[str], initial_cash: float,
         })
         prev_nav = nav
 
-    if not nav_history:
+    if len(nav_history) < MIN_TRADING_DAYS_FOR_BENCHMARK:
         return None
 
+    # ---- Realized period metrics (always honest, regardless of sample size) ----
     final_nav = nav_history[-1]["nav"]
     total_return = ((final_nav - initial_cash) / initial_cash) * 100
-    calendar_days = (datetime.strptime(trading_dates[-1], "%Y-%m-%d") -
-                     datetime.strptime(trading_dates[0], "%Y-%m-%d")).days
-    years = max(calendar_days / 365.25, 0.01)
-    ann_return = ((final_nav / initial_cash) ** (1 / years) - 1) * 100 if years > 0 else 0
 
-    # Max drawdown
+    # Max drawdown is a realized observation (worst peak-to-trough that
+    # actually occurred in the window), not a statistical estimate, so it's
+    # safe to report at any sample size — just label the window in the UI.
     peak = 0
     max_dd = 0
     for point in nav_history:
@@ -2148,14 +2183,37 @@ def compute_benchmark(trading_dates: list[str], initial_cash: float,
         if dd < max_dd:
             max_dd = dd
 
+    n = len(nav_history)
+
+    # ---- Statistical / projection metrics (gated by sample size) ----
+    # Annualized return is a projection: it scales the period return up to a
+    # full year. On short windows a single noisy day swings it wildly. Hide
+    # it (return None) until the sample is large enough that the projection
+    # is at least directionally meaningful.
+    if n >= MIN_TRADING_DAYS_FOR_ANNUALIZATION:
+        # Annualize using *trading* days, not calendar days, to stay
+        # consistent with how Sharpe et al. are conventionally annualized
+        # (sqrt(252)). Calendar-day annualization mixes incompatible units
+        # with the Sharpe denominator.
+        years = n / 252.0
+        ann_return = ((final_nav / initial_cash) ** (1 / years) - 1) * 100
+        ann_return_out = round(ann_return, 2)
+    else:
+        ann_return_out = None
+
     return {
         "symbol": bench_symbol,
         "nav_history": nav_history,
+        "trading_days": n,
+        "min_days_for_annualization": MIN_TRADING_DAYS_FOR_ANNUALIZATION,
+        "partial": n < MIN_TRADING_DAYS_FOR_ANNUALIZATION,
         "metrics": {
+            # Realized period metrics — always populated when benchmark exists.
             "total_return_pct": round(total_return, 2),
-            "annualized_return_pct": round(ann_return, 2),
             "max_drawdown_pct": round(max_dd, 2),
             "final_nav": round(final_nav, 2),
+            # Statistical metrics — None when sample is too short to be honest.
+            "annualized_return_pct": ann_return_out,
         },
     }
 
@@ -2173,11 +2231,15 @@ def compute_metrics(portfolio: Portfolio, initial_cash: float,
     final_nav = nav_series[-1]["nav"]
     total_return = ((final_nav - initial_cash) / initial_cash) * 100
 
-    # Annualized return (calendar days / 365.25, per GIPS/CFA standard)
-    calendar_days = (datetime.strptime(trading_dates[-1], "%Y-%m-%d") -
-                     datetime.strptime(trading_dates[0], "%Y-%m-%d")).days
-    years = max(calendar_days / 365.25, 0.01)
-    ann_return = ((final_nav / initial_cash) ** (1 / years) - 1) * 100 if years > 0 else 0
+    # Annualized return — only when the sample is statistically meaningful.
+    # Annualize using *trading* days (n/252) to stay consistent with the
+    # sqrt(252) convention used by Sharpe/vol below.
+    n_nav = len(nav_series)
+    if n_nav >= MIN_TRADING_DAYS_FOR_ANNUALIZATION:
+        years = n_nav / 252.0
+        ann_return = ((final_nav / initial_cash) ** (1 / years) - 1) * 100
+    else:
+        ann_return = None
 
     # Max drawdown
     peak_nav = 0
@@ -2225,46 +2287,43 @@ def compute_metrics(portfolio: Portfolio, initial_cash: float,
         if prev_nav > 0:
             daily_returns.append((nav_series[i]["nav"] - prev_nav) / prev_nav)
 
-    if daily_returns:
+    # Risk-free rate is used for Sharpe/Sortino. Loaded regardless so we can
+    # report it even when downstream stats are gated off.
+    risk_free_ann = 0.0
+    try:
+        treasury_path = Path(__file__).parent.parent / "data" / "macro" / "treasury-rates.json"
+        if treasury_path.exists():
+            treasury_data = json.loads(treasury_path.read_text())
+            t_rates = treasury_data.get("data", treasury_data) if isinstance(treasury_data, dict) else treasury_data
+            start_date = nav_series[0]["date"]
+            end_date = nav_series[-1]["date"]
+            period_rates = [r["month3"] for r in t_rates
+                           if start_date <= r["date"] <= end_date and r.get("month3") is not None]
+            if period_rates:
+                risk_free_ann = sum(period_rates) / len(period_rates)
+    except Exception:
+        risk_free_ann = 2.0
+
+    # Statistical risk metrics — gated by sample size for the same reason as
+    # ann_return above. With <60 daily returns, std() and Sharpe have CIs on
+    # the order of the point estimate; reporting them is misleading.
+    if daily_returns and ann_return is not None:
         import statistics
         import math
 
         daily_std = statistics.stdev(daily_returns) if len(daily_returns) > 1 else 0
         ann_vol = daily_std * (252 ** 0.5) * 100
-
-        # Load risk-free rate from treasury data (3-month T-bill)
-        # Use average rate over the backtest period for accuracy
-        risk_free_ann = 0.0
-        try:
-            treasury_path = Path(__file__).parent.parent / "data" / "macro" / "treasury-rates.json"
-            if treasury_path.exists():
-                treasury_data = json.loads(treasury_path.read_text())
-                t_rates = treasury_data.get("data", treasury_data) if isinstance(treasury_data, dict) else treasury_data
-                # Filter to backtest date range
-                start_date = nav_series[0]["date"]
-                end_date = nav_series[-1]["date"]
-                period_rates = [r["month3"] for r in t_rates
-                               if start_date <= r["date"] <= end_date and r.get("month3") is not None]
-                if period_rates:
-                    risk_free_ann = sum(period_rates) / len(period_rates)  # already in % terms
-        except Exception:
-            risk_free_ann = 2.0  # Conservative default when treasury data unavailable
-
-        # Sharpe = (annualized return - risk-free rate) / annualized volatility
         excess_return = ann_return - risk_free_ann
         sharpe = excess_return / ann_vol if ann_vol > 0 else 0
 
-        # Sortino = (annualized return - risk-free rate) / annualized downside deviation
-        # Downside deviation: use ALL returns, replace positives with 0
-        daily_rf = risk_free_ann / 100 / 252  # convert annual % to daily decimal
+        daily_rf = risk_free_ann / 100 / 252
         downside_sq = [min(r - daily_rf, 0) ** 2 for r in daily_returns]
         downside_dev = math.sqrt(sum(downside_sq) / len(downside_sq)) * math.sqrt(252) * 100
         sortino = excess_return / downside_dev if downside_dev > 0 else 0
     else:
-        ann_vol = 0
-        sharpe = 0
-        sortino = 0
-        risk_free_ann = 0.0
+        ann_vol = None
+        sharpe = None
+        sortino = None
 
     # Utilized capital metrics
     positions_values = [p["positions_value"] for p in nav_series]
@@ -2276,12 +2335,25 @@ def compute_metrics(portfolio: Portfolio, initial_cash: float,
     )
     utilization_pct = (avg_utilized_capital / initial_cash) * 100 if initial_cash > 0 else 0
 
+    def _r(v, ndigits=2):
+        return None if v is None else round(v, ndigits)
+
     return {
+        # Realized period metrics — always populated when there's NAV data.
         "total_return_pct": round(total_return, 2),
-        "annualized_return_pct": round(ann_return, 2),
         "max_drawdown_pct": round(max_dd, 2),
         "max_drawdown_date": max_dd_date,
         "final_nav": round(final_nav, 2),
+        # Statistical metrics — None when sample is too short to be honest.
+        "annualized_return_pct": _r(ann_return),
+        "annualized_volatility_pct": _r(ann_vol),
+        "sharpe_ratio": _r(sharpe),
+        "sortino_ratio": _r(sortino),
+        # Sample-size signal so consumers can render "—" with context.
+        "trading_days": n_nav,
+        "min_days_for_annualization": MIN_TRADING_DAYS_FOR_ANNUALIZATION,
+        "stats_partial": n_nav < MIN_TRADING_DAYS_FOR_ANNUALIZATION,
+        # Trade-based metrics — honest when there are trades.
         "total_entries": total_entries,
         "total_trades": len(real_trades),
         "wins": len(wins),
@@ -2292,9 +2364,7 @@ def compute_metrics(portfolio: Portfolio, initial_cash: float,
         "avg_loss_pct": round(avg_loss, 2),
         "avg_holding_days": round(avg_days, 1),
         "profit_factor": round(profit_factor, 2),
-        "annualized_volatility_pct": round(ann_vol, 2),
-        "sharpe_ratio": round(sharpe, 2),
-        "sortino_ratio": round(sortino, 2),
+        # Capital utilization — period observation, always honest.
         "risk_free_rate_pct": round(risk_free_ann, 2),
         "peak_utilized_capital": round(peak_utilized_capital, 2),
         "avg_utilized_capital": round(avg_utilized_capital, 2),
@@ -2410,19 +2480,22 @@ def print_report(result: dict):
     print(f"  BACKTEST REPORT: {config_name}")
     print("=" * 70)
 
+    def _fmt(v, spec=">8.2f", suffix="%"):
+        return f"{'—':>8}{suffix}" if v is None else f"{v:{spec}}{suffix}"
+
     print(f"\n  Performance")
-    print(f"  {'Total Return:':<25} {m['total_return_pct']:>8.2f}%")
-    print(f"  {'Annualized Return:':<25} {m['annualized_return_pct']:>8.2f}%")
-    print(f"  {'Max Drawdown:':<25} {m['max_drawdown_pct']:>8.2f}%  ({m['max_drawdown_date']})")
+    print(f"  {'Total Return:':<25} {_fmt(m.get('total_return_pct'))}")
+    print(f"  {'Annualized Return:':<25} {_fmt(m.get('annualized_return_pct'))}")
+    print(f"  {'Max Drawdown:':<25} {_fmt(m.get('max_drawdown_pct'))}  ({m.get('max_drawdown_date', '')})")
     print(f"  {'Final NAV:':<25} ${m['final_nav']:>12,.2f}")
     print(f"  {'Profit Factor:':<25} {m['profit_factor']:>8.2f}")
 
     # Benchmark comparison
-    if "benchmark_return_pct" in m:
+    if m.get("benchmark_return_pct") is not None:
         print(f"\n  Benchmark (S&P 500)")
-        print(f"  {'Benchmark Return:':<25} {m['benchmark_return_pct']:>8.2f}%")
-        print(f"  {'Benchmark Ann. Return:':<25} {m['benchmark_ann_return_pct']:>8.2f}%")
-        print(f"  {'Alpha (annualized):':<25} {m['alpha_ann_pct']:>8.2f}%")
+        print(f"  {'Benchmark Return:':<25} {_fmt(m.get('benchmark_return_pct'))}")
+        print(f"  {'Benchmark Ann. Return:':<25} {_fmt(m.get('benchmark_ann_return_pct'))}")
+        print(f"  {'Alpha (annualized):':<25} {_fmt(m.get('alpha_ann_pct'))}")
 
     print(f"\n  Trade Statistics")
     print(f"  {'Total Trades:':<25} {m['total_trades']:>8}")

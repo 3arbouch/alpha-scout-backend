@@ -415,6 +415,7 @@ CREATE TABLE IF NOT EXISTS auto_trader_agents (
     id              TEXT PRIMARY KEY,
     name            TEXT NOT NULL,
     prompt          TEXT NOT NULL,
+    allowed_tools   TEXT,
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL
 );
@@ -449,6 +450,7 @@ CREATE TABLE IF NOT EXISTS experiments (
     -- Agent output
     thesis                          TEXT,
     assumptions                     TEXT,
+    lessons                         TEXT,              -- agent's reflection on prior experiments (UI-only; not fed back)
     portfolio_id                    TEXT,              -- FK → portfolios.portfolio_id (lineage)
     portfolio_config                TEXT,              -- legacy: will be phased out, use portfolio_id instead
     -- Optimization target
@@ -626,8 +628,11 @@ def _apply_migrations(conn: sqlite3.Connection):
     existing_tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
     if "experiments" in existing_tables:
         _add_column_if_missing(conn, "experiments", "portfolio_id", "TEXT")
+        _add_column_if_missing(conn, "experiments", "lessons", "TEXT")
     if "deployments" in existing_tables:
         _add_column_if_missing(conn, "deployments", "portfolio_id", "TEXT")
+    if "auto_trader_agents" in existing_tables:
+        _add_column_if_missing(conn, "auto_trader_agents", "allowed_tools", "TEXT")
 
 
 def init_db(conn: sqlite3.Connection):

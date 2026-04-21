@@ -485,12 +485,18 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
 
     # Helper: resolve active allocation profile for a given date
     def _resolve_profile(active_regimes_today):
-        """Walk profile_priority, return (profile_name, weights_dict)."""
+        """Walk profile_priority, return (profile_name, weights_dict).
+
+        Always returns the inner `.weights` sub-dict of a profile, never the
+        outer profile wrapper. Previously the "default" branch returned the
+        whole {trigger, weights, ...} dict, which both crashed the transition
+        summary printer and made per-sleeve weight lookups silently return 0.
+        """
         if not allocation_profiles or not profile_priority:
             return None, None
         for pname in profile_priority:
             if pname == "default":
-                return "default", allocation_profiles.get("default", {})
+                return "default", allocation_profiles.get("default", {}).get("weights", {})
             pdef = allocation_profiles.get(pname, {})
             triggers = pdef.get("trigger", [])
             if not triggers:
@@ -501,7 +507,7 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
                 return pname, pdef.get("weights", {})
         # Fallback to default
         if "default" in allocation_profiles:
-            return "default", allocation_profiles.get("default", {})
+            return "default", allocation_profiles.get("default", {}).get("weights", {})
         return None, None
 
     all_dates_index = {d: idx for idx, d in enumerate(all_dates)}
@@ -811,11 +817,16 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
         last_nav = combined_nav_history[-1]["nav"]
         total_return = (last_nav / initial_capital - 1) * 100
 
-        # Annualized return
-        days = (datetime.strptime(all_dates[-1], "%Y-%m-%d") -
-                datetime.strptime(all_dates[0], "%Y-%m-%d")).days
-        years = max(days / 365.25, 0.01)
-        ann_return = ((last_nav / initial_capital) ** (1 / years) - 1) * 100
+        # Annualized return — gated by trading-day sample size, consistent
+        # with the per-sleeve and benchmark sides. Below the gate the metric
+        # would be a wild extrapolation of noise; we report None instead.
+        from backtest_engine import MIN_TRADING_DAYS_FOR_ANNUALIZATION
+        n_nav = len(combined_nav_history)
+        if n_nav >= MIN_TRADING_DAYS_FOR_ANNUALIZATION:
+            years = n_nav / 252.0
+            ann_return = ((last_nav / initial_capital) ** (1 / years) - 1) * 100
+        else:
+            ann_return = None
 
         # Max drawdown
         peak = initial_capital
@@ -843,41 +854,34 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
         except Exception:
             risk_free_ann = 2.0  # conservative default
 
-        # Sharpe = (annualized return - risk-free rate) / annualized volatility
-        if len(combined_nav_history) > 1:
-            daily_returns = []
-            for j in range(1, len(combined_nav_history)):
-                prev = combined_nav_history[j-1]["nav"]
-                curr = combined_nav_history[j]["nav"]
-                if prev > 0:
-                    daily_returns.append(curr / prev - 1)
-            if daily_returns:
-                import statistics
-                import math
-                ann_vol = statistics.stdev(daily_returns) * (252 ** 0.5) * 100 if len(daily_returns) > 1 else 0
-                excess_return = ann_return - risk_free_ann
-                sharpe = excess_return / ann_vol if ann_vol > 0 else 0
-            else:
-                sharpe = 0
-                ann_vol = 0
-        else:
-            sharpe = 0
-            ann_vol = 0
-            daily_returns = []
+        # Sharpe / Sortino / Calmar — all built from the gated ann_return.
+        # When ann_return is None (short window), the entire group is None.
+        daily_returns = []
+        for j in range(1, len(combined_nav_history)):
+            prev = combined_nav_history[j-1]["nav"]
+            curr = combined_nav_history[j]["nav"]
+            if prev > 0:
+                daily_returns.append(curr / prev - 1)
 
-        # Sortino = (annualized return - risk-free rate) / annualized downside deviation
-        # Downside deviation: sqrt(mean([min(r - daily_rf, 0)^2 for ALL r])) * sqrt(252)
-        if daily_returns:
-            daily_rf = risk_free_ann / 100 / 252  # annual % to daily decimal
+        if daily_returns and ann_return is not None:
+            import statistics
+            import math
+            ann_vol = statistics.stdev(daily_returns) * (252 ** 0.5) * 100 if len(daily_returns) > 1 else 0
+            excess_return = ann_return - risk_free_ann
+            sharpe = excess_return / ann_vol if ann_vol > 0 else 0
+
+            daily_rf = risk_free_ann / 100 / 252
             downside_sq = [min(r - daily_rf, 0) ** 2 for r in daily_returns]
             downside_dev = math.sqrt(sum(downside_sq) / len(downside_sq)) * math.sqrt(252) * 100
-            excess_return = ann_return - risk_free_ann
             sortino = excess_return / downside_dev if downside_dev > 0 else 0
-        else:
-            sortino = 0
 
-        # Calmar ratio (ann return / max DD)
-        calmar = abs(ann_return / max_dd) if max_dd < 0 else 0
+            # Calmar = ann return / |max drawdown|
+            calmar = abs(ann_return / max_dd) if max_dd < 0 else 0
+        else:
+            ann_vol = None
+            sharpe = None
+            sortino = None
+            calmar = None
 
         # Max drawdown date
         peak = initial_capital
@@ -922,17 +926,25 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
             (total_pnl / avg_utilized_capital) * 100 if avg_utilized_capital > 0 else 0, 2
         )
 
+        def _r(v, ndigits=2):
+            return None if v is None else round(v, ndigits)
+
         portfolio_metrics = {
             "initial_capital": initial_capital,
             "final_nav": round(last_nav, 2),
             "total_return_pct": round(total_return, 2),
-            "annualized_return_pct": round(ann_return, 2),
-            "annualized_volatility_pct": round(ann_vol, 2),
             "max_drawdown_pct": round(max_dd, 2),
             "max_drawdown_date": max_dd_date,
-            "sharpe_ratio": round(sharpe, 2),
-            "sortino_ratio": round(sortino, 2),
-            "calmar_ratio": round(calmar, 2),
+            # Statistical metrics — None on short windows; UI renders "—".
+            "annualized_return_pct": _r(ann_return),
+            "annualized_volatility_pct": _r(ann_vol),
+            "sharpe_ratio": _r(sharpe),
+            "sortino_ratio": _r(sortino),
+            "calmar_ratio": _r(calmar),
+            # Sample-size signal so consumers can render explanatory text.
+            "trading_days": n_nav,
+            "min_days_for_annualization": MIN_TRADING_DAYS_FOR_ANNUALIZATION,
+            "stats_partial": n_nav < MIN_TRADING_DAYS_FOR_ANNUALIZATION,
             "profit_factor": profit_factor,
             "total_entries": total_entries,
             "closed_trades": closed,
@@ -945,7 +957,7 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
             "avg_utilized_capital": round(avg_utilized_capital, 2),
             "return_on_utilized_capital_pct": return_on_utilized_capital_pct,
             "trading_days": len(all_dates),
-            "years": round(years, 2),
+            "years": round(n_nav / 252.0, 2),
         }
     else:
         portfolio_metrics = {}
@@ -980,11 +992,13 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
             "active_days": sleeve_active_days[i],
             "gated_off_days": sleeve_gated_off_days[i],
             "total_return_pct": metrics.get("total_return_pct", 0),
-            "annualized_return_pct": metrics.get("annualized_return_pct", 0),
-            "annualized_volatility_pct": metrics.get("annualized_volatility_pct", 0),
             "max_drawdown_pct": metrics.get("max_drawdown_pct", 0),
-            "sharpe_ratio": metrics.get("sharpe_ratio", 0),
-            "sortino_ratio": metrics.get("sortino_ratio", 0),
+            # Statistical fields pass through as None on short windows
+            # rather than collapsing to 0 (which would look like a real result).
+            "annualized_return_pct": metrics.get("annualized_return_pct"),
+            "annualized_volatility_pct": metrics.get("annualized_volatility_pct"),
+            "sharpe_ratio": metrics.get("sharpe_ratio"),
+            "sortino_ratio": metrics.get("sortino_ratio"),
             "total_entries": metrics.get("total_entries", 0),
             "closed_trades": s_closed,
             "wins": s_wins,
@@ -1001,20 +1015,41 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
     bench_sector = _infer_portfolio_sector(sleeves)
     from backtest_engine import SECTOR_ETF_MAP
 
-    ann_return = portfolio_metrics.get("annualized_return_pct", 0)
+    ann_return = portfolio_metrics.get("annualized_return_pct")
+    portfolio_total_return = portfolio_metrics.get("total_return_pct")
+
+    def _populate_benchmark_fields(bench: dict | None, prefix: str):
+        """Copy realized period metrics always; annualized alpha only when both
+        portfolio and benchmark have a meaningful annualized return."""
+        if not bench:
+            return
+        bm = bench["metrics"]
+        bench_total = bm.get("total_return_pct")
+        bench_ann = bm.get("annualized_return_pct")
+
+        # Realized period metrics — always set when benchmark exists.
+        portfolio_metrics[f"{prefix}_benchmark_return_pct"] = bench_total
+        if portfolio_total_return is not None and bench_total is not None:
+            portfolio_metrics[f"period_excess_vs_{prefix}_pct"] = round(
+                portfolio_total_return - bench_total, 2)
+
+        # Annualized stats — only when both sides cleared the sample-size gate.
+        if bench_ann is not None and ann_return is not None:
+            portfolio_metrics[f"alpha_vs_{prefix}_pct"] = round(ann_return - bench_ann, 2)
+            portfolio_metrics[f"{prefix}_benchmark_ann_return_pct"] = bench_ann
+        else:
+            portfolio_metrics[f"alpha_vs_{prefix}_pct"] = None
+            portfolio_metrics[f"{prefix}_benchmark_ann_return_pct"] = None
 
     # Market benchmark (SPY) — always compute
     print(f"\nComputing benchmark (S&P 500)...")
     market_benchmark = compute_benchmark(all_dates, initial_capital, sector=None)
+    _populate_benchmark_fields(market_benchmark, "market")
     if market_benchmark:
-        market_ann = market_benchmark["metrics"]["annualized_return_pct"]
-        portfolio_metrics["alpha_vs_market_pct"] = round(ann_return - market_ann, 2)
-        portfolio_metrics["market_benchmark_return_pct"] = market_benchmark["metrics"]["total_return_pct"]
-        portfolio_metrics["market_benchmark_ann_return_pct"] = market_benchmark["metrics"]["annualized_return_pct"]
-        # Keep backward compat fields
-        portfolio_metrics["benchmark_return_pct"] = market_benchmark["metrics"]["total_return_pct"]
-        portfolio_metrics["benchmark_ann_return_pct"] = market_benchmark["metrics"]["annualized_return_pct"]
-        portfolio_metrics["alpha_ann_pct"] = portfolio_metrics["alpha_vs_market_pct"]
+        # Backward-compat aliases for older readers (experiments table, UIs).
+        portfolio_metrics["benchmark_return_pct"] = market_benchmark["metrics"].get("total_return_pct")
+        portfolio_metrics["benchmark_ann_return_pct"] = market_benchmark["metrics"].get("annualized_return_pct")
+        portfolio_metrics["alpha_ann_pct"] = portfolio_metrics.get("alpha_vs_market_pct")
 
     # Sector benchmark — compute if single-sector portfolio
     benchmark = market_benchmark
@@ -1022,11 +1057,8 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
     if bench_sector and bench_sector in SECTOR_ETF_MAP:
         print(f"Computing benchmark ({SECTOR_ETF_MAP[bench_sector]})...")
         sector_benchmark = compute_benchmark(all_dates, initial_capital, sector=bench_sector)
+        _populate_benchmark_fields(sector_benchmark, "sector")
         if sector_benchmark:
-            sector_ann = sector_benchmark["metrics"]["annualized_return_pct"]
-            portfolio_metrics["alpha_vs_sector_pct"] = round(ann_return - sector_ann, 2)
-            portfolio_metrics["sector_benchmark_return_pct"] = sector_benchmark["metrics"]["total_return_pct"]
-            portfolio_metrics["sector_benchmark_ann_return_pct"] = sector_benchmark["metrics"]["annualized_return_pct"]
             benchmark = sector_benchmark
 
     # -----------------------------------------------------------------------
@@ -1035,16 +1067,26 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
     print(f"\n{'=' * 70}")
     print(f"PORTFOLIO RESULTS: {name}")
     print(f"{'=' * 70}")
-    print(f"  Total Return:     {portfolio_metrics.get('total_return_pct', 0):+.2f}%")
-    print(f"  Annualized:       {portfolio_metrics.get('annualized_return_pct', 0):+.2f}%")
-    print(f"  Max Drawdown:     {portfolio_metrics.get('max_drawdown_pct', 0):.2f}%")
-    print(f"  Sharpe Ratio:     {portfolio_metrics.get('sharpe_ratio', 0):.2f}")
+    def _fmt(v, spec="+.2f", suffix="%"):
+        return "—" if v is None else f"{v:{spec}}{suffix}"
+
+    print(f"  Total Return:     {_fmt(portfolio_metrics.get('total_return_pct'))}")
+    print(f"  Annualized:       {_fmt(portfolio_metrics.get('annualized_return_pct'))}")
+    print(f"  Max Drawdown:     {_fmt(portfolio_metrics.get('max_drawdown_pct'), '.2f')}")
+    print(f"  Sharpe Ratio:     {_fmt(portfolio_metrics.get('sharpe_ratio'), '.2f', '')}")
     if market_benchmark:
-        print(f"  Benchmark (SPY):  {portfolio_metrics.get('market_benchmark_return_pct', 0):+.2f}%")
-        print(f"  Alpha vs Market:  {portfolio_metrics.get('alpha_vs_market_pct', 0):+.2f}%")
-    if portfolio_metrics.get("alpha_vs_sector_pct") is not None:
-        print(f"  Benchmark ({SECTOR_ETF_MAP.get(bench_sector, '?')}):  {portfolio_metrics.get('sector_benchmark_return_pct', 0):+.2f}%")
-        print(f"  Alpha vs Sector:  {portfolio_metrics.get('alpha_vs_sector_pct', 0):+.2f}%")
+        print(f"  Benchmark (SPY):  {_fmt(portfolio_metrics.get('market_benchmark_return_pct'))}")
+        if portfolio_metrics.get("period_excess_vs_market_pct") is not None:
+            print(f"  Excess vs Market: {_fmt(portfolio_metrics.get('period_excess_vs_market_pct'))} (period)")
+        if portfolio_metrics.get("alpha_vs_market_pct") is not None:
+            print(f"  Alpha vs Market:  {_fmt(portfolio_metrics.get('alpha_vs_market_pct'))} (annualized)")
+    if sector_benchmark:
+        print(f"  Benchmark ({SECTOR_ETF_MAP.get(bench_sector, '?')}):  "
+              f"{_fmt(portfolio_metrics.get('sector_benchmark_return_pct'))}")
+        if portfolio_metrics.get("period_excess_vs_sector_pct") is not None:
+            print(f"  Excess vs Sector: {_fmt(portfolio_metrics.get('period_excess_vs_sector_pct'))} (period)")
+        if portfolio_metrics.get("alpha_vs_sector_pct") is not None:
+            print(f"  Alpha vs Sector:  {_fmt(portfolio_metrics.get('alpha_vs_sector_pct'))} (annualized)")
 
     print(f"\n  Per-Sleeve Breakdown:")
     for s in per_sleeve_summary:

@@ -972,390 +972,71 @@ def _print_selloffs(results, show_recovery=False):
         print()
 
 
-# ---------------------------------------------------------------------------
-# Fundamental Signal Detectors
-# ---------------------------------------------------------------------------
-
-def _load_quarterly_income(symbol: str) -> list[dict]:
-    """Load quarterly income statements sorted chronologically."""
-    path = DATA_DIR / "fundamentals" / "income" / f"{symbol}.json"
-    if not path.exists():
-        return []
-    with open(path) as f:
-        data = json.load(f).get("data", [])
-    qtrs = [q for q in data if q.get("period", "").startswith("Q")]
-    qtrs.sort(key=lambda x: x["date"])
-    return qtrs
-
-
-def _quarter_key(q: dict) -> str:
-    """Return 'YYYY-QN' key for matching same quarter across years."""
-    return f"{q['date'][:4]}-{q['period']}"
-
-
-def _find_prior_year_quarter(qtrs: list[dict], target: dict) -> dict | None:
-    """Find the same fiscal quarter one year prior."""
-    target_period = target.get("period")
-    target_year = int(target["date"][:4])
-    for q in qtrs:
-        if q.get("period") == target_period and int(q["date"][:4]) == target_year - 1:
-            return q
-    return None
-
-
-def _compute_yoy_revenue_growth(qtrs: list[dict]) -> list[dict]:
-    """
-    For each quarter, compute YoY revenue growth %.
-    Returns list of {date, filingDate, revenue, yoy_growth, net_margin, op_margin} sorted by date.
-    """
-    results = []
-    for q in qtrs:
-        rev = q.get("revenue", 0)
-        if not rev or rev <= 0:
-            continue
-        prior = _find_prior_year_quarter(qtrs, q)
-        if not prior or not prior.get("revenue") or prior["revenue"] <= 0:
-            continue
-        yoy = (rev / prior["revenue"] - 1) * 100
-        ni = q.get("netIncome", 0) or 0
-        oi = q.get("operatingIncome", 0) or 0
-        prior_ni = prior.get("netIncome", 0) or 0
-        prior_oi = prior.get("operatingIncome", 0) or 0
-        results.append({
-            "date": q["date"],  # fiscal quarter end
-            "filingDate": q.get("filingDate", q["date"]),  # when market knows
-            "period": q.get("period"),
-            "revenue": rev,
-            "prior_revenue": prior["revenue"],
-            "yoy_growth": yoy,
-            "net_margin": ni / rev * 100 if rev else 0,
-            "prior_net_margin": prior_ni / prior["revenue"] * 100 if prior["revenue"] else 0,
-            "op_margin": oi / rev * 100 if rev else 0,
-            "prior_op_margin": prior_oi / prior["revenue"] * 100 if prior["revenue"] else 0,
-            "net_income": ni,
-            "operating_income": oi,
-        })
-    results.sort(key=lambda x: x["date"])
-    return results
-
-
-def find_revenue_breakouts(symbol: str, threshold: float = 50.0,
-                           start: str = None, end: str = None) -> list[dict]:
-    """
-    Find quarters where YoY revenue growth >= threshold%.
-
-    Args:
-        symbol: Ticker
-        threshold: Min YoY revenue growth % (default 50)
-        start/end: Date range filter (on filingDate)
-
-    Returns:
-        List of {signal_date, date, yoy_growth, revenue, ...}
-    """
-    qtrs = _load_quarterly_income(symbol)
-    growth_data = _compute_yoy_revenue_growth(qtrs)
-    results = []
-    for g in growth_data:
-        sig_date = g["filingDate"]
-        if start and sig_date < start:
-            continue
-        if end and sig_date > end:
-            continue
-        if g["yoy_growth"] >= threshold:
-            results.append({"signal_date": sig_date, **g})
-    return results
-
-
-def find_revenue_acceleration(symbol: str, min_quarters: int = 2,
-                              start: str = None, end: str = None) -> list[dict]:
-    """
-    Find periods where YoY revenue growth rate is INCREASING for N consecutive quarters.
-
-    Signal fires on the filingDate of the Nth consecutive accelerating quarter.
-
-    Returns:
-        List of {signal_date, streak, yoy_growth, prior_yoy_growth, ...}
-    """
-    qtrs = _load_quarterly_income(symbol)
-    growth_data = _compute_yoy_revenue_growth(qtrs)
-    if len(growth_data) < 2:
-        return []
-
-    results = []
-    streak = 0
-    for i in range(1, len(growth_data)):
-        if growth_data[i]["yoy_growth"] > growth_data[i - 1]["yoy_growth"]:
-            streak += 1
-        else:
-            streak = 0
-
-        if streak >= min_quarters:
-            sig_date = growth_data[i]["filingDate"]
-            if start and sig_date < start:
-                continue
-            if end and sig_date > end:
-                continue
-            results.append({
-                "signal_date": sig_date,
-                "streak": streak,
-                **growth_data[i],
-                "prior_yoy_growth": growth_data[i - 1]["yoy_growth"],
-            })
-    return results
-
-
-def find_margin_expansion(symbol: str, metric: str = "net_margin",
-                          min_quarters: int = 2,
-                          start: str = None, end: str = None) -> list[dict]:
-    """
-    Find periods where margin is expanding YoY for N consecutive quarters
-    AND margin is improving sequentially (QoQ).
-
-    Args:
-        metric: "net_margin" or "op_margin"
-        min_quarters: Consecutive quarters required
-
-    Returns:
-        List of {signal_date, streak, margin, prior_year_margin, margin_expansion_bps, ...}
-    """
-    qtrs = _load_quarterly_income(symbol)
-    growth_data = _compute_yoy_revenue_growth(qtrs)
-    if len(growth_data) < 2:
-        return []
-
-    prior_key = f"prior_{metric}"
-    results = []
-    streak = 0
-    for i in range(1, len(growth_data)):
-        current_margin = growth_data[i][metric]
-        prior_year_margin = growth_data[i][prior_key]
-        prev_quarter_margin = growth_data[i - 1][metric]
-
-        yoy_expanding = current_margin > prior_year_margin
-        qoq_improving = current_margin > prev_quarter_margin
-
-        if yoy_expanding and qoq_improving:
-            streak += 1
-        else:
-            streak = 0
-
-        if streak >= min_quarters:
-            sig_date = growth_data[i]["filingDate"]
-            if start and sig_date < start:
-                continue
-            if end and sig_date > end:
-                continue
-            expansion_bps = (current_margin - prior_year_margin) * 100
-            results.append({
-                "signal_date": sig_date,
-                "streak": streak,
-                "margin": current_margin,
-                "prior_year_margin": prior_year_margin,
-                "margin_expansion_bps": expansion_bps,
-                "metric": metric,
-                **{k: v for k, v in growth_data[i].items() if k not in ("net_margin", "op_margin", "prior_net_margin", "prior_op_margin")},
-            })
-    return results
-
-
-def find_margin_turnaround(symbol: str, metric: str = "net_margin",
-                           threshold_bps: float = 1000.0, min_quarters: int = 2,
-                           start: str = None, end: str = None) -> list[dict]:
-    """
-    Find periods where margin expands >= threshold_bps YoY for N consecutive quarters.
-    Catches efficiency turnarounds (e.g., META 2023).
-
-    Returns:
-        List of {signal_date, expansion_bps, streak, ...}
-    """
-    qtrs = _load_quarterly_income(symbol)
-    growth_data = _compute_yoy_revenue_growth(qtrs)
-    if not growth_data:
-        return []
-
-    prior_key = f"prior_{metric}"
-    results = []
-    streak = 0
-    for i in range(len(growth_data)):
-        current_margin = growth_data[i][metric]
-        prior_year_margin = growth_data[i][prior_key]
-        expansion_bps = (current_margin - prior_year_margin) * 100
-
-        if expansion_bps >= threshold_bps:
-            streak += 1
-        else:
-            streak = 0
-
-        if streak >= min_quarters:
-            sig_date = growth_data[i]["filingDate"]
-            if start and sig_date < start:
-                continue
-            if end and sig_date > end:
-                continue
-            results.append({
-                "signal_date": sig_date,
-                "streak": streak,
-                "margin": current_margin,
-                "prior_year_margin": prior_year_margin,
-                "expansion_bps": expansion_bps,
-                "metric": metric,
-                **{k: v for k, v in growth_data[i].items() if k not in ("net_margin", "op_margin", "prior_net_margin", "prior_op_margin")},
-            })
-    return results
-
-
-def find_relative_outperformance(symbol: str, benchmark: str = "^GSPC",
-                                  threshold: float = 20.0, window_days: int = 126,
-                                  start: str = None, end: str = None,
-                                  conn=None) -> list[dict]:
-    """
-    Find dates where stock's trailing return exceeds benchmark by >= threshold pp.
-
-    Args:
-        benchmark: Benchmark symbol (default SPX)
-        threshold: Min outperformance in percentage points
-        window_days: Trailing window in trading days (126 ≈ 6 months)
-
-    Returns:
-        List of {signal_date, stock_return, benchmark_return, spread}
-    """
-    own_conn = conn is None
-    if own_conn:
-        conn = get_connection()
-
-    stock_prices = get_prices(symbol, start=None, end=end, conn=conn)
-
-    # Load benchmark from index files or DB
-    bench_prices = []
-    if benchmark.startswith("^"):
-        # Load from index JSON
-        idx_map = {"^GSPC": "GSPC", "^DJI": "DJI", "^IXIC": "IXIC"}
-        idx_file = DATA_DIR / "prices" / "indices" / f"{idx_map.get(benchmark, benchmark)}.json"
-        if idx_file.exists():
-            with open(idx_file) as f:
-                idx_data = json.load(f).get("data", [])
-            bench_prices = [(b["date"], b["close"]) for b in idx_data]
-            bench_prices.sort()
-    else:
-        bench_prices = get_prices(benchmark, start=None, end=end, conn=conn)
-
-    if own_conn:
-        conn.close()
-
-    if not stock_prices or not bench_prices:
-        return []
-
-    # Build date-indexed lookups
-    stock_idx = {d: c for d, c in stock_prices}
-    bench_idx = {d: c for d, c in bench_prices}
-
-    # Get common dates
-    common_dates = sorted(set(stock_idx.keys()) & set(bench_idx.keys()))
-    if len(common_dates) <= window_days:
-        return []
-
-    results = []
-    for i in range(window_days, len(common_dates)):
-        current_date = common_dates[i]
-        lookback_date = common_dates[i - window_days]
-
-        if start and current_date < start:
-            continue
-        if end and current_date > end:
-            continue
-
-        stock_ret = (stock_idx[current_date] / stock_idx[lookback_date] - 1) * 100
-        bench_ret = (bench_idx[current_date] / bench_idx[lookback_date] - 1) * 100
-        spread = stock_ret - bench_ret
-
-        if spread >= threshold:
-            results.append({
-                "signal_date": current_date,
-                "stock_return": round(stock_ret, 2),
-                "benchmark_return": round(bench_ret, 2),
-                "spread": round(spread, 2),
-            })
-    return results
-
-
-def find_volume_conviction(symbol: str, short_window: int = 60,
-                           long_window: int = 252, ratio_threshold: float = 0.8,
-                           start: str = None, end: str = None,
-                           conn=None) -> list[dict]:
-    """
-    Find dates where short-term avg volume < ratio_threshold * long-term avg volume
-    while price is above its long-term average (rising price + falling volume = conviction).
-
-    Returns:
-        List of {signal_date, short_vol, long_vol, ratio, price, price_avg}
-    """
-    own_conn = conn is None
-    if own_conn:
-        conn = get_connection()
-
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT date, close, volume FROM prices WHERE symbol = ? ORDER BY date ASC",
-        [symbol],
-    )
-    rows = cur.fetchall()
-    if own_conn:
-        conn.close()
-
-    if len(rows) < long_window + 1:
-        return []
-
-    results = []
-    for i in range(long_window, len(rows)):
-        date, close, volume = rows[i]
-        if start and date < start:
-            continue
-        if end and date > end:
-            continue
-
-        short_vols = [r[2] for r in rows[i - short_window:i] if r[2] and r[2] > 0]
-        long_vols = [r[2] for r in rows[i - long_window:i] if r[2] and r[2] > 0]
-
-        if not short_vols or not long_vols:
-            continue
-
-        short_avg = sum(short_vols) / len(short_vols)
-        long_avg = sum(long_vols) / len(long_vols)
-
-        if long_avg == 0:
-            continue
-
-        ratio = short_avg / long_avg
-
-        # Price must be above its long-term average (uptrend)
-        long_prices = [r[1] for r in rows[i - long_window:i]]
-        price_avg = sum(long_prices) / len(long_prices)
-
-        if ratio <= ratio_threshold and close > price_avg:
-            results.append({
-                "signal_date": date,
-                "short_vol": int(short_avg),
-                "long_vol": int(long_avg),
-                "ratio": round(ratio, 3),
-                "price": close,
-                "price_avg": round(price_avg, 2),
-            })
-    return results
-
 
 # ---------------------------------------------------------------------------
 # Fundamental signal helpers
 # ---------------------------------------------------------------------------
 
-def _load_quarterly_income(symbol: str) -> list[dict]:
-    """Load quarterly income statements sorted chronologically."""
-    path = DATA_DIR / "fundamentals" / "income" / f"{symbol}.json"
-    if not path.exists():
-        return []
-    with open(path) as f:
-        data = json.load(f).get("data", [])
-    qtrs = [q for q in data if q.get("period", "").startswith("Q")]
-    return sorted(qtrs, key=lambda x: x["date"])
+# 10-Q for accelerated filers is due within 40-45 days of quarter end; use 45 as a
+# conservative fallback when an earnings announcement date can't be joined.
+_FILING_LAG_FALLBACK_DAYS = 45
+
+
+def _load_quarterly_income(symbol: str, conn=None) -> list[dict]:
+    """
+    Load quarterly income statements from market.db, sorted chronologically.
+
+    Point-in-time correctness:
+      filingDate = earliest earnings-announcement date within [period_end, +60d],
+                   falling back to period_end + 45 days when no announcement row
+                   is available (pre-IPO quarters, sparse coverage).
+    """
+    own_conn = conn is None
+    if own_conn:
+        conn = get_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT
+                i.date, i.fiscal_year, i.period,
+                i.revenue, i.net_income, i.operating_income,
+                (SELECT MIN(e.date) FROM earnings e
+                 WHERE e.symbol = i.symbol
+                   AND e.date >= i.date
+                   AND e.date <= DATE(i.date, '+60 days')) AS announcement_date
+            FROM income i
+            WHERE i.symbol = ? AND i.period LIKE 'Q%'
+            ORDER BY i.date ASC
+            """,
+            (symbol,),
+        ).fetchall()
+    finally:
+        if own_conn:
+            conn.close()
+
+    qtrs = []
+    for date, fiscal_year, period, revenue, net_income, operating_income, ann in rows:
+        if ann is None:
+            filing_date = (
+                datetime.strptime(date, "%Y-%m-%d")
+                + timedelta(days=_FILING_LAG_FALLBACK_DAYS)
+            ).strftime("%Y-%m-%d")
+        else:
+            filing_date = ann
+        # Guard: filing must be on/after period end. Drop malformed rows rather than
+        # silently introduce negative-lookahead bias.
+        if filing_date < date:
+            continue
+        qtrs.append({
+            "date": date,
+            "period": period,
+            "calendarYear": str(fiscal_year) if fiscal_year is not None else date[:4],
+            "revenue": revenue or 0,
+            "netIncome": net_income or 0,
+            "operatingIncome": operating_income or 0,
+            "filingDate": filing_date,
+        })
+    return qtrs
 
 
 def _quarter_key(q: dict) -> str:
@@ -1426,14 +1107,15 @@ def _compute_quarterly_yoy(qtrs: list[dict]) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def find_revenue_breakouts(symbol: str, threshold: float = 50.0,
-                           start: str = None, end: str = None) -> list[dict]:
+                           start: str = None, end: str = None,
+                           conn=None) -> list[dict]:
     """
     Signal A(a): Flag quarters where YoY revenue growth >= threshold%.
 
     Returns list of {signal_date, revenue_yoy, revenue, ...} dicts.
     signal_date = filingDate (when market learns about it).
     """
-    qtrs = _load_quarterly_income(symbol)
+    qtrs = _load_quarterly_income(symbol, conn=conn)
     if not qtrs:
         return []
     computed = _compute_quarterly_yoy(qtrs)
@@ -1457,14 +1139,15 @@ def find_revenue_breakouts(symbol: str, threshold: float = 50.0,
 
 
 def find_revenue_acceleration(symbol: str, min_quarters: int = 2,
-                              start: str = None, end: str = None) -> list[dict]:
+                              start: str = None, end: str = None,
+                              conn=None) -> list[dict]:
     """
     Signal B: Flag dates where YoY revenue growth has been INCREASING
     for >= min_quarters consecutive quarters.
 
     Acceleration = this quarter's YoY growth > prior quarter's YoY growth.
     """
-    qtrs = _load_quarterly_income(symbol)
+    qtrs = _load_quarterly_income(symbol, conn=conn)
     if not qtrs:
         return []
     computed = _compute_quarterly_yoy(qtrs)
@@ -1499,14 +1182,15 @@ def find_revenue_acceleration(symbol: str, min_quarters: int = 2,
 
 def find_margin_expansion(symbol: str, metric: str = "net_margin",
                           min_quarters: int = 2,
-                          start: str = None, end: str = None) -> list[dict]:
+                          start: str = None, end: str = None,
+                          conn=None) -> list[dict]:
     """
     Signal C: Flag dates where margin has expanded YoY for >= min_quarters
     consecutive quarters AND is expanding sequentially (QoQ).
 
     metric: 'net_margin' or 'op_margin'
     """
-    qtrs = _load_quarterly_income(symbol)
+    qtrs = _load_quarterly_income(symbol, conn=conn)
     if not qtrs:
         return []
     computed = _compute_quarterly_yoy(qtrs)
@@ -1546,13 +1230,14 @@ def find_margin_expansion(symbol: str, metric: str = "net_margin",
 def find_margin_turnaround(symbol: str, metric: str = "net_margin",
                            threshold_bps: float = 1000,
                            min_quarters: int = 2,
-                           start: str = None, end: str = None) -> list[dict]:
+                           start: str = None, end: str = None,
+                           conn=None) -> list[dict]:
     """
     Signal A(b): Flag dates where margin expanded >= threshold_bps YoY
     for >= min_quarters consecutive quarters.
     Catches efficiency turnarounds (e.g. META 2023) even without revenue breakout.
     """
-    qtrs = _load_quarterly_income(symbol)
+    qtrs = _load_quarterly_income(symbol, conn=conn)
     if not qtrs:
         return []
     computed = _compute_quarterly_yoy(qtrs)
@@ -1719,14 +1404,15 @@ def find_volume_conviction(symbol: str, short_window: int = 60,
 def find_revenue_deceleration(symbol: str, min_quarters: int = 2,
                               require_margin_compression: bool = True,
                               margin_metric: str = "net_margin",
-                              start: str = None, end: str = None) -> list[dict]:
+                              start: str = None, end: str = None,
+                              conn=None) -> list[dict]:
     """
     Exit Signal: Flag dates where YoY revenue growth has DECLINED for
     >= min_quarters consecutive quarters.
     If require_margin_compression=True, at least one of those quarters must
     also show YoY margin compression.
     """
-    qtrs = _load_quarterly_income(symbol)
+    qtrs = _load_quarterly_income(symbol, conn=conn)
     if not qtrs:
         return []
     computed = _compute_quarterly_yoy(qtrs)
@@ -1772,12 +1458,13 @@ def find_revenue_deceleration(symbol: str, min_quarters: int = 2,
 def find_margin_collapse(symbol: str, metric: str = "net_margin",
                          threshold_bps: float = -500,
                          min_quarters: int = 2,
-                         start: str = None, end: str = None) -> list[dict]:
+                         start: str = None, end: str = None,
+                         conn=None) -> list[dict]:
     """
     Exit Signal: Flag dates where margin contracted > threshold_bps YoY
     for >= min_quarters consecutive quarters.
     """
-    qtrs = _load_quarterly_income(symbol)
+    qtrs = _load_quarterly_income(symbol, conn=conn)
     if not qtrs:
         return []
     computed = _compute_quarterly_yoy(qtrs)
