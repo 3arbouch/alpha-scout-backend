@@ -598,13 +598,15 @@ Remember: query the data first, don't guess. Explore before you commit."""
     # defaults to. Force adaptive thinking for 4.7 only; leave other
     # models on their defaults so we don't alter working behavior.
     #
-    # `display: "summarized"` explicitly overrides Opus 4.7's per-model
-    # default of `"omitted"` (which returns empty thinking with signature
-    # only). This gives us plaintext thinking summaries in the transcript
-    # and in our agent_thinking event stream — same behavior Opus 4.6
-    # and Sonnet 4.6 already ship with by default.
+    # Note: Opus 4.7's thinking blocks return with empty `thinking` text
+    # and a signature only (display defaults to "omitted" per-model).
+    # Anthropic's docs say passing display="summarized" unseals the text,
+    # but claude-agent-sdk 0.1.61's subprocess transport only reads
+    # `type` from this dict (see subprocess_cli.py:305-312) and the
+    # bundled CLI binary has no --display flag. Until the SDK plumbs
+    # this through, the value is not actually configurable here.
     if resolved_model == "claude-opus-4-7":
-        agent_opts["thinking"] = {"type": "adaptive", "display": "summarized"}
+        agent_opts["thinking"] = {"type": "adaptive"}
 
     try:
         async for message in query(
