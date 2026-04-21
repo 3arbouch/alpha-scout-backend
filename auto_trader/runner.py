@@ -232,7 +232,15 @@ def _get_trade_summary(exp_id: str) -> dict | None:
 
 
 def build_history_context(run_id: str, target_metric: str, limit: int = 20) -> str:
-    """Build full history of past experiments for the agent to learn from."""
+    """Build full history of past experiments for the agent to learn from.
+
+    Deliberately excludes the `lessons` field. Lessons are the agent's own
+    interpretation of prior experiments and are persisted for UI display only;
+    surfacing them here would bias subsequent iterations by anchoring the
+    agent on its own past self-interpretation. `get_experiment_history()`
+    intentionally does not SELECT the column so the data isn't available
+    at this layer. Do not change either without reading the design rationale.
+    """
     history = get_experiment_history(run_id, limit=limit)
     if not history:
         return "No previous experiments. This is your first experiment."
@@ -685,6 +693,15 @@ Remember: query the data first, don't guess. Explore before you commit."""
         thesis = str(thesis_obj)
         assumptions = thesis_data.get("assumptions", [])
     portfolio_config = thesis_data.get("portfolio", {})
+    # Agent's reflection on prior experiments. Stored for UI display only —
+    # deliberately NOT surfaced in build_history_context to keep next
+    # iterations unbiased by prior self-interpretation.
+    lessons = thesis_data.get("lessons")
+    if isinstance(lessons, str):
+        lessons = lessons.strip() or None
+    elif lessons is not None:
+        # Agent emitted a non-string; coerce to string rather than dropping.
+        lessons = json.dumps(lessons, default=str)
 
     print(f"  Thesis: {thesis[:100]}...")
     print(f"  Sleeves: {len(portfolio_config.get('sleeves', []))}")
@@ -715,6 +732,7 @@ Remember: query the data first, don't guess. Explore before you commit."""
             backtest_start=backtest_start, backtest_end=backtest_end,
             initial_capital=initial_capital, model=model,
             session_id=session_id, duration_seconds=time.time() - t0, error="Backtest failed",
+            lessons=lessons,
         )
         return {"decision": "discard", "error": "backtest_failed", "id": exp_id}
 
@@ -750,6 +768,7 @@ Remember: query the data first, don't guess. Explore before you commit."""
         initial_capital=initial_capital, model=model,
         session_id=session_id, duration_seconds=duration_total,
         portfolio_id=portfolio_id,
+        lessons=lessons,
     )
 
     # Persist trades per sleeve under source_type='experiment'.

@@ -53,8 +53,14 @@ def log_experiment(
     duration_seconds: float = None,
     error: str = None,
     portfolio_id: str = None,
+    lessons: str = None,
 ) -> str:
-    """Log a single experiment. Returns the experiment ID."""
+    """Log a single experiment. Returns the experiment ID.
+
+    `lessons` is the agent's free-text reflection on prior experiments. Stored
+    for UI display only — it is NOT surfaced in build_history_context, so
+    subsequent iterations are not anchored by prior self-interpretation.
+    """
     exp_id = generate_experiment_id(run_id, iteration)
     now = datetime.now(timezone.utc).isoformat()
 
@@ -65,7 +71,7 @@ def log_experiment(
     conn = get_db()
     conn.execute(
         """INSERT INTO experiments
-           (id, run_id, iteration, thesis, assumptions, portfolio_id, portfolio_config,
+           (id, run_id, iteration, thesis, assumptions, lessons, portfolio_id, portfolio_config,
             target_metric, target_value, conditions, conditions_met,
             total_return_pct, annualized_return_pct, sharpe_ratio, sortino_ratio,
             max_drawdown_pct, annualized_volatility_pct, alpha_ann_pct,
@@ -76,9 +82,9 @@ def log_experiment(
             decision, best_value_so_far, improvement_pct,
             backtest_start, backtest_end, initial_capital,
             model, session_id, tokens_used, duration_seconds, error, created_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (exp_id, run_id, iteration,
-         thesis, json.dumps(assumptions), portfolio_id, json.dumps(portfolio_config),
+         thesis, json.dumps(assumptions), lessons, portfolio_id, json.dumps(portfolio_config),
          target_metric, target_value, json.dumps(conditions), 1 if conditions_met else 0,
          metrics.get("total_return_pct"), metrics.get("annualized_return_pct"),
          metrics.get("sharpe_ratio"), metrics.get("sortino_ratio"),
