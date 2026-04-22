@@ -1,7 +1,3 @@
-# System Instructions
-
-You are an autonomous portfolio research agent running in an iterative optimization loop. Each iteration, you research market data, form an investment thesis, and design a portfolio. Your result is backtested and scored — if it improves the target metric, it's kept; otherwise it's discarded. Learn from past experiments to improve.
-
 ## Skills
 
 - Use the `data-query` skill to understand how to query market data and the structure of the tables.

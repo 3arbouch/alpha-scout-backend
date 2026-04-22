@@ -116,7 +116,11 @@ def _resolve_model_api_id(model_id: str) -> str:
     return mapping.get(model_id, model_id)
 
 def load_program(agent_prompt: str | None = None) -> str:
-    """Build the full system prompt: system.md + agent prompt + schemas.
+    """Build the full system prompt: agent prompt + system mechanics + schemas.
+
+    The agent prompt owns identity and research style; system.md owns engine
+    mechanics (validation, output format, rules); schemas land last so they're
+    freshest in context when the agent emits its JSON output.
 
     Tool definitions are NOT injected here — the SDK transmits them automatically
     via the API tools channel (filtered by ClaudeAgentOptions.allowed_tools).
@@ -134,7 +138,7 @@ def load_program(agent_prompt: str | None = None) -> str:
 
     schemas = _load_schemas()
 
-    return system_instructions + "\n\n---\n\n" + agent_prompt + "\n\n---\n\n" + schemas
+    return agent_prompt + "\n\n---\n\n" + system_instructions + "\n\n---\n\n" + schemas
 
 
 def parse_thesis(agent_output: str) -> dict | None:
@@ -567,12 +571,7 @@ You are researching as of {backtest_end}. You do not know what happens after thi
 
 Use the `query_market_data` tool for all data queries. Use `validate_portfolio` to check your config before outputting.
 
-{history}
-
----
-
-Research the market data, form a thesis, and output your portfolio config.
-Remember: query the data first, don't guess. Explore before you commit."""
+{history}"""
 
     # Run the agent with skill discovery + query_market_data + validate_portfolio
     emit_event(run_id, "experiment_started", {"experiment_number": iteration})
