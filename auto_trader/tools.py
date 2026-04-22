@@ -44,6 +44,7 @@ DATE_COLUMN_MAP = {
     "insider_trades": "transaction_date",
     "macro_indicators": "date",
     "macro_derived": "date",
+    "features_daily": "date",
 }
 
 
@@ -237,10 +238,13 @@ async def validate_portfolio_tool(args: dict[str, Any]) -> dict[str, Any]:
     "Use this during research to investigate whether a signal pattern actually predicts returns. "
     "Returns trigger count, win rate, average return, Sharpe, and sample events (best/worst).\n\n"
     "signal_config: An entry condition config dict. Same format as portfolio entry conditions. "
-    "Examples:\n"
+    "Examples (prefer feature_threshold / feature_percentile / days_to_earnings / analyst_upgrades for valuation, growth, and catalyst signals):\n"
+    '  {"type": "feature_percentile", "feature": "ev_ebitda", "max_percentile": 20, "scope": "sector", "min_value": 0, "max_value": 25}\n'
+    '  {"type": "feature_threshold", "feature": "fcf_yield", "operator": ">=", "value": 5}\n'
+    '  {"type": "feature_threshold", "feature": "eps_yoy", "operator": ">=", "value": 20}\n'
+    '  {"type": "days_to_earnings", "min_days": 0, "max_days": 5}\n'
+    '  {"type": "analyst_upgrades", "window_days": 90, "min_net_upgrades": 2}\n'
     '  {"type": "momentum_rank", "lookback": 63, "operator": ">=", "value": 80}\n'
-    '  {"type": "earnings_momentum", "lookback_quarters": 4, "min_beats": 3}\n'
-    '  {"type": "pe_percentile", "max_percentile": 20}\n'
     '  {"type": "current_drop", "threshold": -15, "window_days": 90}\n'
     '  {"type": "rsi", "period": 14, "operator": "<=", "value": 30}\n\n'
     "target_horizon: Forward return horizon. e.g. '3m', '6m', '12m'.",

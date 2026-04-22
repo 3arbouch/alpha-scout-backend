@@ -1000,6 +1000,17 @@ async def run_async(ticker_filter=None, layer_filter=None, dry_run=False, concur
     # DB update phase — AFTER all JSON fetching
     update_db_incremental()
 
+    # Derived features — rebuild recent days after raw upsert
+    try:
+        import sqlite3
+        import features as _features
+        with sqlite3.connect(str(DB_PATH)) as _fconn:
+            _fconn.execute("PRAGMA journal_mode=WAL")
+            n_syms, n_rows = _features.update_recent(_fconn)
+        log.info(f"  features_daily: {n_rows:,} rows touched across {n_syms} symbols")
+    except Exception as e:
+        log.error(f"features_daily update failed: {e}")
+
     stats["finished_at"] = datetime.now(timezone.utc).isoformat()
     save_snapshot(stats, "_meta", "last-run.json")
     _executor.shutdown(wait=False)
