@@ -1021,6 +1021,11 @@ async def get_experiment_trades(run_id: str, experiment_id: str):
     Returns every BUY and SELL across every sleeve of the portfolio, tagged
     with sleeve_label. SELL rows carry round-trip fields (pnl, pnl_pct,
     entry_date, days_held, reason); BUY rows have those fields as null.
+
+    Each trade is enriched with a `snapshot` of the stock's features_daily
+    values on the trade date — 9 valuation/growth metrics computed
+    point-in-time. This lets the trader see both what the strategy rule
+    observed and the broader picture of the stock on that date.
     """
     conn = get_db()
     # Verify the experiment belongs to this run (404 if not found)
@@ -1052,6 +1057,47 @@ async def get_experiment_trades(run_id: str, experiment_id: str):
             except (json.JSONDecodeError, TypeError):
                 pass
         trades.append(d)
+
+    # Enrich every trade with the per-(symbol,date) feature snapshot.
+    # One bulk query against features_daily keyed on the distinct (symbol, date)
+    # pairs — cheap because features_daily is indexed on (symbol, date).
+    if trades:
+        pairs = sorted({(t["symbol"], t["date"]) for t in trades})
+        import sqlite3 as _sqlite3
+        import os as _os
+        market_db = _os.environ.get(
+            "MARKET_DB_PATH",
+            str(Path(__file__).parent.parent / "data" / "market.db"),
+        )
+        snapshots: dict[tuple, dict] = {}
+        try:
+            mconn = _sqlite3.connect(market_db)
+            # Chunk to stay under SQLite's default 999-variable limit.
+            CHUNK = 450
+            cur = mconn.cursor()
+            for i in range(0, len(pairs), CHUNK):
+                chunk = pairs[i : i + CHUNK]
+                placeholders = ",".join(["(?,?)"] * len(chunk))
+                args = [v for pair in chunk for v in pair]
+                for row in cur.execute(
+                    f"SELECT symbol, date, pe, ps, p_b, ev_ebitda, ev_sales, "
+                    f"fcf_yield, div_yield, eps_yoy, rev_yoy "
+                    f"FROM features_daily WHERE (symbol, date) IN ({placeholders})",
+                    args,
+                ).fetchall():
+                    snapshots[(row[0], row[1])] = {
+                        "pe": row[2], "ps": row[3], "p_b": row[4],
+                        "ev_ebitda": row[5], "ev_sales": row[6],
+                        "fcf_yield": row[7], "div_yield": row[8],
+                        "eps_yoy": row[9], "rev_yoy": row[10],
+                    }
+            mconn.close()
+        except Exception:
+            # Snapshot enrichment is best-effort; never block the trades list.
+            snapshots = {}
+
+        for t in trades:
+            t["snapshot"] = snapshots.get((t["symbol"], t["date"]))
 
     return {
         "experiment_id": experiment_id,
