@@ -999,6 +999,57 @@ async def get_experiment_trades(run_id: str, experiment_id: str):
     }
 
 
+@router.get("/runs/{run_id}/experiments/{experiment_id}/positions")
+async def get_experiment_positions(run_id: str, experiment_id: str):
+    """Per-ticker position book for an experiment's backtest.
+
+    Reconstructs positions from the trade ledger, priced as of the
+    experiment's backtest_end. Response shape matches
+    /deployments/{id}/positions so the same frontend components render both.
+    """
+    from portfolio_book import reconstruct_positions, make_price_lookup
+
+    conn = get_db()
+    exp = conn.execute(
+        "SELECT id, backtest_end, initial_capital FROM experiments "
+        "WHERE id = ? AND run_id = ?",
+        (experiment_id, run_id),
+    ).fetchone()
+    if not exp:
+        conn.close()
+        raise HTTPException(404, f"Experiment '{experiment_id}' not found in run '{run_id}'")
+
+    backtest_end = exp["backtest_end"]
+    initial_capital = exp["initial_capital"] or 0
+
+    rows = conn.execute(
+        """SELECT sleeve_label, date, action, symbol, shares, price, amount,
+                  entry_price, pnl
+           FROM trades
+           WHERE source_type = 'experiment' AND source_id = ?""",
+        (experiment_id,),
+    ).fetchall()
+    conn.close()
+
+    trades = [dict(r) for r in rows]
+
+    market_db = os.environ.get(
+        "MARKET_DB_PATH",
+        str(PROJECT_ROOT / "data" / "market.db"),
+    )
+    price_lookup = make_price_lookup(market_db)
+
+    book = reconstruct_positions(trades, initial_capital, backtest_end, price_lookup)
+
+    return {
+        "experiment_id": experiment_id,
+        "run_id": run_id,
+        "as_of_date": backtest_end,
+        "initial_capital": initial_capital,
+        **book,
+    }
+
+
 @router.get("/runs/{run_id}/experiments/{experiment_id}/session")
 async def get_experiment_session(run_id: str, experiment_id: str):
     """Get the full agent session trail for an experiment."""
