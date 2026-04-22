@@ -933,6 +933,20 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
             (total_pnl / avg_utilized_capital) * 100 if avg_utilized_capital > 0 else 0, 2
         )
 
+        # Realized vs unrealized split. When force_close_at_end=False, positions
+        # remaining at the last bar haven't played out — their pnl is "paper"
+        # until the next signal-driven exit. Report both so consumers can tell
+        # how much of the final number is locked in vs still at risk.
+        positions_value_at_end = combined_nav_history[-1].get("positions_value", 0) if combined_nav_history else 0
+        total_realized_pnl = sum(t.get("pnl", 0) or 0 for t in all_closed)
+        total_unrealized_pnl = round(total_pnl - total_realized_pnl, 2)
+        open_positions_count = sum(
+            len(sr.get("open_positions", [])) for sr in sleeve_results
+        )
+        open_position_fraction_pct = round(
+            (positions_value_at_end / last_nav * 100) if last_nav else 0, 2
+        )
+
         def _r(v, ndigits=2):
             return None if v is None else round(v, ndigits)
 
@@ -963,6 +977,12 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
             "peak_utilized_capital": round(peak_utilized_capital, 2),
             "avg_utilized_capital": round(avg_utilized_capital, 2),
             "return_on_utilized_capital_pct": return_on_utilized_capital_pct,
+            # Realized vs unrealized split (see note above).
+            "total_realized_pnl": round(total_realized_pnl, 2),
+            "total_unrealized_pnl": total_unrealized_pnl,
+            "positions_value_at_end": round(positions_value_at_end, 2),
+            "open_positions_count": open_positions_count,
+            "open_position_fraction_pct": open_position_fraction_pct,
             "trading_days": len(all_dates),
             "years": round(n_nav / 252.0, 2),
         }

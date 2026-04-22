@@ -467,7 +467,13 @@ def run_backtest(portfolio_config: dict, start: str, end: str, capital: float,
             "initial_capital": capital,
         }
 
-        result = run_portfolio_backtest(config, force_close_at_end=True)
+        # Don't force-close at backtest_end. Forced liquidation corrupts the
+        # signal — it replaces the strategy's exit rules with "sell because the
+        # calendar ran out" at whatever price the last day happens to print.
+        # Final NAV already marks-to-market via record_nav, so total_return_pct
+        # and Sharpe are correct. Win rate / profit factor now compute on real
+        # signal-driven exits only; open positions are reported separately.
+        result = run_portfolio_backtest(config, force_close_at_end=False)
         metrics = result.get("metrics", {})
 
         # The portfolio engine already computed one benchmark (SPY or sector ETF).
