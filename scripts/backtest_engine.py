@@ -1498,14 +1498,14 @@ def precompute_signals(config: dict, symbols: list[str], conn, price_index: dict
             result = []
             for idx in sorted(by_condition.keys()):
                 cond_config = conditions[idx] if idx < len(conditions) else {}
+                # Carry the full condition config (feature, operator, thresholds, scope, etc.)
+                # so the trader can see BOTH the rule and the observed values. `type` is set
+                # first so it wins over any stray duplicate.
                 entry = {
                     "type": cond_config.get("type", "unknown"),
                     "values": by_condition[idx],
+                    **{k: v for k, v in cond_config.items() if k != "type"},
                 }
-                # Include threshold from config if present
-                for tkey in ("threshold", "value", "max_percentile", "lookback"):
-                    if tkey in cond_config:
-                        entry[tkey] = cond_config[tkey]
                 result.append(entry)
 
             structured_signals[symbol][date] = result
@@ -1611,6 +1611,7 @@ class Portfolio:
             "date": date,
             "symbol": symbol,
             "action": "BUY",
+            "reason": "entry",
             "price": round(exec_price, 2),
             "shares": round(shares, 4),
             "amount": round(amount, 2),
