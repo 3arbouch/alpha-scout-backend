@@ -52,6 +52,12 @@ SEED_TEMPLATES = [
         "description": "Balanced multi-sector portfolio researcher. Explores all sectors, fundamentals, and macro conditions.",
         "prompt": """# Default Portfolio Researcher
 
+## Context
+
+You are part of an autonomous research loop. Each iteration, you form a thesis and design a portfolio — it's backtested and scored against a target metric the user specifies, and improved results are kept. Past experiments with their configs and outcomes are included in your context. Your job is to learn from them and propose something that does better.
+
+## Identity
+
 You are an autonomous portfolio researcher. Your job is to explore market data,
 form an investment thesis, and design a portfolio that optimizes for a target metric.
 
@@ -86,6 +92,12 @@ understanding of what drives winners and losers. Do not overfit to the training 
         "category": "energy",
         "description": "Focused on energy sector stocks. Analyzes oil prices, natural gas, refining margins, and energy fundamentals.",
         "prompt": """# Energy Specialist
+
+## Context
+
+You are part of an autonomous research loop. Each iteration, you form a thesis and design a portfolio — it's backtested and scored against a target metric the user specifies, and improved results are kept. Past experiments with their configs and outcomes are included in your context. Your job is to learn from them and propose something that does better.
+
+## Identity
 
 You are a portfolio researcher specializing in the energy sector. Your expertise is
 in oil & gas companies, refiners, pipelines, and energy infrastructure.
@@ -125,6 +137,12 @@ understanding of what drives winners and losers in energy. Do not overfit to the
         "category": "technology",
         "description": "Growth-focused tech researcher. Targets high-growth technology stocks with strong earnings execution.",
         "prompt": """# Tech Momentum Researcher
+
+## Context
+
+You are part of an autonomous research loop. Each iteration, you form a thesis and design a portfolio — it's backtested and scored against a target metric the user specifies, and improved results are kept. Past experiments with their configs and outcomes are included in your context. Your job is to learn from them and propose something that does better.
+
+## Identity
 
 You are a portfolio researcher focused on high-growth technology stocks. You look for
 companies with accelerating revenue, expanding margins, and strong earnings execution.
@@ -174,6 +192,26 @@ def _ensure_tables():
             ("default", "Default Agent", DEFAULT_PROMPT, now, now),
         )
         conn.commit()
+    else:
+        # Migration: refresh the built-in 'default' agent if its prompt still
+        # matches one of the prior canonical versions. User edits are preserved.
+        # Two hashes because early DBs were seeded from the template (no trailing
+        # newline, 1557b) and later from program.md (with trailing newline, 1558b).
+        import hashlib
+        OLD_DEFAULT_AGENT_HASHES = {
+            "9aaf5f443a6c9bfe362a4d30519376e1",  # program.md with trailing \n
+            "04016bc22637c32a25a9084c393cfedd",  # template body, no trailing \n
+        }
+        row = conn.execute(
+            "SELECT prompt FROM auto_trader_agents WHERE id = 'default'"
+        ).fetchone()
+        if row and hashlib.md5(row[0].encode()).hexdigest() in OLD_DEFAULT_AGENT_HASHES:
+            now = datetime.now(timezone.utc).isoformat()
+            conn.execute(
+                "UPDATE auto_trader_agents SET prompt = ?, updated_at = ? WHERE id = 'default'",
+                (DEFAULT_PROMPT, now),
+            )
+            conn.commit()
     # Seed templates
     existing_templates = conn.execute("SELECT COUNT(*) FROM auto_trader_templates").fetchone()[0]
     if existing_templates == 0:
@@ -183,6 +221,30 @@ def _ensure_tables():
                 "INSERT INTO auto_trader_templates (id, name, category, description, prompt, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (t["id"], t["name"], t["category"], t["description"], t["prompt"], now, now),
             )
+        conn.commit()
+    else:
+        # Migration: refresh seed templates whose prompt still matches the prior
+        # canonical version (md5 hashes below). User-edited templates are left
+        # alone — we only touch rows that haven't been customized.
+        import hashlib
+        OLD_SEED_HASHES = {
+            "default": "04016bc22637c32a25a9084c393cfedd",
+            "energy_specialist": "fc3771ade95f20df52b508035bca468c",
+            "tech_momentum": "501fb41993daeb6f2032c557de7a2fa7",
+        }
+        now = datetime.now(timezone.utc).isoformat()
+        for t in SEED_TEMPLATES:
+            old_hash = OLD_SEED_HASHES.get(t["id"])
+            if not old_hash:
+                continue
+            row = conn.execute(
+                "SELECT prompt FROM auto_trader_templates WHERE id = ?", (t["id"],)
+            ).fetchone()
+            if row and hashlib.md5(row[0].encode()).hexdigest() == old_hash:
+                conn.execute(
+                    "UPDATE auto_trader_templates SET prompt = ?, updated_at = ? WHERE id = ?",
+                    (t["prompt"], now, t["id"]),
+                )
         conn.commit()
     conn.close()
 
