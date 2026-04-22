@@ -205,6 +205,55 @@ JOIN macro_indicators s ON strftime('%Y-%m',m.date) = strftime('%Y-%m',s.date) A
 WHERE m.series='brent' AND m.date >= '2023-01-01' GROUP BY month ORDER BY month;
 ```
 
+## Table: features_daily (~1.4M rows)
+
+Point-in-time derived valuation & growth features per `(symbol, date)`. One row per
+trading day per symbol. Price-dependent ratios reflect that day's close; TTM
+numerators/denominators come from the most recent filed quarter as of the same day.
+
+**This is the same table the backtest engine reads** for `feature_threshold` /
+`feature_percentile` conditions and for ranking — values you see here are byte-identical
+to what the engine evaluates against. Use it to screen the universe before choosing
+thresholds in your portfolio config.
+
+```
+symbol TEXT, date TEXT,
+pe REAL,          -- market_cap / TTM net_income (NULL if earnings <= 0)
+ps REAL,          -- market_cap / TTM revenue
+p_b REAL,         -- market_cap / total_equity
+ev_ebitda REAL,   -- (market_cap + net_debt) / TTM ebitda
+ev_sales REAL,    -- (market_cap + net_debt) / TTM revenue
+fcf_yield REAL,   -- TTM free_cash_flow / market_cap, percent
+div_yield REAL,   -- TTM |dividends_paid| / market_cap, percent
+eps_yoy REAL,     -- latest Q eps_diluted vs same-Q prior year, percent
+rev_yoy REAL      -- latest Q revenue vs same-Q prior year, percent
+```
+
+```sql
+-- What's cheap today on EV/EBITDA?
+SELECT symbol, ev_ebitda, fcf_yield FROM features_daily
+WHERE date = (SELECT MAX(date) FROM features_daily) AND ev_ebitda BETWEEN 0 AND 8
+ORDER BY ev_ebitda LIMIT 20;
+
+-- Sector-relative cheap PE snapshot
+SELECT f.symbol, u.sector, f.pe FROM features_daily f
+JOIN universe_profiles u ON u.symbol=f.symbol
+WHERE f.date=(SELECT MAX(date) FROM features_daily) AND f.pe BETWEEN 0 AND 100
+ORDER BY u.sector, f.pe;
+
+-- High-growth + cheap combo screen
+SELECT symbol, pe, eps_yoy, rev_yoy FROM features_daily
+WHERE date=(SELECT MAX(date) FROM features_daily)
+  AND pe BETWEEN 0 AND 20 AND eps_yoy > 20 AND rev_yoy > 15
+ORDER BY eps_yoy DESC LIMIT 20;
+
+-- Historical PE percentile for one name
+SELECT date, pe FROM features_daily
+WHERE symbol='NVDA' AND pe IS NOT NULL
+  AND date >= date('now', '-5 years')
+ORDER BY date;
+```
+
 ## Table: macro_derived (~28K rows)
 
 Computed macro series (moving averages, z-scores, YoY changes).

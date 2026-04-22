@@ -121,7 +121,15 @@ VALID_TRIGGER_TYPES = [
     "margin_turnaround", "relative_performance", "volume_conviction",
     "rsi", "momentum_rank", "ma_crossover", "volume_capitulation",
     "always",
+    # Feature-table conditions (read from market.db features_daily)
+    "feature_threshold", "feature_percentile", "days_to_earnings", "analyst_upgrades",
 ]
+
+# Features available in features_daily (same list as scripts/features.py FEATURE_COLUMNS)
+FEATURE_COLUMNS = (
+    "pe", "ps", "p_b", "ev_ebitda", "ev_sales",
+    "fcf_yield", "div_yield", "eps_yoy", "rev_yoy",
+)
 VALID_STOP_TYPES = ["drawdown_from_entry", "fundamental"]
 VALID_TP_TYPES = ["gain_from_entry", "above_peak", "target_price"]
 VALID_SIZING_TYPES = ["equal_weight", "risk_parity", "fixed_amount"]
@@ -255,6 +263,14 @@ def precompute_condition(condition_config: dict, symbols: list[str], conn, start
         return _precompute_technical_condition(condition_config, symbols, conn, start, end, price_index=price_index)
     elif ctype == "always":
         return _precompute_always_condition(symbols, conn, start, end, price_index=price_index)
+    elif ctype == "feature_threshold":
+        return _precompute_feature_threshold(condition_config, symbols, conn, start, end)
+    elif ctype == "feature_percentile":
+        return _precompute_feature_percentile(condition_config, symbols, conn, start, end)
+    elif ctype == "days_to_earnings":
+        return _precompute_days_to_earnings(condition_config, symbols, conn, start, end, price_index=price_index)
+    elif ctype == "analyst_upgrades":
+        return _precompute_analyst_upgrades(condition_config, symbols, conn, start, end, price_index=price_index)
     else:
         raise ValueError(f"Unknown condition type: {ctype}")
 
@@ -406,11 +422,317 @@ def _precompute_always_condition(symbols: list[str], conn, start: str, end: str,
 
 
 # ---------------------------------------------------------------------------
+# Feature-table conditions (read from market.db features_daily)
+# ---------------------------------------------------------------------------
+_OPERATORS = {
+    ">":  lambda a, b: a > b,
+    ">=": lambda a, b: a >= b,
+    "<":  lambda a, b: a < b,
+    "<=": lambda a, b: a <= b,
+    "==": lambda a, b: a == b,
+    "!=": lambda a, b: a != b,
+}
+
+
+def _get_market_conn(conn):
+    """Return a connection to market.db.
+
+    The engine's `conn` may be app.db (where trades/portfolios live) or market.db
+    (where prices/fundamentals/features live) depending on caller. If the given
+    conn doesn't have features_daily (or is None), open market.db directly.
+    """
+    if conn is not None:
+        try:
+            conn.cursor().execute("SELECT 1 FROM features_daily LIMIT 1")
+            return conn, False  # same connection, caller owns close
+        except Exception:
+            pass
+    import sqlite3
+    import os
+    from pathlib import Path
+    mk = os.environ.get("MARKET_DB_PATH") or str(Path(__file__).parent.parent / "data" / "market.db")
+    return sqlite3.connect(mk), True  # new connection, must close
+
+
+def _load_feature_series(feature: str, symbols: list[str], start: str, end: str, conn) -> dict:
+    """Bulk-load features_daily for `feature`, returning {symbol: [(date, value), ...]} sorted asc.
+
+    Range is widened 1y before `start` so bisect-as-of can find a value for early trading days
+    when the first in-window row hasn't been written yet (rare, but happens for IPOs).
+    """
+    if feature not in FEATURE_COLUMNS:
+        raise ValueError(f"Unknown feature: {feature}")
+    # pad start by 1 year so as-of lookups have data even near the edge
+    from datetime import datetime, timedelta
+    pad_start = (datetime.strptime(start, "%Y-%m-%d") - timedelta(days=365)).strftime("%Y-%m-%d")
+
+    mconn, owned = _get_market_conn(conn)
+    try:
+        cur = mconn.cursor()
+        placeholders = ",".join("?" * len(symbols))
+        q = (f"SELECT symbol, date, {feature} FROM features_daily "
+             f"WHERE symbol IN ({placeholders}) AND date BETWEEN ? AND ? AND {feature} IS NOT NULL "
+             f"ORDER BY symbol, date")
+        rows = cur.execute(q, (*symbols, pad_start, end)).fetchall()
+    finally:
+        if owned:
+            mconn.close()
+
+    out: dict[str, list] = {}
+    for sym, d, v in rows:
+        out.setdefault(sym, []).append((d, v))
+    return out
+
+
+def _trading_dates(price_index, symbols, conn, start, end):
+    """Union of trading dates in range from price_index (or DB fallback)."""
+    if price_index:
+        all_dates = set()
+        for s in symbols:
+            if s in price_index:
+                all_dates.update(d for d in price_index[s] if start <= d <= end)
+        return sorted(all_dates)
+    mconn, owned = _get_market_conn(conn)
+    try:
+        rows = mconn.execute(
+            "SELECT DISTINCT date FROM prices WHERE date >= ? AND date <= ? ORDER BY date",
+            (start, end),
+        ).fetchall()
+    finally:
+        if owned:
+            mconn.close()
+    return [r[0] for r in rows]
+
+
+def _precompute_feature_threshold(cond: dict, symbols: list[str], conn, start: str, end: str) -> dict:
+    """Signal fires on each trading day where the as-of feature value passes operator/value."""
+    from bisect import bisect_right
+
+    feature = cond["feature"]
+    operator = cond.get("operator", ">=")
+    target = cond["value"]
+    op_fn = _OPERATORS.get(operator)
+    if op_fn is None:
+        raise ValueError(f"Unknown operator: {operator}")
+
+    series = _load_feature_series(feature, symbols, start, end, conn)
+    # Use each symbol's own feature dates as "trading days" — dense: one row per trading day.
+    signals: dict = {}
+    for sym, pts in series.items():
+        dates = [p[0] for p in pts]
+        values = [p[1] for p in pts]
+        sig: dict = {}
+        for d, v in zip(dates, values):
+            if d < start or d > end:
+                continue
+            if op_fn(v, target):
+                sig[d] = v
+        if sig:
+            signals[sym] = sig
+    return signals
+
+
+def _precompute_feature_percentile(cond: dict, symbols: list[str], conn, start: str, end: str) -> dict:
+    """For each trading day, rank symbols by `feature` and emit signal for the bottom N% (or top, if max_percentile > 50 feels natural as-is)."""
+    from bisect import bisect_right
+    from collections import defaultdict
+
+    feature = cond["feature"]
+    max_pct = float(cond.get("max_percentile", 30))
+    scope = cond.get("scope", "universe")
+    min_value = cond.get("min_value")
+    max_value = cond.get("max_value")
+
+    series = _load_feature_series(feature, symbols, start, end, conn)
+    if not series:
+        return {}
+
+    # Sector lookup if scoped
+    sector_of: dict[str, str] = {}
+    if scope == "sector":
+        mconn, owned = _get_market_conn(conn)
+        try:
+            cur = mconn.cursor()
+            placeholders = ",".join("?" * len(symbols))
+            try:
+                rows = cur.execute(
+                    f"SELECT symbol, sector FROM universe_profiles WHERE symbol IN ({placeholders})",
+                    symbols,
+                ).fetchall()
+                sector_of = {s: sec or "UNKNOWN" for s, sec in rows}
+            except Exception:
+                sector_of = {}
+        finally:
+            if owned:
+                mconn.close()
+
+    # Build per-symbol date→value for bisect
+    per_sym = {s: ([p[0] for p in pts], [p[1] for p in pts]) for s, pts in series.items()}
+
+    trading_dates = _trading_dates(None, symbols, conn, start, end)
+
+    signals: dict = defaultdict(dict)
+    for d in trading_dates:
+        # Collect latest-as-of value per symbol
+        snap: dict[str, float] = {}
+        for sym, (dates, values) in per_sym.items():
+            idx = bisect_right(dates, d) - 1
+            if idx < 0:
+                continue
+            v = values[idx]
+            if min_value is not None and v < min_value:
+                continue
+            if max_value is not None and v > max_value:
+                continue
+            snap[sym] = v
+
+        if len(snap) < 3:
+            continue
+
+        if scope == "sector":
+            buckets: dict[str, list] = defaultdict(list)
+            for sym, v in snap.items():
+                buckets[sector_of.get(sym, "UNKNOWN")].append((sym, v))
+            for sec, items in buckets.items():
+                if len(items) < 3:
+                    continue
+                items.sort(key=lambda x: x[1])
+                cutoff = max(1, int(len(items) * max_pct / 100))
+                for sym, v in items[:cutoff]:
+                    signals[sym][d] = v
+        else:
+            ranked = sorted(snap.items(), key=lambda x: x[1])
+            cutoff = max(1, int(len(ranked) * max_pct / 100))
+            for sym, v in ranked[:cutoff]:
+                signals[sym][d] = v
+
+    return dict(signals)
+
+
+def _precompute_days_to_earnings(cond: dict, symbols: list[str], conn, start: str, end: str,
+                                 price_index: dict = None) -> dict:
+    """Signal on trading days where the next upcoming earnings event is [min_days, max_days] away."""
+    from bisect import bisect_left
+    from datetime import datetime
+
+    min_days = int(cond.get("min_days", 0))
+    max_days = int(cond.get("max_days", 7))
+
+    mconn, owned = _get_market_conn(conn)
+    try:
+        cur = mconn.cursor()
+        placeholders = ",".join("?" * len(symbols))
+        # Pull ALL earnings events in window — at backtest time, any event with
+        # event_date > today counts as upcoming, regardless of whether eps_actual
+        # was later filled in. The live-only "IS NULL" filter would be wrong here.
+        from datetime import datetime as _dt, timedelta as _td
+        pad_end = (_dt.strptime(end, "%Y-%m-%d") + _td(days=max_days + 1)).strftime("%Y-%m-%d")
+        rows = cur.execute(
+            f"SELECT symbol, date FROM earnings WHERE symbol IN ({placeholders}) "
+            f"AND date >= ? AND date <= ? ORDER BY symbol, date",
+            (*symbols, start, pad_end),
+        ).fetchall()
+    finally:
+        if owned:
+            mconn.close()
+
+    upcoming: dict[str, list[str]] = {}
+    for sym, d in rows:
+        upcoming.setdefault(sym, []).append(d)
+
+    trading_dates = _trading_dates(price_index, symbols, conn, start, end)
+    if not trading_dates:
+        return {}
+
+    # Cache datetime parses
+    td_parsed = [datetime.strptime(d, "%Y-%m-%d") for d in trading_dates]
+
+    signals: dict = {}
+    for sym, event_dates in upcoming.items():
+        if not event_dates:
+            continue
+        ev_parsed = [datetime.strptime(d, "%Y-%m-%d") for d in event_dates]
+        sig: dict = {}
+        for td, td_dt in zip(trading_dates, td_parsed):
+            # Find the next event strictly after today (or ≥ today: include day-of)
+            idx = bisect_left(event_dates, td)
+            if idx >= len(event_dates):
+                continue
+            delta = (ev_parsed[idx] - td_dt).days
+            if min_days <= delta <= max_days:
+                sig[td] = delta
+        if sig:
+            signals[sym] = sig
+    return signals
+
+
+def _precompute_analyst_upgrades(cond: dict, symbols: list[str], conn, start: str, end: str,
+                                 price_index: dict = None) -> dict:
+    """Signal when net (upgrades - downgrades) in trailing window >= min_net_upgrades."""
+    from datetime import datetime, timedelta
+
+    window_days = int(cond.get("window_days", 90))
+    min_net = int(cond.get("min_net_upgrades", 2))
+
+    mconn, owned = _get_market_conn(conn)
+    try:
+        cur = mconn.cursor()
+        # Widen lookback by window_days so the first trading day has full history
+        from datetime import datetime as _dt
+        pad_start = (_dt.strptime(start, "%Y-%m-%d") - timedelta(days=window_days)).strftime("%Y-%m-%d")
+        placeholders = ",".join("?" * len(symbols))
+        rows = cur.execute(
+            f"SELECT symbol, date, action FROM analyst_grades WHERE symbol IN ({placeholders}) "
+            f"AND action IN ('upgrade','downgrade') AND date >= ? AND date <= ? ORDER BY symbol, date",
+            (*symbols, pad_start, end),
+        ).fetchall()
+    finally:
+        if owned:
+            mconn.close()
+
+    # Bucket per symbol: sorted list of (date_dt, +1 or -1)
+    events: dict[str, list] = {}
+    for sym, d, action in rows:
+        sign = 1 if action == "upgrade" else -1
+        events.setdefault(sym, []).append((datetime.strptime(d, "%Y-%m-%d"), sign))
+
+    trading_dates = _trading_dates(price_index, symbols, conn, start, end)
+    if not trading_dates:
+        return {}
+
+    td_parsed = [datetime.strptime(d, "%Y-%m-%d") for d in trading_dates]
+
+    signals: dict = {}
+    for sym, ev in events.items():
+        # Two-pointer sliding window
+        sig: dict = {}
+        lo, hi = 0, 0
+        net = 0
+        for td_str, td_dt in zip(trading_dates, td_parsed):
+            window_start = td_dt - timedelta(days=window_days)
+            # Advance hi to include all events with date <= td_dt
+            while hi < len(ev) and ev[hi][0] <= td_dt:
+                net += ev[hi][1]
+                hi += 1
+            # Advance lo to exclude events older than window_start
+            while lo < hi and ev[lo][0] < window_start:
+                net -= ev[lo][1]
+                lo += 1
+            if net >= min_net:
+                sig[td_str] = net
+        if sig:
+            signals[sym] = sig
+    return signals
+
+
+# ---------------------------------------------------------------------------
 # Ranking
 # ---------------------------------------------------------------------------
 VALID_RANKING_METRICS = [
     "pe_percentile", "current_drop", "rsi", "momentum_rank",
     "revenue_growth_yoy", "margin_expanding",
+    # features_daily columns — any of these is a valid ranking metric
+    *FEATURE_COLUMNS,
 ]
 
 DEFAULT_RANKING_METRIC = "pe_percentile"
@@ -516,7 +838,17 @@ def _compute_ranking_scores(metric: str, symbols: list[str], conn, date: str,
                     scores[symbol] = (curr_margin - prev_margin) * 100  # margin change in pct points
             except (json.JSONDecodeError, KeyError, ZeroDivisionError):
                 continue
-    
+
+    elif metric in FEATURE_COLUMNS:
+        # Any features_daily column is a valid ranker. As-of lookup per symbol.
+        series = _load_feature_series(metric, symbols, date, date, conn)
+        for symbol, pts in series.items():
+            # _load_feature_series pads 1y before start; most recent <= date wins
+            dates_only = [p[0] for p in pts]
+            idx = bisect_right(dates_only, date) - 1
+            if idx >= 0:
+                scores[symbol] = pts[idx][1]
+
     return scores
 
 

@@ -140,6 +140,66 @@ class AlwaysCondition(BaseModel):
     type: Literal["always"] = "always"
 
 
+# ---------------------------------------------------------------------------
+# Feature-table conditions — read from market.db features_daily.
+# Values are point-in-time: latest quarterly report as-of the trading day,
+# combined with that day's close for price-dependent ratios. Same values are
+# queryable via `data-query` so agent research and engine execution agree.
+# ---------------------------------------------------------------------------
+FeatureName = Literal[
+    "pe",          # market_cap / TTM net_income
+    "ps",          # market_cap / TTM revenue
+    "p_b",         # market_cap / total_equity
+    "ev_ebitda",   # (market_cap + net_debt) / TTM ebitda
+    "ev_sales",    # (market_cap + net_debt) / TTM revenue
+    "fcf_yield",   # TTM free_cash_flow / market_cap, percent
+    "div_yield",   # TTM |dividends_paid| / market_cap, percent
+    "eps_yoy",     # latest Q eps_diluted vs same-Q prior year, percent
+    "rev_yoy",     # latest Q revenue vs same-Q prior year, percent
+]
+
+
+class FeatureThresholdCondition(BaseModel):
+    """Fires when the as-of feature value passes operator/value on that day."""
+    type: Literal["feature_threshold"] = "feature_threshold"
+    feature: FeatureName
+    operator: Literal[">", ">=", "<", "<=", "==", "!="] = ">="
+    value: float
+
+
+class FeaturePercentileCondition(BaseModel):
+    """Ranks symbols by feature on each trading day; bottom max_percentile get a signal.
+
+    scope='universe' ranks across all active symbols; 'sector' ranks within GICS sector.
+    Optional min_value / max_value filter outliers before ranking (e.g. min_pe=0 to
+    exclude negative-earnings names from a cheap-PE screen).
+    """
+    type: Literal["feature_percentile"] = "feature_percentile"
+    feature: FeatureName
+    max_percentile: float = Field(default=30, ge=0, le=100)
+    scope: Literal["universe", "sector"] = "universe"
+    min_value: float | None = None
+    max_value: float | None = None
+
+
+class DaysToEarningsCondition(BaseModel):
+    """Fires on trading days where the next earnings event is [min_days, max_days] away.
+
+    Use to enter pre-earnings momentum (e.g. 0..5 days out) or to blackout
+    positions around earnings (combine inversely in a sleeve).
+    """
+    type: Literal["days_to_earnings"] = "days_to_earnings"
+    min_days: int = Field(default=0, ge=0)
+    max_days: int = Field(default=7, ge=1)
+
+
+class AnalystUpgradesCondition(BaseModel):
+    """Net (upgrades - downgrades) in trailing window ≥ min_net_upgrades."""
+    type: Literal["analyst_upgrades"] = "analyst_upgrades"
+    window_days: int = Field(default=90, ge=1, le=365)
+    min_net_upgrades: int = Field(default=2, ge=1)
+
+
 EntryCondition = Annotated[
     CurrentDropCondition
     | PeriodDropCondition
@@ -157,7 +217,11 @@ EntryCondition = Annotated[
     | MomentumRankCondition
     | MaCrossoverCondition
     | VolumCapitulationCondition
-    | AlwaysCondition,
+    | AlwaysCondition
+    | FeatureThresholdCondition
+    | FeaturePercentileCondition
+    | DaysToEarningsCondition
+    | AnalystUpgradesCondition,
     Field(discriminator="type"),
 ]
 
@@ -277,8 +341,12 @@ class TimeStopConfig(BaseModel):
 class RankingConfig(BaseModel):
     """Rank qualified candidates by a metric before applying max_positions."""
     by: Literal[
+        # Legacy metrics (kept for backward compatibility with saved configs)
         "pe_percentile", "current_drop", "rsi",
         "momentum_rank", "revenue_growth_yoy", "margin_expanding",
+        # features_daily columns — any feature is rankable
+        "pe", "ps", "p_b", "ev_ebitda", "ev_sales",
+        "fcf_yield", "div_yield", "eps_yoy", "rev_yoy",
     ] = Field(default="pe_percentile")
     order: Literal["asc", "desc"] = Field(default="asc", description="'asc' = lowest first.")
     top_n: int | None = Field(default=None, description="How many candidates to select. Defaults to max_positions.")
