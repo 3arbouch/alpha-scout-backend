@@ -2647,7 +2647,23 @@ def compute_metrics(portfolio: Portfolio, initial_cash: float,
         daily_std = statistics.stdev(daily_returns) if len(daily_returns) > 1 else 0
         ann_vol = daily_std * (252 ** 0.5) * 100
         excess_return = ann_return - risk_free_ann
-        sharpe = excess_return / ann_vol if ann_vol > 0 else 0
+        sharpe_ann = excess_return / ann_vol if ann_vol > 0 else 0
+
+        # Period-basis sharpe for short windows — see portfolio_engine for
+        # rationale. Keeps the displayed sharpe self-consistent with the
+        # displayed period return when the run is < 1 year.
+        n = len(daily_returns)
+        period_vol = daily_std * (n ** 0.5) * 100
+        rf_period = risk_free_ann * (n / 252.0)
+        period_return = total_return  # computed above
+        sharpe_period = (period_return - rf_period) / period_vol if period_vol > 0 else 0
+
+        if n_nav < 252:
+            sharpe = sharpe_period
+            sharpe_basis = "period"
+        else:
+            sharpe = sharpe_ann
+            sharpe_basis = "annualized"
 
         daily_rf = risk_free_ann / 100 / 252
         downside_sq = [min(r - daily_rf, 0) ** 2 for r in daily_returns]
@@ -2656,6 +2672,9 @@ def compute_metrics(portfolio: Portfolio, initial_cash: float,
     else:
         ann_vol = None
         sharpe = None
+        sharpe_ann = None
+        sharpe_period = None
+        sharpe_basis = None
         sortino = None
 
     # Utilized capital metrics
@@ -2680,7 +2699,12 @@ def compute_metrics(portfolio: Portfolio, initial_cash: float,
         # Statistical metrics — None when sample is too short to be honest.
         "annualized_return_pct": _r(ann_return),
         "annualized_volatility_pct": _r(ann_vol),
+        # `sharpe_ratio` is basis-aware: period sharpe for <252 trading days,
+        # annualized otherwise. Side fields always populated.
         "sharpe_ratio": _r(sharpe),
+        "sharpe_ratio_annualized": _r(sharpe_ann),
+        "sharpe_ratio_period": _r(sharpe_period),
+        "sharpe_basis": sharpe_basis,
         "sortino_ratio": _r(sortino),
         # Sample-size signal so consumers can render "—" with context.
         "trading_days": n_nav,

@@ -208,6 +208,11 @@ CREATE TABLE IF NOT EXISTS deployments (
     last_alpha_pct                  REAL,
     last_benchmark_return_pct       REAL,
     last_sharpe_ratio               REAL,
+    -- basis-aware sharpe: `last_sharpe_ratio` holds the displayed value
+    -- (period for <252 trading days, annualized otherwise). The side fields
+    -- are always populated so the UI can show both if it wants.
+    last_sharpe_basis               TEXT,
+    last_sharpe_ratio_annualized    REAL,
     last_max_drawdown_pct           REAL,
     last_ann_volatility_pct         REAL,
     rolling_vol_30d_pct             REAL,
@@ -461,7 +466,12 @@ CREATE TABLE IF NOT EXISTS experiments (
     -- Backtest metrics
     total_return_pct                REAL,
     annualized_return_pct           REAL,
+    -- `sharpe_ratio` is basis-aware (period if backtest spans <252 trading
+    -- days, annualized otherwise). Side fields always populated.
     sharpe_ratio                    REAL,
+    sharpe_basis                    TEXT,
+    sharpe_ratio_annualized         REAL,
+    sharpe_ratio_period             REAL,
     sortino_ratio                   REAL,
     max_drawdown_pct                REAL,
     annualized_volatility_pct       REAL,
@@ -629,8 +639,13 @@ def _apply_migrations(conn: sqlite3.Connection):
     if "experiments" in existing_tables:
         _add_column_if_missing(conn, "experiments", "portfolio_id", "TEXT")
         _add_column_if_missing(conn, "experiments", "lessons", "TEXT")
+        _add_column_if_missing(conn, "experiments", "sharpe_basis", "TEXT")
+        _add_column_if_missing(conn, "experiments", "sharpe_ratio_annualized", "REAL")
+        _add_column_if_missing(conn, "experiments", "sharpe_ratio_period", "REAL")
     if "deployments" in existing_tables:
         _add_column_if_missing(conn, "deployments", "portfolio_id", "TEXT")
+        _add_column_if_missing(conn, "deployments", "last_sharpe_basis", "TEXT")
+        _add_column_if_missing(conn, "deployments", "last_sharpe_ratio_annualized", "REAL")
     if "auto_trader_agents" in existing_tables:
         _add_column_if_missing(conn, "auto_trader_agents", "allowed_tools", "TEXT")
 

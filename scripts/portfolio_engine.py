@@ -873,9 +873,27 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
         if daily_returns and ann_return is not None:
             import statistics
             import math
-            ann_vol = statistics.stdev(daily_returns) * (252 ** 0.5) * 100 if len(daily_returns) > 1 else 0
+            daily_std = statistics.stdev(daily_returns) if len(daily_returns) > 1 else 0
+            ann_vol = daily_std * (252 ** 0.5) * 100
             excess_return = ann_return - risk_free_ann
-            sharpe = excess_return / ann_vol if ann_vol > 0 else 0
+            sharpe_ann = excess_return / ann_vol if ann_vol > 0 else 0
+
+            # Period-basis sharpe: for short windows the annualized number is a
+            # noisy extrapolation (std-err grows with 1/sqrt(years)). Compute a
+            # period sharpe that matches the displayed period return so the UI
+            # is self-consistent on short deployments. Basis flips at 252 days.
+            n = len(daily_returns)
+            period_vol = daily_std * (n ** 0.5) * 100
+            rf_period = risk_free_ann * (n / 252.0)
+            period_return = total_return  # already computed
+            sharpe_period = (period_return - rf_period) / period_vol if period_vol > 0 else 0
+
+            if n_nav < 252:
+                sharpe = sharpe_period
+                sharpe_basis = "period"
+            else:
+                sharpe = sharpe_ann
+                sharpe_basis = "annualized"
 
             daily_rf = risk_free_ann / 100 / 252
             downside_sq = [min(r - daily_rf, 0) ** 2 for r in daily_returns]
@@ -887,6 +905,9 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
         else:
             ann_vol = None
             sharpe = None
+            sharpe_ann = None
+            sharpe_period = None
+            sharpe_basis = None
             sortino = None
             calmar = None
 
@@ -959,7 +980,13 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
             # Statistical metrics — None on short windows; UI renders "—".
             "annualized_return_pct": _r(ann_return),
             "annualized_volatility_pct": _r(ann_vol),
+            # `sharpe_ratio` is the basis-aware "displayed" value: period sharpe
+            # for windows <252 trading days, annualized otherwise. The side
+            # fields are always populated so callers can show both if needed.
             "sharpe_ratio": _r(sharpe),
+            "sharpe_ratio_annualized": _r(sharpe_ann),
+            "sharpe_ratio_period": _r(sharpe_period),
+            "sharpe_basis": sharpe_basis,
             "sortino_ratio": _r(sortino),
             "calmar_ratio": _r(calmar),
             # Sample-size signal so consumers can render explanatory text.
