@@ -2506,6 +2506,39 @@ async def list_trades(
                 pass
         data.append(_sanitize_floats(d))
 
+    # Enrich each trade with a `snapshot` of the stock's features_daily values on
+    # the trade date — same nine valuation/growth metrics the experiment trades
+    # endpoint exposes. Best-effort: never block the trades list.
+    if data:
+        pairs = sorted({(t["symbol"], t["date"]) for t in data if t.get("symbol") and t.get("date")})
+        snapshots: dict[tuple, dict] = {}
+        if pairs:
+            try:
+                mconn = sqlite3.connect(str(MARKET_DB_PATH))
+                CHUNK = 450
+                cur = mconn.cursor()
+                for i in range(0, len(pairs), CHUNK):
+                    chunk = pairs[i : i + CHUNK]
+                    placeholders = ",".join(["(?,?)"] * len(chunk))
+                    args = [v for pair in chunk for v in pair]
+                    for row in cur.execute(
+                        f"SELECT symbol, date, pe, ps, p_b, ev_ebitda, ev_sales, "
+                        f"fcf_yield, div_yield, eps_yoy, rev_yoy "
+                        f"FROM features_daily WHERE (symbol, date) IN ({placeholders})",
+                        args,
+                    ).fetchall():
+                        snapshots[(row[0], row[1])] = {
+                            "pe": row[2], "ps": row[3], "p_b": row[4],
+                            "ev_ebitda": row[5], "ev_sales": row[6],
+                            "fcf_yield": row[7], "div_yield": row[8],
+                            "eps_yoy": row[9], "rev_yoy": row[10],
+                        }
+                mconn.close()
+            except Exception:
+                snapshots = {}
+        for t in data:
+            t["snapshot"] = snapshots.get((t.get("symbol"), t.get("date")))
+
     return {"total": total, "limit": limit, "offset": offset, "data": data}
 
 
