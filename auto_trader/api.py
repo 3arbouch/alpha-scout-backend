@@ -951,28 +951,48 @@ async def get_run(run_id: str):
 @router.get("/runs/{run_id}/experiments")
 async def list_experiments(
     run_id: str,
-    limit: int = Query(50, ge=1, le=200),
+    limit: int = Query(10000, ge=1, le=10000),
+    since_iteration: int | None = Query(
+        None, ge=0,
+        description="Only return experiments with iteration > this value. Use for incremental polling.",
+    ),
 ):
-    """List all experiments for a run with metrics."""
+    """List all experiments for a run with metrics.
+
+    Default returns every experiment in the run (cap 10000, matching max_experiments).
+    Pass `since_iteration=N` to fetch only experiments newer than the last one you've seen —
+    use this for incremental polling so the frontend doesn't refetch the full list every tick.
+    """
     _get_run(run_id)  # verify run exists
 
     conn = get_db()
+    total = conn.execute(
+        "SELECT COUNT(*) FROM experiments WHERE run_id = ?", (run_id,)
+    ).fetchone()[0]
+
+    params: list = [run_id]
+    where = "WHERE run_id = ?"
+    if since_iteration is not None:
+        where += " AND iteration > ?"
+        params.append(since_iteration)
+    params.append(limit)
+
     rows = conn.execute(
-        """SELECT id, iteration, thesis, portfolio_id,
-                  target_metric, target_value, conditions_met,
-                  total_return_pct, annualized_return_pct, sharpe_ratio, sortino_ratio,
-                  max_drawdown_pct, annualized_volatility_pct, alpha_ann_pct,
-                  alpha_vs_market_pct, alpha_vs_sector_pct,
-                  market_benchmark_return_pct, market_benchmark_ann_return_pct,
-                  sector_benchmark_return_pct, sector_benchmark_ann_return_pct,
-                  profit_factor, win_rate_pct, total_trades,
-                  decision, best_value_so_far, improvement_pct,
-                  session_id, duration_seconds, created_at
-           FROM experiments
-           WHERE run_id = ?
-           ORDER BY iteration
-           LIMIT ?""",
-        (run_id, limit),
+        f"""SELECT id, iteration, thesis, portfolio_id,
+                   target_metric, target_value, conditions_met,
+                   total_return_pct, annualized_return_pct, sharpe_ratio, sortino_ratio,
+                   max_drawdown_pct, annualized_volatility_pct, alpha_ann_pct,
+                   alpha_vs_market_pct, alpha_vs_sector_pct,
+                   market_benchmark_return_pct, market_benchmark_ann_return_pct,
+                   sector_benchmark_return_pct, sector_benchmark_ann_return_pct,
+                   profit_factor, win_rate_pct, total_trades,
+                   decision, best_value_so_far, improvement_pct,
+                   session_id, duration_seconds, created_at
+            FROM experiments
+            {where}
+            ORDER BY iteration
+            LIMIT ?""",
+        params,
     ).fetchall()
     conn.close()
 
@@ -984,7 +1004,8 @@ async def list_experiments(
 
     return {
         "run_id": run_id,
-        "total": len(data),
+        "total": total,
+        "count": len(data),
         "data": data,
     }
 
