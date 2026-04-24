@@ -856,11 +856,53 @@ async def stream_run(run_id: str):
 
 
 @router.get("/runs/{run_id}/events")
-async def get_run_events(run_id: str):
-    """Get all events for a run (historical). Use /stream for live events."""
-    _get_run(run_id)  # verify run exists
-    events, _ = tail_events(run_id)
-    return {"run_id": run_id, "total": len(events), "events": events}
+async def get_run_events(
+    run_id: str,
+    limit: int = Query(200, ge=1, le=2000),
+    since_event_id: int | None = Query(
+        None, ge=0,
+        description="Return events strictly after this id (use next_cursor from a prior response).",
+    ),
+    types: str | None = Query(
+        None,
+        description="Comma-separated event types to include (e.g. experiment_started,backtest_started). Unknown types are ignored.",
+    ),
+):
+    """Get historical events for a run, oldest-first. Use /stream for live tail.
+
+    Events are read from the run's append-only JSONL log. Each event gets an
+    `event_id` equal to its line number in that log — stable across calls and
+    suitable for use as a cursor via `since_event_id`.
+
+    Filtering: `since_event_id` filters by cursor; `types` narrows to a
+    high-signal subset. `total` is the count matching those filters (ignoring
+    `limit`), so callers can render "Showing N of T".
+    """
+    _get_run(run_id)  # verify run exists (404 if missing)
+
+    type_allow: set[str] | None = None
+    if types:
+        type_allow = {t.strip() for t in types.split(",") if t.strip()}
+
+    raw, _ = tail_events(run_id)
+    # Tag each event with its 1-based line-number id, then apply filters.
+    tagged = [{**ev, "event_id": i + 1} for i, ev in enumerate(raw)]
+    filtered = tagged
+    if since_event_id is not None:
+        filtered = [e for e in filtered if e["event_id"] > since_event_id]
+    if type_allow is not None:
+        filtered = [e for e in filtered if e.get("type") in type_allow]
+
+    total = len(filtered)
+    page = filtered[:limit]
+    next_cursor = page[-1]["event_id"] if page else None
+    return {
+        "run_id": run_id,
+        "total": total,
+        "count": len(page),
+        "next_cursor": next_cursor,
+        "events": page,
+    }
 
 
 @router.get("/runs")
