@@ -2,7 +2,7 @@
 name: data-query
 description: >
   Query AlphaScout market data — stock prices, fundamentals, earnings, insider trades,
-  analyst grades, macro indicators, and derived series. 10 tables in SQLite with data
+  analyst grades, macro indicators, and derived series. 11 tables in SQLite with data
   from 2015 to present for ~530 tickers (S&P 500 + sector ETFs).
   Use when you need to explore market data, test hypotheses, or analyze stocks/sectors.
 ---
@@ -128,7 +128,7 @@ SELECT symbol, date, revenue_actual, revenue_estimated,
 FROM earnings WHERE symbol='NVDA' AND revenue_actual IS NOT NULL ORDER BY date DESC LIMIT 8;
 ```
 
-## Table: analyst_grades (~274K rows)
+## Table: analyst_grades (~276K rows)
 
 Analyst rating changes.
 
@@ -138,7 +138,7 @@ symbol TEXT, date TEXT, grading_company TEXT, previous_grade TEXT, new_grade TEX
 
 `action`: upgrade, downgrade, maintain, init, reiterated.
 
-## Table: insider_trades (~83K rows)
+## Table: insider_trades (~85K rows)
 
 Insider buy/sell transactions.
 
@@ -156,13 +156,21 @@ FROM insider_trades WHERE transaction_type='P-Purchase'
 GROUP BY symbol ORDER BY total_value DESC LIMIT 20;
 ```
 
-## Table: universe_profiles (521 rows)
+## Table: universe_profiles (522 rows)
 
 Company metadata.
 
 ```
-symbol TEXT, name TEXT, sector TEXT, industry TEXT, market_cap REAL, exchange TEXT, beta REAL, is_etf INT
+symbol TEXT, name TEXT, sector TEXT, industry TEXT, market_cap REAL,
+exchange TEXT, country TEXT, beta REAL, price REAL, volume INT,
+avg_volume INT, is_actively_trading INT, ipo_date TEXT, is_etf INT,
+is_adr INT, cik TEXT, description TEXT, synced_at TEXT
 ```
+
+`price`, `volume`, `avg_volume` are snapshot values as of `synced_at` — use the `prices`
+table for time-series close/volume. `is_etf=1` for sector/index ETFs; `is_adr=1` for
+ADRs (foreign listings). `ipo_date` is the firm's listing date (YYYY-MM-DD), useful to
+exclude names with short histories.
 
 **Sectors:** Technology (91), Industrials (79), Financial Services (70), Healthcare (62), Consumer Cyclical (53), Consumer Defensive (37), Utilities (32), Real Estate (31), Communication Services (23), Energy (23), Basic Materials (20)
 
@@ -182,7 +190,19 @@ Macro economic indicators from FRED. Daily/weekly/monthly frequency.
 date TEXT, series TEXT, value REAL, source TEXT
 ```
 
-**Daily series:** vix, brent, wti, natgas, dxy, spx, nasdaq, fed_funds, treasury_2y, treasury_5y, treasury_10y, treasury_30y, spread_10y2y, spread_10y3m, hy_spread, hy_yield, bbb_spread, breakeven_5y, breakeven_10y, tips_real_10y, eurusd, gbpusd, jpyusd, financial_stress, nfci, vix_st_futures, gas_regular, gas_diesel
+**Daily series:**
+
+- *Equity / vol*: spx, nasdaq, vix, vix_st_futures
+- *Rates (full Treasury curve)*: treasury_1m, treasury_2m, treasury_3m, treasury_6m, treasury_1y, treasury_2y, treasury_3y, treasury_5y, treasury_7y, treasury_10y, treasury_20y, treasury_30y, fed_funds
+- *Curve spreads*: spread_10y2y, spread_10y3m
+- *Inflation-linked*: breakeven_5y, breakeven_10y, breakeven_5y_fwd (5y5y forward), tips_real_10y
+- *Credit*: hy_spread, hy_yield, bbb_spread, financial_stress, nfci
+- *FX*: dxy, usd_broad (trade-weighted), eurusd, gbpusd, jpyusd
+- *Commodities*: brent, wti, natgas, gas_regular, gas_diesel
+
+Note: `treasury_2m` coverage begins 2018-10; all other daily series go back to 2015.
+
+**Weekly series:** initial_claims (jobless claims, Thursday release), continued_claims
 
 **Monthly series:** cpi, core_cpi, pce, core_pce, cpi_energy, ppi_commodities, nonfarm_payrolls, unemployment, retail_sales, industrial_prod, housing_starts, building_permits, consumer_sentiment, gdp, copper, aluminum, jolts_openings
 
@@ -254,7 +274,7 @@ WHERE symbol='NVDA' AND pe IS NOT NULL
 ORDER BY date;
 ```
 
-## Table: macro_derived (~28K rows)
+## Table: macro_derived (~29K rows)
 
 Computed macro series (moving averages, z-scores, YoY changes).
 
