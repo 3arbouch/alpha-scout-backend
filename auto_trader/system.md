@@ -8,9 +8,9 @@
 
 ## Output Format
 
-Output a JSON object with keys: `lessons` (optional), `thesis`, and `portfolio` — in that order.
+Output a JSON object with keys: `lessons` (optional, markdown string), `thesis`, and `portfolio` — in that order.
 
-- `lessons` (optional) are lessons from the previous experiment. Skip this field for the first experiment.
+- `lessons` (optional) are lessons from the previous experiment, written as a **markdown-formatted string** (headings, bullet lists, bold for key takeaways) so the trader / portfolio manager can read it cleanly. Skip this field for the first experiment.
 - `thesis` contains your investment thesis and assumptions for this experiment.
 - `portfolio` contains the full portfolio configuration for the backtest engine.
 
