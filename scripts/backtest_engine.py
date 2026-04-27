@@ -1602,7 +1602,8 @@ class Portfolio:
         exec_price = price * (1 + slippage_bps / 10000)
 
         # Vol-adaptive stop/TP: compute frozen exit prices once at entry.
-        # Legacy modes get all-None and the dynamic check stays in force.
+        # Legacy modes get None for the prices (engine uses the dynamic check)
+        # but still get a unified record in signal_detail for the FE.
         from stop_pricing import compute_stop_pricing
         pricing = compute_stop_pricing(
             self.strategy_config, symbol, date, exec_price, self.ohlc_fetcher,
@@ -1613,17 +1614,21 @@ class Portfolio:
             print(f"  [vol-stops] skip {symbol} @ {date}: insufficient history")
             return
 
-        # Embed vol-stop metadata into signal_detail so postmortems can see it
-        # without a DB migration. Carried to the SELL trade by existing logic.
-        merged_signal = dict(signal_detail) if isinstance(signal_detail, dict) else (
-            {"_": signal_detail} if signal_detail is not None else {}
-        )
-        if pricing["stop_metadata"]:
-            merged_signal["stop"] = pricing["stop_metadata"]
-        if pricing["tp_metadata"]:
-            merged_signal["take_profit"] = pricing["tp_metadata"]
-        if not merged_signal:
-            merged_signal = signal_detail  # preserve original None-ish passthrough
+        # Build signal_detail. If no stop and no take_profit are configured,
+        # preserve the original shape (a list of entry-condition records) so
+        # legacy backtests are byte-identical. Otherwise normalize to a dict
+        # with `entries` + `stop?` + `take_profit?` so the FE has one path
+        # regardless of which exit modes are in use.
+        if pricing["stop_record"] is None and pricing["tp_record"] is None:
+            merged_signal = signal_detail
+        else:
+            merged_signal = {}
+            if signal_detail is not None:
+                merged_signal["entries"] = signal_detail
+            if pricing["stop_record"]:
+                merged_signal["stop"] = pricing["stop_record"]
+            if pricing["tp_record"]:
+                merged_signal["take_profit"] = pricing["tp_record"]
 
         shares = amount / exec_price
 

@@ -98,15 +98,43 @@ result_legacy = _run({
     "stop_loss": {"type": "drawdown_from_entry", "value": -10, "cooldown_days": 30},
     "take_profit": {"type": "gain_from_entry", "value": 15},
 })
-n_buy_legacy = sum(1 for t in result_legacy["trades"] if t["action"] == "BUY")
-check("legacy drawdown_from_entry produces trades", n_buy_legacy > 0,
-      f"buys={n_buy_legacy}")
-# Legacy positions must NOT have stop metadata in signal_detail
-legacy_has_stop_meta = any(
-    isinstance(t.get("signal_detail"), dict) and "stop" in t["signal_detail"]
-    for t in result_legacy["trades"] if t["action"] == "BUY"
+buys_legacy = [t for t in result_legacy["trades"] if t["action"] == "BUY"]
+check("legacy drawdown_from_entry produces trades", len(buys_legacy) > 0,
+      f"buys={len(buys_legacy)}")
+
+# Unified-shape contract: legacy modes ALSO emit stop/take_profit records, so
+# the FE has one rendering path. The records carry type/params/summary; the
+# evidence dict is empty for legacy (no frozen price to record).
+legacy_record_ok = all(
+    isinstance(t.get("signal_detail"), dict)
+    and t["signal_detail"].get("stop", {}).get("type") == "drawdown_from_entry"
+    and t["signal_detail"]["stop"].get("evidence") == {}
+    and "Stop" in t["signal_detail"]["stop"].get("summary", "")
+    and t["signal_detail"].get("take_profit", {}).get("type") == "gain_from_entry"
+    for t in buys_legacy
 )
-check("legacy mode does NOT add 'stop' metadata", not legacy_has_stop_meta)
+check("legacy mode emits unified stop/take_profit records with summary",
+      legacy_record_ok)
+
+# Entries list is preserved under the new `entries` key (renamed from `_`)
+entries_present = all(
+    isinstance(t["signal_detail"].get("entries"), list)
+    for t in buys_legacy
+)
+check("legacy: entries list preserved under 'entries' key", entries_present)
+
+# When NO stop and NO take_profit configured, signal_detail stays a list (the
+# original shape) — byte-for-byte legacy preservation.
+result_no_exits = _run({
+    # explicitly drop stop_loss / take_profit
+})
+buys_no_exits = [t for t in result_no_exits["trades"] if t["action"] == "BUY"]
+no_exits_shape_ok = all(
+    isinstance(t.get("signal_detail"), list)
+    for t in buys_no_exits
+) if buys_no_exits else True
+check("no exits configured: signal_detail stays a list (legacy shape)",
+      no_exits_shape_ok)
 
 
 # ---------------------------------------------------------------------------
@@ -122,24 +150,26 @@ buys_atr = [t for t in result_atr["trades"] if t["action"] == "BUY"]
 sells_atr = [t for t in result_atr["trades"] if t["action"] == "SELL"]
 check("ATR mode produces buys", len(buys_atr) > 0, f"buys={len(buys_atr)}")
 
-# Every BUY must have stop metadata embedded.
+# Every BUY must have stop record in unified shape.
 all_have_stop_meta = all(
     isinstance(t.get("signal_detail"), dict)
-    and t["signal_detail"].get("stop", {}).get("mode") == "atr_multiple"
+    and t["signal_detail"].get("stop", {}).get("type") == "atr_multiple"
+    and "atr" in t["signal_detail"]["stop"].get("evidence", {})
+    and "frozen_price" in t["signal_detail"]["stop"]["evidence"]
+    and "summary" in t["signal_detail"]["stop"]
     for t in buys_atr
 )
-check("every BUY has ATR stop metadata in signal_detail", all_have_stop_meta)
+check("every BUY has ATR unified-shape stop record", all_have_stop_meta)
 
 # Every SELL flagged stop_loss must execute at <= frozen stop_price (after slippage).
 sl_fires = [t for t in sells_atr if t.get("reason") == "stop_loss"]
 print(f"  ATR stop-loss fires: {len(sl_fires)}")
 for t in sl_fires:
     sd = t.get("signal_detail") or {}
-    frozen = (sd.get("stop") or {}).get("frozen_price")
+    frozen = ((sd.get("stop") or {}).get("evidence") or {}).get("frozen_price")
     if frozen is None:
         check(f"stop_loss SELL has frozen_price ({t['symbol']}@{t['date']})", False)
         continue
-    # Allow small slippage band — within 1.0 bps of frozen.
     ok = t["price"] <= frozen * 1.01
     check(f"ATR SELL price ≤ frozen stop ({t['symbol']}@{t['date']}: "
           f"price={t['price']:.2f}, frozen={frozen:.2f})", ok)
@@ -148,7 +178,7 @@ tp_fires = [t for t in sells_atr if t.get("reason") == "take_profit"]
 print(f"  ATR take-profit fires: {len(tp_fires)}")
 for t in tp_fires:
     sd = t.get("signal_detail") or {}
-    frozen_tp = (sd.get("take_profit") or {}).get("frozen_price")
+    frozen_tp = ((sd.get("take_profit") or {}).get("evidence") or {}).get("frozen_price")
     if frozen_tp is None:
         check(f"take_profit SELL has frozen_price ({t['symbol']}@{t['date']})", False)
         continue
@@ -173,17 +203,20 @@ check("realized_vol historical produces buys", len(buys_rv) > 0,
       f"buys={len(buys_rv)}")
 all_have_meta = all(
     isinstance(t.get("signal_detail"), dict)
-    and t["signal_detail"].get("stop", {}).get("mode") == "realized_vol_multiple"
-    and t["signal_detail"]["stop"].get("sigma_source") == "historical"
+    and t["signal_detail"].get("stop", {}).get("type") == "realized_vol_multiple"
+    and t["signal_detail"]["stop"]["params"].get("sigma_source") == "historical"
+    and "sigma" in t["signal_detail"]["stop"].get("evidence", {})
     for t in buys_rv
 )
-check("every BUY has realized_vol historical metadata", all_have_meta)
+check("every BUY has realized_vol historical unified record", all_have_meta)
 
 # Frozen stop_price should be entry * (1 - k * sigma)
 for t in buys_rv[:3]:
-    sd = t["signal_detail"]["stop"]
-    expected = t["price"] * (1 - 2.0 * sd["sigma_at_entry"])
-    actual = sd["frozen_price"]
+    rec = t["signal_detail"]["stop"]
+    sigma = rec["evidence"]["sigma"]
+    k = rec["params"]["k"]
+    expected = t["price"] * (1 - k * sigma)
+    actual = rec["evidence"]["frozen_price"]
     ok = abs(expected - actual) < 0.01
     check(f"frozen_price = entry*(1-k*sigma) ({t['symbol']}: "
           f"expected={expected:.4f}, actual={actual:.4f})", ok)
@@ -202,14 +235,17 @@ result_rv_e = _run({
 buys_e = [t for t in result_rv_e["trades"] if t["action"] == "BUY"]
 check("EWMA mode produces buys", len(buys_e) > 0)
 
-# Mixed mode: stop should have new metadata, take_profit should NOT.
+# Mixed mode: stop is realized_vol_multiple/ewma, tp is legacy gain_from_entry.
+# Both records present in unified shape; FE renders both via .summary.
 mixed_ok = all(
     isinstance(t.get("signal_detail"), dict)
-    and t["signal_detail"].get("stop", {}).get("sigma_source") == "ewma"
-    and "take_profit" not in t["signal_detail"]
+    and t["signal_detail"].get("stop", {}).get("type") == "realized_vol_multiple"
+    and t["signal_detail"]["stop"]["params"].get("sigma_source") == "ewma"
+    and t["signal_detail"].get("take_profit", {}).get("type") == "gain_from_entry"
+    and t["signal_detail"]["take_profit"].get("evidence") == {}
     for t in buys_e
 )
-check("mixed mode: stop=ewma, tp=legacy gain_from_entry (no tp metadata)", mixed_ok)
+check("mixed mode: both stop+tp records emitted in unified shape", mixed_ok)
 
 
 # ---------------------------------------------------------------------------

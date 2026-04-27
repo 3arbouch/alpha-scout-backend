@@ -80,6 +80,63 @@ def compute_realized_vol(closes: list[float], window_days: int, source: str) -> 
     return None
 
 
+def _summarize(role: str, type_: str, params: dict, evidence: dict) -> str:
+    """BE-rendered human-readable label for a stop / take-profit record.
+
+    The FE renders this as-is when it doesn't have a custom layout for `type_`.
+    Adding a future signal type means writing a `_summarize` branch — the FE
+    keeps working without changes.
+    """
+    label = "Stop" if role == "stop" else "TP"
+    if type_ == "drawdown_from_entry":
+        return f"{label} @ {params.get('value')}%"
+    if type_ == "gain_from_entry":
+        sign = "+" if (params.get("value") or 0) >= 0 else ""
+        return f"{label} @ {sign}{params.get('value')}%"
+    if type_ == "above_peak":
+        return f"{label} @ +{params.get('value')}% above peak"
+    if type_ == "atr_multiple":
+        fp = evidence.get("frozen_price")
+        fp_s = f" = ${fp:.2f}" if isinstance(fp, (int, float)) else ""
+        return f"{label} @ {params.get('k')}× ATR({params.get('window_days')}d){fp_s}"
+    if type_ == "realized_vol_multiple":
+        fp = evidence.get("frozen_price")
+        fp_s = f" = ${fp:.2f}" if isinstance(fp, (int, float)) else ""
+        src = params.get("sigma_source", "historical")
+        return f"{label} @ {params.get('k')}σ ({params.get('window_days')}d, {src}){fp_s}"
+    return f"{label} ({type_})"
+
+
+def _make_record(role: str, cfg: dict, params_keys: list[str], evidence: dict) -> dict:
+    """Build the unified {type, params, evidence, summary} record for one role.
+
+    `params_keys` is the subset of `cfg` keys that belong in `params` (the input
+    config) — keeps `type` and any fields that don't make sense to echo out.
+    """
+    type_ = cfg.get("type")
+    params = {k: cfg[k] for k in params_keys if k in cfg}
+    return {
+        "type": type_,
+        "params": params,
+        "evidence": evidence,
+        "summary": _summarize(role, type_, params, evidence),
+    }
+
+
+# Per-type fields that go into `params`. New types extend these mappings.
+_STOP_PARAMS_BY_TYPE = {
+    "drawdown_from_entry": ["value", "cooldown_days"],
+    "atr_multiple": ["k", "window_days", "cooldown_days"],
+    "realized_vol_multiple": ["k", "window_days", "sigma_source", "cooldown_days"],
+}
+_TP_PARAMS_BY_TYPE = {
+    "gain_from_entry": ["value"],
+    "above_peak": ["value"],
+    "atr_multiple": ["k", "window_days"],
+    "realized_vol_multiple": ["k", "window_days", "sigma_source"],
+}
+
+
 def compute_stop_pricing(
     strategy_config: dict,
     symbol: str,
@@ -87,25 +144,24 @@ def compute_stop_pricing(
     entry_price: float,
     ohlc_fetcher: Callable[[str, str, int], list[tuple[float, float, float]]] | None,
 ) -> dict:
-    """Compute frozen stop_price / take_profit_price for the new modes.
+    """Compute frozen exit prices and unified-shape signal_detail records.
 
     Returns a dict with keys:
-      - stop_price: float | None       — frozen stop, or None if mode is legacy / unset.
-      - take_profit_price: float | None
-      - stop_metadata: dict | None     — mode/k/window/sigma_or_atr_at_entry, for signal_detail.
-      - tp_metadata: dict | None
-      - abort: bool                    — True if a new mode was requested but history is
-                                         insufficient. Caller skips the entry.
-
-    Legacy modes (drawdown_from_entry, gain_from_entry, above_peak) and unset
-    configs return all-None and abort=False — the engine uses its existing
-    dynamic checks.
+      - stop_price: float | None        — frozen stop for vol-adaptive modes,
+                                          None for legacy (engine uses dynamic check).
+      - take_profit_price: float | None — same.
+      - stop_record: dict | None        — {type, params, evidence, summary} for
+                                          ANY configured stop mode (legacy or new).
+                                          None when no stop is configured.
+      - tp_record: dict | None          — same for take_profit.
+      - abort: bool                     — True if a new mode was requested but history
+                                          is insufficient. Caller skips the entry.
     """
     out = {
         "stop_price": None,
         "take_profit_price": None,
-        "stop_metadata": None,
-        "tp_metadata": None,
+        "stop_record": None,
+        "tp_record": None,
         "abort": False,
     }
 
@@ -113,6 +169,16 @@ def compute_stop_pricing(
     tp = strategy_config.get("take_profit") or {}
     sl_type = sl.get("type")
     tp_type = tp.get("type")
+
+    # Legacy modes need no OHLC. Build their records up front.
+    if sl_type in ("drawdown_from_entry",):
+        out["stop_record"] = _make_record(
+            "stop", sl, _STOP_PARAMS_BY_TYPE.get(sl_type, []), evidence={},
+        )
+    if tp_type in ("gain_from_entry", "above_peak"):
+        out["tp_record"] = _make_record(
+            "tp", tp, _TP_PARAMS_BY_TYPE.get(tp_type, []), evidence={},
+        )
 
     needs_ohlc = sl_type in ("atr_multiple", "realized_vol_multiple") or \
                  tp_type in ("atr_multiple", "realized_vol_multiple")
@@ -128,8 +194,6 @@ def compute_stop_pricing(
             if isinstance(w, int) and w > 0:
                 windows.append(w)
     if not windows:
-        # New mode requested but no valid window — treat as abort so we don't
-        # silently fall back. The Pydantic validator should normally prevent this.
         out["abort"] = True
         return out
     max_window = max(windows)
@@ -144,50 +208,47 @@ def compute_stop_pricing(
         return out
     closes = [c for _, _, c in bars]
 
-    def _price_for(cfg: dict, side: str) -> tuple[float | None, dict | None]:
-        """side = 'stop' (price below entry) or 'tp' (price above entry)."""
-        mode = cfg.get("type")
+    def _price_and_evidence(cfg: dict, side: str) -> tuple[float | None, dict | None]:
+        """Compute frozen exit price and the evidence dict. side = 'stop' | 'tp'."""
+        type_ = cfg.get("type")
         k = cfg.get("k")
         window = cfg.get("window_days")
-        if mode == "atr_multiple":
+        if type_ == "atr_multiple":
             atr = compute_atr(bars, window)
             if atr is None or atr <= 0:
                 return None, None
             offset = k * atr
             price = entry_price - offset if side == "stop" else entry_price + offset
-            return price, {
-                "mode": mode, "k": k, "window_days": window,
-                "atr_at_entry": round(atr, 6), "frozen_price": round(price, 6),
-            }
-        if mode == "realized_vol_multiple":
+            return price, {"atr": round(atr, 6), "frozen_price": round(price, 6)}
+        if type_ == "realized_vol_multiple":
             sigma_source = cfg.get("sigma_source", "historical")
             sigma = compute_realized_vol(closes, window, sigma_source)
             if sigma is None or sigma <= 0:
                 return None, None
-            move = k * sigma  # daily fractional move; flat-percent interpretation
+            move = k * sigma  # daily fractional; flat-percent interpretation
             price = entry_price * (1 - move) if side == "stop" else entry_price * (1 + move)
-            return price, {
-                "mode": mode, "k": k, "window_days": window,
-                "sigma_source": sigma_source, "sigma_at_entry": round(sigma, 8),
-                "frozen_price": round(price, 6),
-            }
+            return price, {"sigma": round(sigma, 8), "frozen_price": round(price, 6)}
         return None, None
 
     if sl_type in ("atr_multiple", "realized_vol_multiple"):
-        price, meta = _price_for(sl, "stop")
+        price, evidence = _price_and_evidence(sl, "stop")
         if price is None:
             out["abort"] = True
             return out
         out["stop_price"] = price
-        out["stop_metadata"] = meta
+        out["stop_record"] = _make_record(
+            "stop", sl, _STOP_PARAMS_BY_TYPE.get(sl_type, []), evidence,
+        )
 
     if tp_type in ("atr_multiple", "realized_vol_multiple"):
-        price, meta = _price_for(tp, "tp")
+        price, evidence = _price_and_evidence(tp, "tp")
         if price is None:
             out["abort"] = True
             return out
         out["take_profit_price"] = price
-        out["tp_metadata"] = meta
+        out["tp_record"] = _make_record(
+            "tp", tp, _TP_PARAMS_BY_TYPE.get(tp_type, []), evidence,
+        )
 
     return out
 

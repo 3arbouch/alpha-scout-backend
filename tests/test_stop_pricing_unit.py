@@ -127,30 +127,48 @@ check(f"hand-traced EWMA matches "
 
 
 # ---------------------------------------------------------------------------
-# compute_stop_pricing — dispatch + abort
+# compute_stop_pricing — unified record shape + dispatch + abort
 # ---------------------------------------------------------------------------
-print("\n=== compute_stop_pricing dispatch ===")
+print("\n=== compute_stop_pricing dispatch (unified shape) ===")
 
-# Legacy modes -> all None, no abort.
+# Legacy stop -> stop_price is None (engine uses dynamic check), but a unified
+# record IS produced for the FE.
 out = compute_stop_pricing(
-    strategy_config={"stop_loss": {"type": "drawdown_from_entry", "value": -25}},
+    strategy_config={"stop_loss": {"type": "drawdown_from_entry", "value": -25,
+                                    "cooldown_days": 60}},
     symbol="X", entry_date="2024-06-15", entry_price=100.0, ohlc_fetcher=None,
 )
-check("legacy drawdown_from_entry: stop_price is None",
+check("legacy drawdown_from_entry: stop_price is None (dynamic)",
       out["stop_price"] is None and not out["abort"])
+sr = out["stop_record"]
+check("legacy stop_record has unified shape (type/params/evidence/summary)",
+      isinstance(sr, dict)
+      and sr.get("type") == "drawdown_from_entry"
+      and sr.get("params", {}).get("value") == -25
+      and sr.get("evidence") == {}
+      and "Stop" in sr.get("summary", ""))
 
-# Unset config -> all None, no abort.
+# Legacy take_profit
+out = compute_stop_pricing(
+    strategy_config={"take_profit": {"type": "gain_from_entry", "value": 60}},
+    symbol="X", entry_date="2024-06-15", entry_price=100.0, ohlc_fetcher=None,
+)
+tr = out["tp_record"]
+check("legacy gain_from_entry tp_record has summary",
+      isinstance(tr, dict) and tr.get("type") == "gain_from_entry"
+      and "TP" in tr.get("summary", ""))
+
+# Unset config -> both records None, no abort.
 out = compute_stop_pricing(
     strategy_config={}, symbol="X", entry_date="2024-06-15",
     entry_price=100.0, ohlc_fetcher=None,
 )
-check("unset config: no abort, no frozen prices",
-      out["stop_price"] is None and out["take_profit_price"] is None and not out["abort"])
+check("unset config: no records, no abort",
+      out["stop_record"] is None and out["tp_record"] is None and not out["abort"])
 
 # ATR mode with synthetic fetcher.
 def fetcher_const(symbol, date, n):
-    # Returns n bars with constant 2.0 spread, no gaps -> ATR = 2.0
-    return [(102.0, 100.0, 101.0)] * n
+    return [(102.0, 100.0, 101.0)] * n  # ATR=2
 
 out = compute_stop_pricing(
     strategy_config={
@@ -159,16 +177,18 @@ out = compute_stop_pricing(
     },
     symbol="X", entry_date="2024-06-15", entry_price=100.0, ohlc_fetcher=fetcher_const,
 )
-# ATR=2, stop = 100 - 2*2 = 96, tp = 100 + 4*2 = 108
 check("ATR stop frozen at 96.0", approx(out["stop_price"], 96.0))
 check("ATR tp frozen at 108.0", approx(out["take_profit_price"], 108.0))
-check("ATR stop metadata includes atr_at_entry",
-      out["stop_metadata"] and out["stop_metadata"].get("atr_at_entry") == 2.0)
-check("ATR no abort on healthy fetch", not out["abort"])
+sr = out["stop_record"]
+check("ATR stop_record.type = atr_multiple",
+      sr and sr["type"] == "atr_multiple" and sr["params"]["k"] == 2.0
+      and sr["evidence"]["atr"] == 2.0 and approx(sr["evidence"]["frozen_price"], 96.0))
+check("ATR stop_record.summary mentions ATR + frozen $",
+      "ATR" in sr["summary"] and "$96.00" in sr["summary"])
 
 # Insufficient bars -> abort.
 def fetcher_short(symbol, date, n):
-    return [(102.0, 100.0, 101.0)] * 3  # always returns 3 bars regardless of n
+    return [(102.0, 100.0, 101.0)] * 3
 
 out = compute_stop_pricing(
     strategy_config={"stop_loss": {"type": "atr_multiple", "k": 2.0, "window_days": 20}},
@@ -177,7 +197,7 @@ out = compute_stop_pricing(
 check("insufficient OHLC -> abort=True",
       out["abort"] and out["stop_price"] is None)
 
-# Realized-vol mode using same constant prices -> sigma=0 -> abort (no usable stop).
+# Realized-vol with constant prices -> sigma=0 -> abort.
 out = compute_stop_pricing(
     strategy_config={"stop_loss": {"type": "realized_vol_multiple", "k": 2.0,
                                     "window_days": 20, "sigma_source": "historical"}},
@@ -185,9 +205,8 @@ out = compute_stop_pricing(
 )
 check("realized_vol with sigma=0 -> abort=True", out["abort"])
 
-# Realized-vol mode with the alternating-returns synthetic.
+# Realized-vol with alternating returns.
 def fetcher_alternating(symbol, date, n):
-    # Generate closes producing alternating ±0.01 log returns; project to OHLC.
     s = [100.0]
     sign = 1
     for _ in range(n - 1):
@@ -207,6 +226,11 @@ expected_stop = 100.0 * (1 - 2.0 * sigma)
 check(f"realized_vol stop ≈ entry*(1-k*sigma) "
       f"(expected={expected_stop:.4f}, got={out['stop_price']:.4f})",
       approx(out["stop_price"], expected_stop, tol=1e-6))
+sr = out["stop_record"]
+check("realized_vol stop_record.evidence.sigma matches",
+      sr and approx(sr["evidence"]["sigma"], sigma, tol=1e-6))
+check("realized_vol summary mentions σ + sigma_source",
+      sr and "σ" in sr["summary"] and "historical" in sr["summary"])
 
 
 # ---------------------------------------------------------------------------
