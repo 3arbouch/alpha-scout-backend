@@ -102,26 +102,35 @@ buys_legacy = [t for t in result_legacy["trades"] if t["action"] == "BUY"]
 check("legacy drawdown_from_entry produces trades", len(buys_legacy) > 0,
       f"buys={len(buys_legacy)}")
 
-# Unified-shape contract: legacy modes ALSO emit stop/take_profit records, so
-# the FE has one rendering path. The records carry type/params/summary; the
-# evidence dict is empty for legacy (no frozen price to record).
+# Canonical signal-record envelope: every record (entry, stop, take_profit)
+# uses {type, config, observed}. Legacy modes emit records with empty observed.
 legacy_record_ok = all(
     isinstance(t.get("signal_detail"), dict)
     and t["signal_detail"].get("stop", {}).get("type") == "drawdown_from_entry"
-    and t["signal_detail"]["stop"].get("evidence") == {}
-    and "Stop" in t["signal_detail"]["stop"].get("summary", "")
+    and t["signal_detail"]["stop"].get("config", {}).get("value") == -10
+    and t["signal_detail"]["stop"].get("observed") == {}
     and t["signal_detail"].get("take_profit", {}).get("type") == "gain_from_entry"
+    and t["signal_detail"]["take_profit"].get("config") == {"value": 15.0}
+    and t["signal_detail"]["take_profit"].get("observed") == {}
     for t in buys_legacy
 )
-check("legacy mode emits unified stop/take_profit records with summary",
+check("legacy stop/tp records use {type, config, observed} envelope",
       legacy_record_ok)
 
-# Entries list is preserved under the new `entries` key (renamed from `_`)
-entries_present = all(
+# Entry signal records also use the canonical envelope.
+entries_envelope_ok = all(
     isinstance(t["signal_detail"].get("entries"), list)
+    and all(
+        isinstance(e, dict)
+        and "type" in e and "config" in e and "observed" in e
+        and "values" not in e   # old key gone
+        and "threshold" not in e   # was spread; now nested in config
+        for e in t["signal_detail"]["entries"]
+    )
     for t in buys_legacy
 )
-check("legacy: entries list preserved under 'entries' key", entries_present)
+check("entry records use {type, config, observed} envelope (no spread/values)",
+      entries_envelope_ok)
 
 # When NO stop and NO take_profit configured, signal_detail stays a list (the
 # original shape) — byte-for-byte legacy preservation.
@@ -150,23 +159,23 @@ buys_atr = [t for t in result_atr["trades"] if t["action"] == "BUY"]
 sells_atr = [t for t in result_atr["trades"] if t["action"] == "SELL"]
 check("ATR mode produces buys", len(buys_atr) > 0, f"buys={len(buys_atr)}")
 
-# Every BUY must have stop record in unified shape.
+# Every BUY must have stop record in canonical envelope.
 all_have_stop_meta = all(
     isinstance(t.get("signal_detail"), dict)
     and t["signal_detail"].get("stop", {}).get("type") == "atr_multiple"
-    and "atr" in t["signal_detail"]["stop"].get("evidence", {})
-    and "frozen_price" in t["signal_detail"]["stop"]["evidence"]
-    and "summary" in t["signal_detail"]["stop"]
+    and "atr" in t["signal_detail"]["stop"].get("observed", {})
+    and "frozen_price" in t["signal_detail"]["stop"]["observed"]
+    and "k" in t["signal_detail"]["stop"].get("config", {})
     for t in buys_atr
 )
-check("every BUY has ATR unified-shape stop record", all_have_stop_meta)
+check("every BUY has ATR canonical-envelope stop record", all_have_stop_meta)
 
 # Every SELL flagged stop_loss must execute at <= frozen stop_price (after slippage).
 sl_fires = [t for t in sells_atr if t.get("reason") == "stop_loss"]
 print(f"  ATR stop-loss fires: {len(sl_fires)}")
 for t in sl_fires:
     sd = t.get("signal_detail") or {}
-    frozen = ((sd.get("stop") or {}).get("evidence") or {}).get("frozen_price")
+    frozen = ((sd.get("stop") or {}).get("observed") or {}).get("frozen_price")
     if frozen is None:
         check(f"stop_loss SELL has frozen_price ({t['symbol']}@{t['date']})", False)
         continue
@@ -178,7 +187,7 @@ tp_fires = [t for t in sells_atr if t.get("reason") == "take_profit"]
 print(f"  ATR take-profit fires: {len(tp_fires)}")
 for t in tp_fires:
     sd = t.get("signal_detail") or {}
-    frozen_tp = ((sd.get("take_profit") or {}).get("evidence") or {}).get("frozen_price")
+    frozen_tp = ((sd.get("take_profit") or {}).get("observed") or {}).get("frozen_price")
     if frozen_tp is None:
         check(f"take_profit SELL has frozen_price ({t['symbol']}@{t['date']})", False)
         continue
@@ -204,19 +213,19 @@ check("realized_vol historical produces buys", len(buys_rv) > 0,
 all_have_meta = all(
     isinstance(t.get("signal_detail"), dict)
     and t["signal_detail"].get("stop", {}).get("type") == "realized_vol_multiple"
-    and t["signal_detail"]["stop"]["params"].get("sigma_source") == "historical"
-    and "sigma" in t["signal_detail"]["stop"].get("evidence", {})
+    and t["signal_detail"]["stop"]["config"].get("sigma_source") == "historical"
+    and "sigma" in t["signal_detail"]["stop"].get("observed", {})
     for t in buys_rv
 )
-check("every BUY has realized_vol historical unified record", all_have_meta)
+check("every BUY has realized_vol historical canonical record", all_have_meta)
 
 # Frozen stop_price should be entry * (1 - k * sigma)
 for t in buys_rv[:3]:
     rec = t["signal_detail"]["stop"]
-    sigma = rec["evidence"]["sigma"]
-    k = rec["params"]["k"]
+    sigma = rec["observed"]["sigma"]
+    k = rec["config"]["k"]
     expected = t["price"] * (1 - k * sigma)
-    actual = rec["evidence"]["frozen_price"]
+    actual = rec["observed"]["frozen_price"]
     ok = abs(expected - actual) < 0.01
     check(f"frozen_price = entry*(1-k*sigma) ({t['symbol']}: "
           f"expected={expected:.4f}, actual={actual:.4f})", ok)
@@ -236,16 +245,16 @@ buys_e = [t for t in result_rv_e["trades"] if t["action"] == "BUY"]
 check("EWMA mode produces buys", len(buys_e) > 0)
 
 # Mixed mode: stop is realized_vol_multiple/ewma, tp is legacy gain_from_entry.
-# Both records present in unified shape; FE renders both via .summary.
+# Both records present in canonical envelope.
 mixed_ok = all(
     isinstance(t.get("signal_detail"), dict)
     and t["signal_detail"].get("stop", {}).get("type") == "realized_vol_multiple"
-    and t["signal_detail"]["stop"]["params"].get("sigma_source") == "ewma"
+    and t["signal_detail"]["stop"]["config"].get("sigma_source") == "ewma"
     and t["signal_detail"].get("take_profit", {}).get("type") == "gain_from_entry"
-    and t["signal_detail"]["take_profit"].get("evidence") == {}
+    and t["signal_detail"]["take_profit"].get("observed") == {}
     for t in buys_e
 )
-check("mixed mode: both stop+tp records emitted in unified shape", mixed_ok)
+check("mixed mode: both stop+tp records use canonical envelope", mixed_ok)
 
 
 # ---------------------------------------------------------------------------

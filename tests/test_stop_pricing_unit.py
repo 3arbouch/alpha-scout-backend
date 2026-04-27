@@ -127,12 +127,12 @@ check(f"hand-traced EWMA matches "
 
 
 # ---------------------------------------------------------------------------
-# compute_stop_pricing — unified record shape + dispatch + abort
+# compute_stop_pricing — canonical {type, config, observed} envelope
 # ---------------------------------------------------------------------------
-print("\n=== compute_stop_pricing dispatch (unified shape) ===")
+print("\n=== compute_stop_pricing dispatch ({type, config, observed}) ===")
 
-# Legacy stop -> stop_price is None (engine uses dynamic check), but a unified
-# record IS produced for the FE.
+# Legacy stop -> stop_price is None (engine uses dynamic check), but the
+# canonical record IS produced (so the FE has uniform rendering across modes).
 out = compute_stop_pricing(
     strategy_config={"stop_loss": {"type": "drawdown_from_entry", "value": -25,
                                     "cooldown_days": 60}},
@@ -141,12 +141,12 @@ out = compute_stop_pricing(
 check("legacy drawdown_from_entry: stop_price is None (dynamic)",
       out["stop_price"] is None and not out["abort"])
 sr = out["stop_record"]
-check("legacy stop_record has unified shape (type/params/evidence/summary)",
+check("legacy stop_record envelope = {type, config, observed}",
       isinstance(sr, dict)
       and sr.get("type") == "drawdown_from_entry"
-      and sr.get("params", {}).get("value") == -25
-      and sr.get("evidence") == {}
-      and "Stop" in sr.get("summary", ""))
+      and sr.get("config", {}).get("value") == -25
+      and sr.get("config", {}).get("cooldown_days") == 60
+      and sr.get("observed") == {})
 
 # Legacy take_profit
 out = compute_stop_pricing(
@@ -154,9 +154,9 @@ out = compute_stop_pricing(
     symbol="X", entry_date="2024-06-15", entry_price=100.0, ohlc_fetcher=None,
 )
 tr = out["tp_record"]
-check("legacy gain_from_entry tp_record has summary",
+check("legacy gain_from_entry tp_record envelope",
       isinstance(tr, dict) and tr.get("type") == "gain_from_entry"
-      and "TP" in tr.get("summary", ""))
+      and tr.get("config") == {"value": 60} and tr.get("observed") == {})
 
 # Unset config -> both records None, no abort.
 out = compute_stop_pricing(
@@ -180,11 +180,12 @@ out = compute_stop_pricing(
 check("ATR stop frozen at 96.0", approx(out["stop_price"], 96.0))
 check("ATR tp frozen at 108.0", approx(out["take_profit_price"], 108.0))
 sr = out["stop_record"]
-check("ATR stop_record.type = atr_multiple",
-      sr and sr["type"] == "atr_multiple" and sr["params"]["k"] == 2.0
-      and sr["evidence"]["atr"] == 2.0 and approx(sr["evidence"]["frozen_price"], 96.0))
-check("ATR stop_record.summary mentions ATR + frozen $",
-      "ATR" in sr["summary"] and "$96.00" in sr["summary"])
+check("ATR stop_record envelope correct",
+      sr and sr["type"] == "atr_multiple"
+      and sr["config"]["k"] == 2.0 and sr["config"]["window_days"] == 20
+      and sr["observed"]["atr"] == 2.0 and approx(sr["observed"]["frozen_price"], 96.0))
+check("ATR record has no legacy keys (params/evidence/summary)",
+      "params" not in sr and "evidence" not in sr and "summary" not in sr)
 
 # Insufficient bars -> abort.
 def fetcher_short(symbol, date, n):
@@ -227,10 +228,10 @@ check(f"realized_vol stop ≈ entry*(1-k*sigma) "
       f"(expected={expected_stop:.4f}, got={out['stop_price']:.4f})",
       approx(out["stop_price"], expected_stop, tol=1e-6))
 sr = out["stop_record"]
-check("realized_vol stop_record.evidence.sigma matches",
-      sr and approx(sr["evidence"]["sigma"], sigma, tol=1e-6))
-check("realized_vol summary mentions σ + sigma_source",
-      sr and "σ" in sr["summary"] and "historical" in sr["summary"])
+check("realized_vol observed.sigma matches",
+      sr and approx(sr["observed"]["sigma"], sigma, tol=1e-6))
+check("realized_vol config carries sigma_source",
+      sr and sr["config"]["sigma_source"] == "historical")
 
 
 # ---------------------------------------------------------------------------

@@ -9,6 +9,31 @@ and scripts/backtest_engine.py for the call sites.
 All functions are pure: caller supplies the OHLC tail, we return numbers.
 Returning None signals "insufficient history — caller decides what to do"
 (today: skip the trade).
+
+----------------------------------------------------------------------------
+Signal-record contract (canonical)
+----------------------------------------------------------------------------
+Every signal record emitted into a trade's `signal_detail` follows the same
+envelope, regardless of kind (entry condition, stop loss, take profit):
+
+    {
+      "type":     "<rule type discriminator>",
+      "config":   {<all user-set parameters of the rule>},
+      "observed": {<runtime values measured at evaluation/freeze time>}
+    }
+
+- `type` is the discriminator from the Pydantic schema (e.g. "current_drop",
+  "atr_multiple", "gain_from_entry"). Same values that appear in the
+  StrategyConfig.
+- `config` always contains the full set of user-tunable params for that type.
+  Empty dict only if the type has no params.
+- `observed` is the runtime evidence: what the engine measured at the moment
+  the rule was evaluated or frozen. Empty dict for legacy modes whose check is
+  dynamic and produces no per-trade observation. Always present (never null).
+
+This envelope is uniform across signal kinds so a single FE renderer handles
+every type, present and future. See scripts/backtest_engine.py for entry-side
+emission and Portfolio.open_position for stop/TP emission.
 """
 from __future__ import annotations
 
@@ -80,59 +105,31 @@ def compute_realized_vol(closes: list[float], window_days: int, source: str) -> 
     return None
 
 
-def _summarize(role: str, type_: str, params: dict, evidence: dict) -> str:
-    """BE-rendered human-readable label for a stop / take-profit record.
+def _make_record(cfg: dict, config_keys: list[str], observed: dict) -> dict:
+    """Build the canonical signal record envelope for one rule.
 
-    The FE renders this as-is when it doesn't have a custom layout for `type_`.
-    Adding a future signal type means writing a `_summarize` branch — the FE
-    keeps working without changes.
+    `config_keys` is the whitelist of fields from `cfg` that belong in `config`.
+    Anything not listed (e.g. internal flags) is dropped.
     """
-    label = "Stop" if role == "stop" else "TP"
-    if type_ == "drawdown_from_entry":
-        return f"{label} @ {params.get('value')}%"
-    if type_ == "gain_from_entry":
-        sign = "+" if (params.get("value") or 0) >= 0 else ""
-        return f"{label} @ {sign}{params.get('value')}%"
-    if type_ == "above_peak":
-        return f"{label} @ +{params.get('value')}% above peak"
-    if type_ == "atr_multiple":
-        fp = evidence.get("frozen_price")
-        fp_s = f" = ${fp:.2f}" if isinstance(fp, (int, float)) else ""
-        return f"{label} @ {params.get('k')}× ATR({params.get('window_days')}d){fp_s}"
-    if type_ == "realized_vol_multiple":
-        fp = evidence.get("frozen_price")
-        fp_s = f" = ${fp:.2f}" if isinstance(fp, (int, float)) else ""
-        src = params.get("sigma_source", "historical")
-        return f"{label} @ {params.get('k')}σ ({params.get('window_days')}d, {src}){fp_s}"
-    return f"{label} ({type_})"
-
-
-def _make_record(role: str, cfg: dict, params_keys: list[str], evidence: dict) -> dict:
-    """Build the unified {type, params, evidence, summary} record for one role.
-
-    `params_keys` is the subset of `cfg` keys that belong in `params` (the input
-    config) — keeps `type` and any fields that don't make sense to echo out.
-    """
-    type_ = cfg.get("type")
-    params = {k: cfg[k] for k in params_keys if k in cfg}
     return {
-        "type": type_,
-        "params": params,
-        "evidence": evidence,
-        "summary": _summarize(role, type_, params, evidence),
+        "type": cfg.get("type"),
+        "config": {k: cfg[k] for k in config_keys if k in cfg},
+        "observed": observed,
     }
 
 
-# Per-type fields that go into `params`. New types extend these mappings.
-_STOP_PARAMS_BY_TYPE = {
-    "drawdown_from_entry": ["value", "cooldown_days"],
-    "atr_multiple": ["k", "window_days", "cooldown_days"],
+# Per-type config fields. Anything not in this list is dropped from the record.
+# Adding a new type means adding a new entry here and (if needed) extending the
+# computation block in compute_stop_pricing.
+_STOP_CONFIG_KEYS_BY_TYPE = {
+    "drawdown_from_entry":   ["value", "cooldown_days"],
+    "atr_multiple":          ["k", "window_days", "cooldown_days"],
     "realized_vol_multiple": ["k", "window_days", "sigma_source", "cooldown_days"],
 }
-_TP_PARAMS_BY_TYPE = {
-    "gain_from_entry": ["value"],
-    "above_peak": ["value"],
-    "atr_multiple": ["k", "window_days"],
+_TP_CONFIG_KEYS_BY_TYPE = {
+    "gain_from_entry":       ["value"],
+    "above_peak":            ["value"],
+    "atr_multiple":          ["k", "window_days"],
     "realized_vol_multiple": ["k", "window_days", "sigma_source"],
 }
 
@@ -170,14 +167,14 @@ def compute_stop_pricing(
     sl_type = sl.get("type")
     tp_type = tp.get("type")
 
-    # Legacy modes need no OHLC. Build their records up front.
-    if sl_type in ("drawdown_from_entry",):
+    # Legacy modes need no OHLC. Build their records with empty `observed`.
+    if sl_type == "drawdown_from_entry":
         out["stop_record"] = _make_record(
-            "stop", sl, _STOP_PARAMS_BY_TYPE.get(sl_type, []), evidence={},
+            sl, _STOP_CONFIG_KEYS_BY_TYPE.get(sl_type, []), observed={},
         )
     if tp_type in ("gain_from_entry", "above_peak"):
         out["tp_record"] = _make_record(
-            "tp", tp, _TP_PARAMS_BY_TYPE.get(tp_type, []), evidence={},
+            tp, _TP_CONFIG_KEYS_BY_TYPE.get(tp_type, []), observed={},
         )
 
     needs_ohlc = sl_type in ("atr_multiple", "realized_vol_multiple") or \
@@ -208,8 +205,8 @@ def compute_stop_pricing(
         return out
     closes = [c for _, _, c in bars]
 
-    def _price_and_evidence(cfg: dict, side: str) -> tuple[float | None, dict | None]:
-        """Compute frozen exit price and the evidence dict. side = 'stop' | 'tp'."""
+    def _price_and_observed(cfg: dict, side: str) -> tuple[float | None, dict | None]:
+        """Compute frozen exit price and the observed dict. side = 'stop' | 'tp'."""
         type_ = cfg.get("type")
         k = cfg.get("k")
         window = cfg.get("window_days")
@@ -231,23 +228,23 @@ def compute_stop_pricing(
         return None, None
 
     if sl_type in ("atr_multiple", "realized_vol_multiple"):
-        price, evidence = _price_and_evidence(sl, "stop")
+        price, observed = _price_and_observed(sl, "stop")
         if price is None:
             out["abort"] = True
             return out
         out["stop_price"] = price
         out["stop_record"] = _make_record(
-            "stop", sl, _STOP_PARAMS_BY_TYPE.get(sl_type, []), evidence,
+            sl, _STOP_CONFIG_KEYS_BY_TYPE.get(sl_type, []), observed,
         )
 
     if tp_type in ("atr_multiple", "realized_vol_multiple"):
-        price, evidence = _price_and_evidence(tp, "tp")
+        price, observed = _price_and_observed(tp, "tp")
         if price is None:
             out["abort"] = True
             return out
         out["take_profit_price"] = price
         out["tp_record"] = _make_record(
-            "tp", tp, _TP_PARAMS_BY_TYPE.get(tp_type, []), evidence,
+            tp, _TP_CONFIG_KEYS_BY_TYPE.get(tp_type, []), observed,
         )
 
     return out

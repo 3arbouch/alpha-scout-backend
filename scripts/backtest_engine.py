@@ -1473,10 +1473,13 @@ def precompute_signals(config: dict, symbols: list[str], conn, price_index: dict
         structured_signals[symbol] = {}
         for date, metadata in dates.items():
             if not isinstance(metadata, dict):
-                # Simple value — wrap it
-                structured_signals[symbol][date] = [
-                    {"type": conditions[0]["type"], "values": {"value": metadata}}
-                ]
+                # Simple value — wrap into the canonical {type, config, observed} envelope.
+                cond_config = conditions[0] if conditions else {}
+                structured_signals[symbol][date] = [{
+                    "type": cond_config.get("type", "unknown"),
+                    "config": {k: v for k, v in cond_config.items() if k != "type"},
+                    "observed": {"value": metadata},
+                }]
                 continue
 
             # Group keys by condition index
@@ -1498,13 +1501,12 @@ def precompute_signals(config: dict, symbols: list[str], conn, price_index: dict
             result = []
             for idx in sorted(by_condition.keys()):
                 cond_config = conditions[idx] if idx < len(conditions) else {}
-                # Carry the full condition config (feature, operator, thresholds, scope, etc.)
-                # so the trader can see BOTH the rule and the observed values. `type` is set
-                # first so it wins over any stray duplicate.
+                # Canonical signal-record envelope: {type, config, observed}.
+                # See scripts/stop_pricing.py module docstring for the contract.
                 entry = {
                     "type": cond_config.get("type", "unknown"),
-                    "values": by_condition[idx],
-                    **{k: v for k, v in cond_config.items() if k != "type"},
+                    "config": {k: v for k, v in cond_config.items() if k != "type"},
+                    "observed": by_condition[idx] or {},
                 }
                 result.append(entry)
 
