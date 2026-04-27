@@ -1548,7 +1548,8 @@ class Position:
     """A single open position."""
 
     def __init__(self, symbol: str, entry_date: str, entry_price: float,
-                 shares: float, peak_price: float = None, signal_detail: dict = None):
+                 shares: float, peak_price: float = None, signal_detail: dict = None,
+                 stop_price: float | None = None, take_profit_price: float | None = None):
         self.symbol = symbol
         self.entry_date = entry_date
         self.entry_price = entry_price
@@ -1556,6 +1557,10 @@ class Position:
         self.peak_price = peak_price or entry_price  # pre-selloff peak for above_peak TP
         self.high_since_entry = entry_price
         self.signal_detail = signal_detail  # entry signal info, carried to SELL trades
+        # Frozen exit prices for vol-adaptive modes (atr_multiple, realized_vol_multiple).
+        # None for legacy modes — those use the dynamic pnl_pct check.
+        self.stop_price = stop_price
+        self.take_profit_price = take_profit_price
 
     def market_value(self, current_price: float) -> float:
         return self.shares * current_price
@@ -1574,20 +1579,52 @@ class Position:
 class Portfolio:
     """Portfolio state tracker."""
 
-    def __init__(self, initial_cash: float):
+    def __init__(self, initial_cash: float, strategy_config: dict | None = None,
+                 ohlc_fetcher=None):
         self.initial_cash = initial_cash
         self.cash = initial_cash
         self.positions: dict[str, Position] = {}  # symbol -> Position
         self.trades: list[dict] = []
         self.nav_history: list[dict] = []  # [{date, nav, cash, positions_value}]
         self.closed_trades: list[dict] = []
+        # For vol-adaptive stop modes: full strategy config (so open_position
+        # knows the active mode/params) and a fetcher to pull pre-entry OHLC.
+        # Both are None for tests/legacy callers — vol modes simply abort then.
+        self.strategy_config = strategy_config or {}
+        self.ohlc_fetcher = ohlc_fetcher
 
     def open_position(self, symbol: str, date: str, price: float,
                       amount: float, slippage_bps: float = 0,
                       peak_price: float = None, signal_detail: dict = None):
-        """Open a new position."""
+        """Open a new position. Skips silently if vol-adaptive stop pricing
+        can't be computed (insufficient history)."""
         # Apply slippage
         exec_price = price * (1 + slippage_bps / 10000)
+
+        # Vol-adaptive stop/TP: compute frozen exit prices once at entry.
+        # Legacy modes get all-None and the dynamic check stays in force.
+        from stop_pricing import compute_stop_pricing
+        pricing = compute_stop_pricing(
+            self.strategy_config, symbol, date, exec_price, self.ohlc_fetcher,
+        )
+        if pricing["abort"]:
+            # Insufficient history for the requested vol-adaptive mode — skip
+            # the entry. Same effect as a missing price: no Position, no trade.
+            print(f"  [vol-stops] skip {symbol} @ {date}: insufficient history")
+            return
+
+        # Embed vol-stop metadata into signal_detail so postmortems can see it
+        # without a DB migration. Carried to the SELL trade by existing logic.
+        merged_signal = dict(signal_detail) if isinstance(signal_detail, dict) else (
+            {"_": signal_detail} if signal_detail is not None else {}
+        )
+        if pricing["stop_metadata"]:
+            merged_signal["stop"] = pricing["stop_metadata"]
+        if pricing["tp_metadata"]:
+            merged_signal["take_profit"] = pricing["tp_metadata"]
+        if not merged_signal:
+            merged_signal = signal_detail  # preserve original None-ish passthrough
+
         shares = amount / exec_price
 
         if symbol in self.positions:
@@ -1603,7 +1640,9 @@ class Portfolio:
                 entry_price=exec_price,
                 shares=shares,
                 peak_price=peak_price,
-                signal_detail=signal_detail,
+                signal_detail=merged_signal,
+                stop_price=pricing["stop_price"],
+                take_profit_price=pricing["take_profit_price"],
             )
 
         self.cash -= amount
@@ -1615,7 +1654,7 @@ class Portfolio:
             "price": round(exec_price, 2),
             "shares": round(shares, 4),
             "amount": round(amount, 2),
-            "signal_detail": signal_detail,
+            "signal_detail": merged_signal,
         })
 
     def close_position(self, symbol: str, date: str, price: float,
@@ -1728,9 +1767,13 @@ def check_stop_loss(pos: Position, current_price: float, config: dict) -> bool:
         return False
 
     sl_type = sl.get("type")
-    sl_value = sl.get("value", -25)
+
+    # Vol-adaptive modes: stop_price was frozen at entry. Trigger on price cross.
+    if sl_type in ("atr_multiple", "realized_vol_multiple"):
+        return pos.stop_price is not None and current_price <= pos.stop_price
 
     if sl_type == "drawdown_from_entry":
+        sl_value = sl.get("value", -25)
         pnl = pos.pnl_pct(current_price)
         return pnl <= sl_value
 
@@ -1744,6 +1787,11 @@ def check_take_profit(pos: Position, current_price: float, config: dict) -> bool
         return False
 
     tp_type = tp.get("type")
+
+    # Vol-adaptive modes: tp_price was frozen at entry. Trigger on price cross.
+    if tp_type in ("atr_multiple", "realized_vol_multiple"):
+        return pos.take_profit_price is not None and current_price >= pos.take_profit_price
+
     tp_value = tp.get("value", 10)
 
     if tp_type == "gain_from_entry":
@@ -1882,7 +1930,11 @@ def run_backtest(config: dict, force_close_at_end: bool = True,
     max_positions = config["sizing"].get("max_positions", 10)
     entry_mode = config["backtest"].get("entry_price", "next_close")
 
-    portfolio = Portfolio(initial_cash)
+    # Build a per-symbol OHLC fetcher for vol-adaptive stops. Cheap closure
+    # over the simulation's market.db connection; only invoked at entry time.
+    from stop_pricing import make_sqlite_ohlc_fetcher
+    _ohlc_fetcher = make_sqlite_ohlc_fetcher(conn)
+    portfolio = Portfolio(initial_cash, strategy_config=config, ohlc_fetcher=_ohlc_fetcher)
 
     import random
 
