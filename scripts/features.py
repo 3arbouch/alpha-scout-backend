@@ -36,37 +36,53 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 from db_config import MARKET_DB_PATH  # noqa: E402
+from server.factors import materialized_features  # noqa: E402
+from server.factors.context import build_context  # noqa: E402
 
 
-FEATURE_COLUMNS = (
-    "pe", "ps", "p_b", "ev_ebitda", "ev_sales",
-    "fcf_yield", "div_yield", "eps_yoy", "rev_yoy",
-)
+def _materialized_columns() -> tuple[str, ...]:
+    """Column names of every precomputed feature, in registry-stable order."""
+    return tuple(f.name for f in materialized_features())
 
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS features_daily (
-    symbol      TEXT NOT NULL,
-    date        TEXT NOT NULL,
-    pe          REAL,
-    ps          REAL,
-    p_b         REAL,
-    ev_ebitda   REAL,
-    ev_sales    REAL,
-    fcf_yield   REAL,
-    div_yield   REAL,
-    eps_yoy     REAL,
-    rev_yoy     REAL,
-    PRIMARY KEY (symbol, date)
-);
-CREATE INDEX IF NOT EXISTS idx_features_date ON features_daily(date);
-CREATE INDEX IF NOT EXISTS idx_features_symbol ON features_daily(symbol);
-"""
+# Backwards-compat alias for callers that still import this constant.
+# Sourced from the registry, not hand-typed.
+FEATURE_COLUMNS = _materialized_columns()
+
+
+def _build_schema_sql() -> str:
+    """Generate CREATE TABLE + INDEXes from the registry."""
+    cols = ",\n    ".join(f"{name:11s} REAL" for name in _materialized_columns())
+    return (
+        f"CREATE TABLE IF NOT EXISTS features_daily (\n"
+        f"    symbol      TEXT NOT NULL,\n"
+        f"    date        TEXT NOT NULL,\n"
+        f"    {cols},\n"
+        f"    PRIMARY KEY (symbol, date)\n"
+        f");\n"
+        f"CREATE INDEX IF NOT EXISTS idx_features_date ON features_daily(date);\n"
+        f"CREATE INDEX IF NOT EXISTS idx_features_symbol ON features_daily(symbol);"
+    )
+
+
+# Generated lazily at module import — captured as a string for visibility / debug.
+SCHEMA = _build_schema_sql()
+
+
+def _existing_columns(conn: sqlite3.Connection) -> set[str]:
+    return {r[1] for r in conn.execute("PRAGMA table_info(features_daily)").fetchall()}
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
+    """Create features_daily if missing, then ALTER TABLE for any registered
+    feature column not yet present (additive only — never drops a column)."""
     conn.executescript(SCHEMA)
+    existing = _existing_columns(conn)
+    for col in _materialized_columns():
+        if col not in existing:
+            conn.execute(f"ALTER TABLE features_daily ADD COLUMN {col} REAL")
     conn.commit()
 
 
@@ -240,35 +256,39 @@ def compute_features_for_day(
 # ---------------------------------------------------------------------------
 # Build per symbol
 # ---------------------------------------------------------------------------
-UPSERT_SQL = (
-    "INSERT OR REPLACE INTO features_daily "
-    "(symbol,date,pe,ps,p_b,ev_ebitda,ev_sales,fcf_yield,div_yield,eps_yoy,rev_yoy) "
-    "VALUES (?,?,?,?,?,?,?,?,?,?,?)"
-)
+def _build_upsert_sql() -> str:
+    cols = _materialized_columns()
+    col_list = ",".join(("symbol", "date", *cols))
+    placeholders = ",".join("?" * (2 + len(cols)))
+    return f"INSERT OR REPLACE INTO features_daily ({col_list}) VALUES ({placeholders})"
+
+
+UPSERT_SQL = _build_upsert_sql()
 
 
 def build_symbol(conn: sqlite3.Connection, symbol: str, start_date: str | None = None) -> int:
-    """Compute and upsert features for every trading day we have prices for. Returns row count."""
+    """Compute and upsert features for every trading day we have prices for.
+
+    Registry-driven: iterates materialized_features() and calls each compute()
+    against a shared per-(symbol, date) ComputeContext. Returns row count.
+    """
     income, balance, cashflow, prices = _load_symbol_bundles(conn, symbol)
     if not income or not prices:
         return 0
 
+    cols = _materialized_columns()
+    feats = materialized_features()
     rows = []
     for date, close in prices:
         if start_date and date < start_date:
             continue
         if close is None or close <= 0:
             continue
-        feats = compute_features_for_day(date, close, income, balance, cashflow)
-        if feats is None:
+        ctx = build_context(symbol, date, close, income, balance, cashflow)
+        if ctx is None:
             continue
-        rows.append((
-            symbol, date,
-            feats["pe"], feats["ps"], feats["p_b"],
-            feats["ev_ebitda"], feats["ev_sales"],
-            feats["fcf_yield"], feats["div_yield"],
-            feats["eps_yoy"], feats["rev_yoy"],
-        ))
+        values = tuple(f.compute(ctx) for f in feats)
+        rows.append((symbol, date, *values))
 
     if rows:
         cur = conn.cursor()
