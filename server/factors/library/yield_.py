@@ -28,5 +28,5 @@ register_feature(
     name="div_yield", compute=_div_yield,
     deps=("prices.close", "cashflow.dividends_paid", "income.shares_diluted"),
     materialization="precomputed", category="yield", unit="percent",
-    description="TTM |dividends_paid| / market_cap × 100. Percent.",
+    description="TTM abs(dividends_paid) / market_cap × 100.",
 )

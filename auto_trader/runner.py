@@ -70,6 +70,82 @@ def _load_schemas() -> str:
         return f"## Schema Error\nFailed to load schemas: {e}"
 
 
+def _load_factor_catalog() -> str:
+    """Build the factor catalog block from server.factors registry + a recent
+    cross-section from features_daily.
+
+    For each registered feature: name, category, unit, definition. For
+    materialized features, also p10/p50/p90 across all symbols on the most
+    recent trading date with broad coverage — gives the agent a 'what's a
+    normal value today' anchor before it picks a threshold.
+    """
+    try:
+        import sqlite3
+        import statistics
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+        from server.factors import all_features
+        from db_config import MARKET_DB_PATH  # type: ignore
+
+        feats = all_features()
+        if not feats:
+            return ""
+
+        # Pull a recent cross-section per feature. We use the most recent date
+        # in features_daily with > 100 non-null values for that feature.
+        rows: list[str] = []
+        rows.append(
+            "| name | category | unit | definition | "
+            "p10 | p50 | p90 | n |"
+        )
+        rows.append(
+            "|---|---|---|---|---|---|---|---|"
+        )
+        with sqlite3.connect(str(MARKET_DB_PATH)) as conn:
+            for f in feats:
+                p10 = p50 = p90 = ""
+                n_str = ""
+                if f.materialization == "precomputed":
+                    cur = conn.cursor()
+                    latest = cur.execute(
+                        f"SELECT date FROM features_daily "
+                        f"WHERE {f.name} IS NOT NULL "
+                        f"GROUP BY date HAVING COUNT(*) > 100 "
+                        f"ORDER BY date DESC LIMIT 1"
+                    ).fetchone()
+                    if latest:
+                        vals = [r[0] for r in cur.execute(
+                            f"SELECT {f.name} FROM features_daily "
+                            f"WHERE date = ? AND {f.name} IS NOT NULL",
+                            (latest[0],),
+                        ).fetchall()]
+                        if vals:
+                            vs = sorted(vals)
+                            n = len(vs)
+                            p10 = f"{vs[int(n*0.1)]:.2f}"
+                            p50 = f"{statistics.median(vs):.2f}"
+                            p90 = f"{vs[int(n*0.9)]:.2f}"
+                            n_str = str(n)
+                else:
+                    p10 = p50 = p90 = "_on-the-fly_"
+                    n_str = "—"
+                rows.append(
+                    f"| `{f.name}` | {f.category} | {f.unit} | "
+                    f"{f.description} | {p10} | {p50} | {p90} | {n_str} |"
+                )
+
+        return (
+            "### Factor Catalog (server/factors registry)\n\n"
+            "Every named factor that `feature_threshold` and `feature_percentile` "
+            "can reference. Materialized factors are stored in the `features_daily` "
+            "table and queryable via `data-query`. Cross-section stats (p10/p50/p90, "
+            "n) are from the most recent trading date with broad coverage — use "
+            "them to pick reasonable thresholds.\n\n"
+            + "\n".join(rows)
+        )
+    except Exception as e:
+        return f"### Factor Catalog\n_(load failed: {e})_"
+
+
 _custom_prompt = None
 # Explicit allowlist for this run. None means the API/CLI didn't supply one,
 # in which case we fall back to the full current catalog (CLI convenience).
@@ -137,8 +213,10 @@ def load_program(agent_prompt: str | None = None) -> str:
         agent_prompt = _custom_prompt or (Path(__file__).parent / "program.md").read_text()
 
     schemas = _load_schemas()
+    catalog = _load_factor_catalog()
 
-    return agent_prompt + "\n\n---\n\n" + system_instructions + "\n\n---\n\n" + schemas
+    parts = [agent_prompt, system_instructions, catalog, schemas]
+    return "\n\n---\n\n".join(p for p in parts if p)
 
 
 def parse_thesis(agent_output: str) -> dict | None:

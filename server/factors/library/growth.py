@@ -21,11 +21,11 @@ register_feature(
     name="eps_yoy", compute=_eps_yoy,
     deps=("income.eps_diluted",),
     materialization="precomputed", category="growth", unit="percent",
-    description="(latest-Q eps_diluted − same-Q prior year) / |prior| × 100. Percent.",
+    description="(latest-Q eps_diluted − same-Q prior year) / abs(prior) × 100.",
 )
 register_feature(
     name="rev_yoy", compute=_rev_yoy,
     deps=("income.revenue",),
     materialization="precomputed", category="growth", unit="percent",
-    description="(latest-Q revenue − same-Q prior year) / prior × 100. Percent.",
+    description="(latest-Q revenue − same-Q prior year) / prior × 100.",
 )
