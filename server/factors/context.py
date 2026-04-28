@@ -1,0 +1,165 @@
+"""ComputeContext — the per-(symbol, date) input bundle passed to feature.compute().
+
+The daily update job loads a symbol's raw history once, then iterates trading
+days. For each day it builds a ComputeContext that exposes lazily-computed
+TTM aggregates and point-in-time slices. Every registered feature reads from
+this context so the slice work happens once per (symbol, date), not once per
+feature.
+
+The semantics here MUST match scripts/features.py exactly — that's what the
+parity test verifies.
+"""
+from __future__ import annotations
+
+from bisect import bisect_right
+from dataclasses import dataclass
+from functools import cached_property
+
+
+# Column indices inside the income tuple loaded as
+# (date, revenue, net_income, ebitda, eps_diluted, shares_diluted)
+I_DATE, I_REV, I_NI, I_EBITDA, I_EPS_D, I_SHARES = 0, 1, 2, 3, 4, 5
+# Balance: (date, total_equity, net_debt)
+B_EQUITY, B_NET_DEBT = 1, 2
+# Cashflow: (date, free_cash_flow, dividends_paid)
+C_FCF, C_DIV = 1, 2
+
+
+def _ttm(quarters: list[tuple], col_idx: int) -> float | None:
+    """Sum the last 4 quarter values at col_idx. None if <4 quarters or any NULL."""
+    if len(quarters) < 4:
+        return None
+    total = 0.0
+    for q in quarters[-4:]:
+        v = q[col_idx]
+        if v is None:
+            return None
+        total += v
+    return total
+
+
+def _yoy_pct(latest: tuple, prior: tuple | None, col_idx: int) -> float | None:
+    if prior is None:
+        return None
+    curr = latest[col_idx]
+    prev = prior[col_idx]
+    if curr is None or prev is None or prev == 0:
+        return None
+    return (curr - prev) / abs(prev) * 100.0
+
+
+def _as_of(rows: list[tuple], target_date: str) -> tuple | None:
+    if not rows:
+        return None
+    dates = [r[0] for r in rows]
+    idx = bisect_right(dates, target_date) - 1
+    return rows[idx] if idx >= 0 else None
+
+
+def _as_of_slice(rows: list[tuple], target_date: str) -> list[tuple]:
+    if not rows:
+        return []
+    dates = [r[0] for r in rows]
+    idx = bisect_right(dates, target_date)
+    return rows[:idx]
+
+
+@dataclass
+class ComputeContext:
+    """Inputs available to every feature compute() for one (symbol, date)."""
+    symbol: str
+    date: str
+    close: float
+    income_slice: list[tuple]      # ascending, all rows with date <= self.date
+    balance_asof: tuple | None     # last balance row with date <= self.date
+    cashflow_slice: list[tuple]    # ascending, all rows with date <= self.date
+
+    @cached_property
+    def latest_q(self) -> tuple | None:
+        return self.income_slice[-1] if self.income_slice else None
+
+    @cached_property
+    def prior_year_q(self) -> tuple | None:
+        """Income row 4 quarters before the latest, or None."""
+        if not self.income_slice:
+            return None
+        latest_idx = len(self.income_slice) - 1
+        prior_idx = latest_idx - 4
+        return self.income_slice[prior_idx] if prior_idx >= 0 else None
+
+    @cached_property
+    def shares(self) -> float | None:
+        if not self.latest_q:
+            return None
+        s = self.latest_q[I_SHARES]
+        return s if s and s > 0 else None
+
+    @cached_property
+    def market_cap(self) -> float | None:
+        return self.close * self.shares if self.shares else None
+
+    @cached_property
+    def ttm_revenue(self) -> float | None:
+        return _ttm(self.income_slice, I_REV)
+
+    @cached_property
+    def ttm_net_income(self) -> float | None:
+        return _ttm(self.income_slice, I_NI)
+
+    @cached_property
+    def ttm_ebitda(self) -> float | None:
+        return _ttm(self.income_slice, I_EBITDA)
+
+    @cached_property
+    def total_equity(self) -> float | None:
+        return self.balance_asof[B_EQUITY] if self.balance_asof else None
+
+    @cached_property
+    def net_debt(self) -> float | None:
+        return self.balance_asof[B_NET_DEBT] if self.balance_asof else None
+
+    @cached_property
+    def enterprise_value(self) -> float | None:
+        if self.market_cap is None or self.net_debt is None:
+            return None
+        return self.market_cap + self.net_debt
+
+    @cached_property
+    def ttm_fcf(self) -> float | None:
+        return _ttm(self.cashflow_slice, C_FCF) if self.cashflow_slice else None
+
+    @cached_property
+    def ttm_dividends(self) -> float | None:
+        return _ttm(self.cashflow_slice, C_DIV) if self.cashflow_slice else None
+
+
+def build_context(
+    symbol: str,
+    date: str,
+    close: float,
+    income: list[tuple],
+    balance: list[tuple],
+    cashflow: list[tuple],
+) -> ComputeContext | None:
+    """Slice raw symbol bundles to the as-of view for `date` and wrap them.
+
+    Returns None when the row should be skipped entirely:
+      - no income rows as-of this date (no fundamentals yet), OR
+      - the latest as-of income row has no usable shares_diluted.
+    Both are conditions under which every materialized feature would be None,
+    so we skip the row to match scripts/features.py:compute_features_for_day.
+    """
+    income_slice = _as_of_slice(income, date)
+    if not income_slice:
+        return None
+    shares = income_slice[-1][I_SHARES]
+    if not shares or shares <= 0:
+        return None
+    return ComputeContext(
+        symbol=symbol,
+        date=date,
+        close=close,
+        income_slice=income_slice,
+        balance_asof=_as_of(balance, date),
+        cashflow_slice=_as_of_slice(cashflow, date),
+    )
