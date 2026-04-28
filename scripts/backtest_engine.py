@@ -264,9 +264,11 @@ def precompute_condition(condition_config: dict, symbols: list[str], conn, start
     elif ctype == "always":
         return _precompute_always_condition(symbols, conn, start, end, price_index=price_index)
     elif ctype == "feature_threshold":
-        return _precompute_feature_threshold(condition_config, symbols, conn, start, end)
+        return _precompute_feature_threshold(condition_config, symbols, conn, start, end,
+                                             price_index=price_index)
     elif ctype == "feature_percentile":
-        return _precompute_feature_percentile(condition_config, symbols, conn, start, end)
+        return _precompute_feature_percentile(condition_config, symbols, conn, start, end,
+                                              price_index=price_index)
     elif ctype == "days_to_earnings":
         return _precompute_days_to_earnings(condition_config, symbols, conn, start, end, price_index=price_index)
     elif ctype == "analyst_upgrades":
@@ -454,18 +456,64 @@ def _get_market_conn(conn):
     return sqlite3.connect(mk), True  # new connection, must close
 
 
-def _load_feature_series(feature: str, symbols: list[str], start: str, end: str, conn) -> dict:
-    """Bulk-load features_daily for `feature`, returning {symbol: [(date, value), ...]} sorted asc.
+def _load_feature_series(feature: str, symbols: list[str], start: str, end: str, conn,
+                         price_index: dict | None = None) -> dict:
+    """Return {symbol: [(date, value), ...]} for `feature` over [start, end].
 
-    Range is widened 1y before `start` so bisect-as-of can find a value for early trading days
-    when the first in-window row hasn't been written yet (rare, but happens for IPOs).
+    Registry-aware:
+      - precomputed → bulk SELECT from features_daily.
+      - on_the_fly  → call FeatureDef.compute_series(symbol, prices) per symbol.
+        price_index must be provided (the engine builds it once per backtest).
+
+    Range is widened 1y before `start` so bisect-as-of can find a value for
+    early trading days when the first in-window row hasn't been written yet.
     """
-    if feature not in FEATURE_COLUMNS:
-        raise ValueError(f"Unknown feature: {feature}")
-    # pad start by 1 year so as-of lookups have data even near the edge
     from datetime import datetime, timedelta
+    import sys as _sys
+    from pathlib import Path as _Path
+    _sys.path.insert(0, str(_Path(__file__).parent.parent))
+    from server.factors import get as _get_feature, feature_names as _feature_names
+
+    if feature not in _feature_names():
+        raise ValueError(f"Unknown feature: {feature}")
+    fd = _get_feature(feature)
     pad_start = (datetime.strptime(start, "%Y-%m-%d") - timedelta(days=365)).strftime("%Y-%m-%d")
 
+    if fd.materialization == "on_the_fly":
+        # Compute per-symbol from price history. Use price_index if given;
+        # else fall back to loading closes from the DB.
+        out: dict[str, list] = {}
+        for sym in symbols:
+            if price_index and sym in price_index:
+                # price_index[sym] is {date: close}; convert to ascending list.
+                prices = sorted(price_index[sym].items())
+            else:
+                mconn, owned = _get_market_conn(conn)
+                try:
+                    rows = mconn.execute(
+                        "SELECT date, close FROM prices WHERE symbol=? "
+                        "AND close IS NOT NULL ORDER BY date ASC",
+                        (sym,),
+                    ).fetchall()
+                    prices = [(d, float(c)) for d, c in rows]
+                finally:
+                    if owned:
+                        mconn.close()
+            if not prices:
+                continue
+            series_map = fd.compute_series(sym, prices)
+            if not series_map:
+                continue
+            # Filter to the padded window and convert to (date, value) ascending.
+            pts = sorted(
+                (d, v) for d, v in series_map.items()
+                if pad_start <= d <= end and v is not None
+            )
+            if pts:
+                out[sym] = pts
+        return out
+
+    # precomputed path — read from features_daily.
     mconn, owned = _get_market_conn(conn)
     try:
         cur = mconn.cursor()
@@ -478,7 +526,7 @@ def _load_feature_series(feature: str, symbols: list[str], start: str, end: str,
         if owned:
             mconn.close()
 
-    out: dict[str, list] = {}
+    out = {}
     for sym, d, v in rows:
         out.setdefault(sym, []).append((d, v))
     return out
@@ -504,7 +552,8 @@ def _trading_dates(price_index, symbols, conn, start, end):
     return [r[0] for r in rows]
 
 
-def _precompute_feature_threshold(cond: dict, symbols: list[str], conn, start: str, end: str) -> dict:
+def _precompute_feature_threshold(cond: dict, symbols: list[str], conn, start: str, end: str,
+                                  price_index: dict | None = None) -> dict:
     """Signal fires on each trading day where the as-of feature value passes operator/value."""
     from bisect import bisect_right
 
@@ -515,7 +564,7 @@ def _precompute_feature_threshold(cond: dict, symbols: list[str], conn, start: s
     if op_fn is None:
         raise ValueError(f"Unknown operator: {operator}")
 
-    series = _load_feature_series(feature, symbols, start, end, conn)
+    series = _load_feature_series(feature, symbols, start, end, conn, price_index=price_index)
     # Use each symbol's own feature dates as "trading days" — dense: one row per trading day.
     signals: dict = {}
     for sym, pts in series.items():
@@ -532,7 +581,8 @@ def _precompute_feature_threshold(cond: dict, symbols: list[str], conn, start: s
     return signals
 
 
-def _precompute_feature_percentile(cond: dict, symbols: list[str], conn, start: str, end: str) -> dict:
+def _precompute_feature_percentile(cond: dict, symbols: list[str], conn, start: str, end: str,
+                                   price_index: dict | None = None) -> dict:
     """For each trading day, rank symbols by `feature` and emit signal for the bottom N% (or top, if max_percentile > 50 feels natural as-is)."""
     from bisect import bisect_right
     from collections import defaultdict
@@ -543,7 +593,7 @@ def _precompute_feature_percentile(cond: dict, symbols: list[str], conn, start: 
     min_value = cond.get("min_value")
     max_value = cond.get("max_value")
 
-    series = _load_feature_series(feature, symbols, start, end, conn)
+    series = _load_feature_series(feature, symbols, start, end, conn, price_index=price_index)
     if not series:
         return {}
 
