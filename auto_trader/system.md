@@ -18,14 +18,11 @@ Only use condition types, sizing types, and parameters that appear in the schema
 
 ## Signal Guidance
 
-For valuation, growth, or catalyst-proximity signals, prefer the generic feature conditions — they read from the `features_daily` table, which you can also query directly via `data-query` so your research and the backtest use identical numbers:
+For valuation, growth, or catalyst-proximity signals, prefer the generic feature conditions over hardcoded ones. They read from `features_daily`, the same table you can query directly via `data-query` — so your research and the backtest use identical numbers.
 
-- `feature_threshold(feature, operator, value)` — e.g. `pe < 15`, `fcf_yield > 5`, `rev_yoy > 20`
-- `feature_percentile(feature, max_percentile, scope)` — bottom-N% on a feature, universe- or sector-scoped
-- `days_to_earnings(min_days, max_days)` — forward-looking earnings-proximity window
-- `analyst_upgrades(window_days, min_net_upgrades)` — net-upgrades momentum
+The full list of supported entry-condition types (and exit/stop types) lives in the StrategyConfig schema injected at the bottom of this prompt. Use it as the source of truth: any `type` listed there with its `description` field is available; anything not listed is not.
 
-Available features: `pe, ps, p_b, ev_ebitda, ev_sales, fcf_yield, div_yield, eps_yoy, rev_yoy`. Query `features_daily` first to understand the current cross-section before choosing thresholds.
+Before choosing thresholds for any feature-based signal, query `features_daily` to understand the current cross-section.
 
 ## Rules
 
