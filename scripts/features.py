@@ -122,24 +122,30 @@ def yoy_pct(latest_q: tuple, year_ago_q: tuple | None, col_idx: int) -> float | 
 # Per-symbol data load
 # ---------------------------------------------------------------------------
 def _load_symbol_bundles(conn: sqlite3.Connection, symbol: str):
-    """Return sorted-ascending lists of (date, ...) tuples for each fundamentals table."""
+    """Return sorted-ascending lists of (date, ...) tuples for each fundamentals table.
+
+    Income columns (positional): date, revenue, net_income, ebitda, eps_diluted,
+    shares_diluted, gross_profit, operating_income. The first 6 are the legacy
+    layout; gross_profit and operating_income are appended so existing indices
+    stay valid for callers that still index positionally.
+
+    Balance columns: date, total_equity, net_debt, total_debt. total_debt is
+    appended for the same reason.
+    """
     cur = conn.cursor()
-    # income: date, revenue, net_income, ebitda, eps_diluted, shares_diluted
     income = cur.execute(
-        "SELECT date, revenue, net_income, ebitda, eps_diluted, shares_diluted "
+        "SELECT date, revenue, net_income, ebitda, eps_diluted, shares_diluted, "
+        "gross_profit, operating_income "
         "FROM income WHERE symbol=? ORDER BY date ASC", (symbol,)
     ).fetchall()
-    # balance: date, total_equity, net_debt
     balance = cur.execute(
-        "SELECT date, total_equity, net_debt "
+        "SELECT date, total_equity, net_debt, total_debt "
         "FROM balance WHERE symbol=? ORDER BY date ASC", (symbol,)
     ).fetchall()
-    # cashflow: date, free_cash_flow, dividends_paid
     cashflow = cur.execute(
         "SELECT date, free_cash_flow, dividends_paid "
         "FROM cashflow WHERE symbol=? ORDER BY date ASC", (symbol,)
     ).fetchall()
-    # prices: date, close
     prices = cur.execute(
         "SELECT date, close FROM prices WHERE symbol=? AND close IS NOT NULL "
         "ORDER BY date ASC", (symbol,)

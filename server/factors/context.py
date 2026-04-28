@@ -17,10 +17,12 @@ from functools import cached_property
 
 
 # Column indices inside the income tuple loaded as
-# (date, revenue, net_income, ebitda, eps_diluted, shares_diluted)
+# (date, revenue, net_income, ebitda, eps_diluted, shares_diluted,
+#  gross_profit, operating_income)
 I_DATE, I_REV, I_NI, I_EBITDA, I_EPS_D, I_SHARES = 0, 1, 2, 3, 4, 5
-# Balance: (date, total_equity, net_debt)
-B_EQUITY, B_NET_DEBT = 1, 2
+I_GROSS_PROFIT, I_OP_INCOME = 6, 7
+# Balance: (date, total_equity, net_debt, total_debt)
+B_EQUITY, B_NET_DEBT, B_TOTAL_DEBT = 1, 2, 3
 # Cashflow: (date, free_cash_flow, dividends_paid)
 C_FCF, C_DIV = 1, 2
 
@@ -131,6 +133,29 @@ class ComputeContext:
     @cached_property
     def ttm_dividends(self) -> float | None:
         return _ttm(self.cashflow_slice, C_DIV) if self.cashflow_slice else None
+
+    @cached_property
+    def ttm_gross_profit(self) -> float | None:
+        return _ttm(self.income_slice, I_GROSS_PROFIT)
+
+    @cached_property
+    def ttm_op_income(self) -> float | None:
+        return _ttm(self.income_slice, I_OP_INCOME)
+
+    @cached_property
+    def total_debt(self) -> float | None:
+        return self.balance_asof[B_TOTAL_DEBT] if self.balance_asof else None
+
+    # ---- Prior-quarter primitives for YoY-accel features --------------------
+    @cached_property
+    def prior_q(self) -> tuple | None:
+        """The quarter immediately before the latest, or None."""
+        return self.income_slice[-2] if len(self.income_slice) >= 2 else None
+
+    @cached_property
+    def prior_q_year_ago(self) -> tuple | None:
+        """Same fiscal quarter one year before the prior quarter (5 back from latest)."""
+        return self.income_slice[-6] if len(self.income_slice) >= 6 else None
 
 
 def build_context(

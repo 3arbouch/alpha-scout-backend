@@ -17,7 +17,7 @@ from .registry import (
     on_the_fly_features,
 )
 # Importing the library modules has the side-effect of registering features.
-from .library import valuation, yield_, growth, momentum  # noqa: F401
+from .library import valuation, yield_, growth, quality, momentum  # noqa: F401
 
 __all__ = [
     "FeatureDef",

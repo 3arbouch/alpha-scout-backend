@@ -101,30 +101,38 @@ def _load_factor_catalog() -> str:
             "|---|---|---|---|---|---|---|---|"
         )
         with sqlite3.connect(str(MARKET_DB_PATH)) as conn:
+            existing_cols = {
+                r[1] for r in conn.execute("PRAGMA table_info(features_daily)").fetchall()
+            }
             for f in feats:
                 p10 = p50 = p90 = ""
                 n_str = ""
                 if f.materialization == "precomputed":
-                    cur = conn.cursor()
-                    latest = cur.execute(
-                        f"SELECT date FROM features_daily "
-                        f"WHERE {f.name} IS NOT NULL "
-                        f"GROUP BY date HAVING COUNT(*) > 100 "
-                        f"ORDER BY date DESC LIMIT 1"
-                    ).fetchone()
-                    if latest:
-                        vals = [r[0] for r in cur.execute(
-                            f"SELECT {f.name} FROM features_daily "
-                            f"WHERE date = ? AND {f.name} IS NOT NULL",
-                            (latest[0],),
-                        ).fetchall()]
-                        if vals:
-                            vs = sorted(vals)
-                            n = len(vs)
-                            p10 = f"{vs[int(n*0.1)]:.2f}"
-                            p50 = f"{statistics.median(vs):.2f}"
-                            p90 = f"{vs[int(n*0.9)]:.2f}"
-                            n_str = str(n)
+                    if f.name not in existing_cols:
+                        # Registered but not yet backfilled into features_daily.
+                        p10 = p50 = p90 = "_pending backfill_"
+                        n_str = "0"
+                    else:
+                        cur = conn.cursor()
+                        latest = cur.execute(
+                            f"SELECT date FROM features_daily "
+                            f"WHERE {f.name} IS NOT NULL "
+                            f"GROUP BY date HAVING COUNT(*) > 100 "
+                            f"ORDER BY date DESC LIMIT 1"
+                        ).fetchone()
+                        if latest:
+                            vals = [r[0] for r in cur.execute(
+                                f"SELECT {f.name} FROM features_daily "
+                                f"WHERE date = ? AND {f.name} IS NOT NULL",
+                                (latest[0],),
+                            ).fetchall()]
+                            if vals:
+                                vs = sorted(vals)
+                                n = len(vs)
+                                p10 = f"{vs[int(n*0.1)]:.2f}"
+                                p50 = f"{statistics.median(vs):.2f}"
+                                p90 = f"{vs[int(n*0.9)]:.2f}"
+                                n_str = str(n)
                 else:
                     p10 = p50 = p90 = "_on-the-fly_"
                     n_str = "—"
