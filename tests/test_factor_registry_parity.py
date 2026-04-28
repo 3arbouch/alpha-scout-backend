@@ -82,9 +82,15 @@ def main():
     conn = sqlite3.connect(db_path)
     conn.row_factory = None
 
-    feature_names = [fd.name for fd in all_features() if fd.materialization == "precomputed"]
+    # Only check features that the legacy implementation knows about — that's
+    # the original 9 (the parity gate was for the refactor; new features added
+    # to the registry have no legacy counterpart to compare against).
+    LEGACY_FEATURES = ("pe", "ps", "p_b", "ev_ebitda", "ev_sales",
+                       "fcf_yield", "div_yield", "eps_yoy", "rev_yoy")
+    registered = {fd.name for fd in all_features() if fd.materialization == "precomputed"}
+    feature_names = [n for n in LEGACY_FEATURES if n in registered]
     cols = ",".join(feature_names)
-    print(f"Registry features (materialized): {feature_names}")
+    print(f"Parity-checked features (legacy ∩ registry): {feature_names}")
 
     cur = conn.cursor()
     if args.all:
