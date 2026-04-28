@@ -19,14 +19,32 @@ Category = Literal["value", "yield", "growth", "quality", "momentum",
 
 @dataclass(frozen=True)
 class FeatureDef:
+    """One feature's identity, math, and execution metadata.
+
+    Two compute interfaces — exactly one is set per feature, determined by
+    `materialization`:
+
+    - precomputed → `compute(ctx)` returns the scalar value for one
+      (symbol, date). The daily update job calls this once per (symbol, date)
+      and writes the result to features_daily.
+
+    - on_the_fly → `compute_series(symbol, prices)` returns a {date: value}
+      dict over the symbol's full price history. The engine calls this once
+      per symbol per backtest. Streaming algorithms (Wilder RSI, momentum)
+      are O(1) amortized per date this way; per-date compute would be O(n).
+
+    `prices` for compute_series is a list of (date, close) pairs in
+    ascending date order — the symbol's full available history.
+    """
     name: str
-    compute: Callable
     deps: tuple[str, ...]
     materialization: Materialization
     category: Category
     unit: str
     description: str
     is_factor: bool = True
+    compute: Callable | None = None
+    compute_series: Callable | None = None
 
 
 _REGISTRY: dict[str, FeatureDef] = {}
@@ -35,20 +53,30 @@ _REGISTRY: dict[str, FeatureDef] = {}
 def register_feature(
     *,
     name: str,
-    compute: Callable,
     deps: tuple[str, ...] | list[str],
     materialization: Materialization,
     category: Category,
     unit: str,
     description: str,
     is_factor: bool = True,
+    compute: Callable | None = None,
+    compute_series: Callable | None = None,
 ) -> FeatureDef:
-    """Register a feature. Called at import time from library modules."""
+    """Register a feature. Called at import time from library modules.
+
+    Validates that the supplied compute interface matches the materialization:
+    precomputed requires `compute`, on_the_fly requires `compute_series`.
+    """
     if name in _REGISTRY:
         raise ValueError(f"feature '{name}' already registered")
+    if materialization == "precomputed" and compute is None:
+        raise ValueError(f"feature '{name}': precomputed requires compute=")
+    if materialization == "on_the_fly" and compute_series is None:
+        raise ValueError(f"feature '{name}': on_the_fly requires compute_series=")
     fd = FeatureDef(
         name=name,
         compute=compute,
+        compute_series=compute_series,
         deps=tuple(deps),
         materialization=materialization,
         category=category,
