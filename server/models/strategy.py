@@ -309,17 +309,67 @@ class EntryConfig(BaseModel):
         return data
 
 
-class StopLossConfig(BaseModel):
-    """Stop loss configuration."""
-    type: Literal["drawdown_from_entry"] = Field(default="drawdown_from_entry")
+class DrawdownFromEntryStop(BaseModel):
+    """Fixed-percent stop. exit if pnl_pct <= value."""
+    type: Literal["drawdown_from_entry"] = "drawdown_from_entry"
     value: float = Field(default=-35, description="Negative %. e.g. -35 = exit at 35% loss.")
     cooldown_days: int = Field(ge=0, default=90, description="Days before re-entering same ticker after stop.")
 
 
-class TakeProfitConfig(BaseModel):
-    """Take profit configuration."""
-    type: Literal["gain_from_entry", "above_peak"] = Field(default="gain_from_entry")
+class AtrMultipleStop(BaseModel):
+    """ATR-multiple stop. stop_price = entry - k * ATR(window_days), frozen at entry."""
+    type: Literal["atr_multiple"] = "atr_multiple"
+    k: float = Field(gt=0, le=10, description="ATR multiplier. Bounded so stops actually fire.")
+    window_days: int = Field(ge=10, le=252, description="ATR lookback in trading bars.")
+    cooldown_days: int = Field(ge=0, default=90, description="Days before re-entering same ticker after stop.")
+
+
+class RealizedVolMultipleStop(BaseModel):
+    """Realized-vol-multiple stop. stop_price = entry * (1 - k * sigma_daily), frozen at entry."""
+    type: Literal["realized_vol_multiple"] = "realized_vol_multiple"
+    k: float = Field(gt=0, le=10, description="Sigma multiplier.")
+    window_days: int = Field(ge=10, le=252, description="Sigma lookback in trading bars.")
+    sigma_source: Literal["historical", "ewma"] = Field(default="historical")
+    cooldown_days: int = Field(ge=0, default=90, description="Days before re-entering same ticker after stop.")
+
+
+StopLossConfig = Annotated[
+    DrawdownFromEntryStop | AtrMultipleStop | RealizedVolMultipleStop,
+    Field(discriminator="type"),
+]
+
+
+class GainFromEntryTP(BaseModel):
+    """Fixed-percent take profit. exit if pnl_pct >= value."""
+    type: Literal["gain_from_entry"] = "gain_from_entry"
     value: float = Field(default=60, description="Positive %. e.g. 60 = sell at 60% profit.")
+
+
+class AbovePeakTP(BaseModel):
+    """Trailing-style take profit relative to running peak."""
+    type: Literal["above_peak"] = "above_peak"
+    value: float = Field(default=60, description="Positive %. exit if (current - peak)/peak * 100 >= value.")
+
+
+class AtrMultipleTP(BaseModel):
+    """ATR-multiple take profit. tp_price = entry + k * ATR(window_days), frozen at entry."""
+    type: Literal["atr_multiple"] = "atr_multiple"
+    k: float = Field(gt=0, le=10, description="ATR multiplier.")
+    window_days: int = Field(ge=10, le=252, description="ATR lookback in trading bars.")
+
+
+class RealizedVolMultipleTP(BaseModel):
+    """Realized-vol-multiple take profit. tp_price = entry * (1 + k * sigma_daily), frozen at entry."""
+    type: Literal["realized_vol_multiple"] = "realized_vol_multiple"
+    k: float = Field(gt=0, le=10, description="Sigma multiplier.")
+    window_days: int = Field(ge=10, le=252, description="Sigma lookback in trading bars.")
+    sigma_source: Literal["historical", "ewma"] = Field(default="historical")
+
+
+TakeProfitConfig = Annotated[
+    GainFromEntryTP | AbovePeakTP | AtrMultipleTP | RealizedVolMultipleTP,
+    Field(discriminator="type"),
+]
 
 
 class TimeStopConfig(BaseModel):
