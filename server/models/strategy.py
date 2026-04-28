@@ -12,6 +12,13 @@ from __future__ import annotations
 from typing import Annotated, Literal
 from pydantic import BaseModel, Field, model_validator
 
+# Import the registry first — the library modules register features at import
+# time, so feature_names() returns a complete tuple by the time we use it
+# below to build the FeatureName Literal.
+from server.factors import feature_names as _registry_feature_names
+
+_FEATURE_NAMES = _registry_feature_names()
+
 
 # ---------------------------------------------------------------------------
 # Entry Conditions (discriminated union on "type")
@@ -145,18 +152,12 @@ class AlwaysCondition(BaseModel):
 # Values are point-in-time: latest quarterly report as-of the trading day,
 # combined with that day's close for price-dependent ratios. Same values are
 # queryable via `data-query` so agent research and engine execution agree.
+#
+# FeatureName is generated from the factor registry (server/factors/library/*).
+# Adding a feature there expands this enum on next process start — schema,
+# agent prompt, and engine all update without any edit to this file.
 # ---------------------------------------------------------------------------
-FeatureName = Literal[
-    "pe",          # market_cap / TTM net_income
-    "ps",          # market_cap / TTM revenue
-    "p_b",         # market_cap / total_equity
-    "ev_ebitda",   # (market_cap + net_debt) / TTM ebitda
-    "ev_sales",    # (market_cap + net_debt) / TTM revenue
-    "fcf_yield",   # TTM free_cash_flow / market_cap, percent
-    "div_yield",   # TTM |dividends_paid| / market_cap, percent
-    "eps_yoy",     # latest Q eps_diluted vs same-Q prior year, percent
-    "rev_yoy",     # latest Q revenue vs same-Q prior year, percent
-]
+FeatureName = Literal[*_FEATURE_NAMES]  # type: ignore[valid-type]
 
 
 class FeatureThresholdCondition(BaseModel):
