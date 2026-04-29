@@ -19,7 +19,7 @@ from .registry import (
 # Importing the library modules has the side-effect of registering features.
 from .library import (
     valuation, yield_, growth, quality, balance_quality,
-    momentum, returns, drawdowns,
+    momentum, returns, drawdowns, volume,
 )  # noqa: F401
 
 __all__ = [
