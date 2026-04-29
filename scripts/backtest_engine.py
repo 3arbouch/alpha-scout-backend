@@ -1307,70 +1307,141 @@ def _precompute_technical_condition(condition_config: dict, symbols: list[str], 
     return signals
 
 
-def _precompute_exit_signals(config: dict, symbols: list[str], conn) -> dict:
+def _precompute_exit_signals(config: dict, symbols: list[str], conn,
+                              price_index: dict | None = None) -> dict:
     """
-    Pre-compute fundamental exit signals for all tickers.
-    
-    Config section "exit_conditions" is a list of condition objects:
-    [
-      {"type": "revenue_deceleration", "min_quarters": 2, "require_margin_compression": true},
-      {"type": "margin_collapse", "threshold_bps": -500, "min_quarters": 2}
-    ]
-    
-    Logic is OR — any exit condition firing triggers exit.
-    
+    Pre-compute exit signals for all tickers.
+
+    Supports four exit types (any can be mixed in `exit_conditions`):
+      - revenue_deceleration  (legacy fundamental, signals.py)
+      - margin_collapse       (legacy fundamental, signals.py)
+      - feature_threshold     (registry-driven, any of the 35 factors)
+      - feature_percentile    (registry-driven cross-section)
+
+    The two registry-driven types reuse the entry-side precompute paths
+    (_precompute_feature_threshold / _precompute_feature_percentile) so the
+    semantics (and the lookahead-correct as-of bisect) are identical. They
+    operate on the same symbol universe; an exit signal on (symbol, date)
+    only matters if the engine has an open position in that symbol on that
+    date — that filtering happens in the simulation loop.
+
+    `exit_logic` ("any" or "all") combines multiple conditions:
+      - any: OR — any condition firing on (symbol, date) emits an exit
+      - all: AND — every condition must fire on the same (symbol, date)
+
     Returns:
-        {symbol: {date: {"reason": "revenue_deceleration", ...metadata}}}
+        {symbol: {date: {"reason": "<type or compound>", ...metadata}}}
     """
     exit_conditions = config.get("exit_conditions", [])
     if not exit_conditions:
         return {}
-    
+    exit_logic = config.get("exit_logic", "any")
+
     bt_start = config["backtest"]["start"]
     bt_end = config["backtest"]["end"]
-    combined = {}  # {symbol: {date: metadata}}
-    
+
+    # Per-condition signal sets: list of {symbol: {date: metadata}}.
+    # We keep them separate so 'all' (AND) can intersect, and 'any' (OR) can union.
+    per_cond_signals: list[dict] = []
+
     for cond in exit_conditions:
         ctype = cond["type"]
-        for symbol in symbols:
+        cond_signals: dict = {}
+
+        if ctype in ("feature_threshold", "feature_percentile"):
+            # Registry-driven: reuse the entry-side precompute. Returns
+            # {symbol: {date: observed_value}}; wrap each into the exit-shape
+            # metadata dict.
             try:
-                if ctype == "revenue_deceleration":
-                    raw = find_revenue_deceleration(
-                        symbol,
-                        min_quarters=cond.get("min_quarters", 2),
-                        require_margin_compression=cond.get("require_margin_compression", True),
-                        margin_metric=cond.get("metric", "net_margin"),
-                        start=bt_start, end=bt_end,
-                        conn=conn,
+                if ctype == "feature_threshold":
+                    feat = _precompute_feature_threshold(
+                        cond, symbols, conn, bt_start, bt_end, price_index=price_index,
                     )
-                elif ctype == "margin_collapse":
-                    raw = find_margin_collapse(
-                        symbol,
-                        metric=cond.get("metric", "net_margin"),
-                        threshold_bps=cond.get("threshold_bps", -500),
-                        min_quarters=cond.get("min_quarters", 2),
-                        start=bt_start, end=bt_end,
-                        conn=conn,
-                    )
+                    op = cond.get("operator", ">=")
+                    feat_name = cond["feature"]
+                    val = cond.get("value")
+                    reason = f"feature_threshold:{feat_name}{op}{val}"
                 else:
-                    continue
-            except Exception:
+                    feat = _precompute_feature_percentile(
+                        cond, symbols, conn, bt_start, bt_end, price_index=price_index,
+                    )
+                    feat_name = cond["feature"]
+                    pct = cond.get("max_percentile", 30)
+                    scope = cond.get("scope", "universe")
+                    reason = f"feature_percentile:{feat_name}<=p{pct}({scope})"
+            except Exception as e:
+                print(f"  [exit] {ctype} precompute failed: {e}")
                 continue
-            
-            if not raw:
-                continue
-            
-            if symbol not in combined:
-                combined[symbol] = {}
-            
-            for entry in raw:
-                sig_date = entry["signal_date"]
-                if sig_date not in combined[symbol]:
-                    combined[symbol][sig_date] = {
-                        "reason": ctype,
-                        **{k: v for k, v in entry.items() if k != "signal_date"}
+
+            for sym, dates_map in feat.items():
+                for d, observed in dates_map.items():
+                    cond_signals.setdefault(sym, {})[d] = {
+                        "reason": reason,
+                        "value": observed,
+                        "feature": cond.get("feature"),
+                        "type": ctype,
                     }
-    
+        else:
+            # Legacy per-symbol fundamental paths.
+            for symbol in symbols:
+                try:
+                    if ctype == "revenue_deceleration":
+                        raw = find_revenue_deceleration(
+                            symbol,
+                            min_quarters=cond.get("min_quarters", 2),
+                            require_margin_compression=cond.get("require_margin_compression", True),
+                            margin_metric=cond.get("metric", "net_margin"),
+                            start=bt_start, end=bt_end,
+                            conn=conn,
+                        )
+                    elif ctype == "margin_collapse":
+                        raw = find_margin_collapse(
+                            symbol,
+                            metric=cond.get("metric", "net_margin"),
+                            threshold_bps=cond.get("threshold_bps", -500),
+                            min_quarters=cond.get("min_quarters", 2),
+                            start=bt_start, end=bt_end,
+                            conn=conn,
+                        )
+                    else:
+                        continue
+                except Exception:
+                    continue
+                if not raw:
+                    continue
+                for entry in raw:
+                    sig_date = entry["signal_date"]
+                    cond_signals.setdefault(symbol, {})[sig_date] = {
+                        "reason": ctype,
+                        **{k: v for k, v in entry.items() if k != "signal_date"},
+                    }
+
+        per_cond_signals.append(cond_signals)
+
+    if not per_cond_signals:
+        return {}
+
+    # Combine.
+    combined: dict = {}
+    if exit_logic == "all":
+        # Intersection: a (symbol, date) must appear in EVERY per-cond set.
+        # Use the first set as the candidate seed.
+        seed = per_cond_signals[0]
+        for sym, dates_map in seed.items():
+            for d, meta in dates_map.items():
+                if all(sym in s and d in s[sym] for s in per_cond_signals[1:]):
+                    reasons = [s[sym][d].get("reason", "") for s in per_cond_signals]
+                    combined.setdefault(sym, {})[d] = {
+                        "reason": " AND ".join(r for r in reasons if r),
+                        "components": [s[sym][d] for s in per_cond_signals],
+                    }
+    else:
+        # Union: any condition firing on (symbol, date) emits an exit.
+        for s in per_cond_signals:
+            for sym, dates_map in s.items():
+                for d, meta in dates_map.items():
+                    combined.setdefault(sym, {}).setdefault(d, meta)
+
     return combined
 
 
@@ -1948,11 +2019,11 @@ def run_backtest(config: dict, force_close_at_end: bool = True,
     total_signals = sum(len(v) for v in signals.values())
     print(f"Found {total_signals} signal dates across {len(signals)} tickers")
 
-    # Pre-compute exit signals (fundamental-based exits)
+    # Pre-compute exit signals (fundamental + registry-driven exits)
     exit_signals = {}
     if config.get("exit_conditions"):
         print("Pre-computing exit signals...")
-        exit_signals = _precompute_exit_signals(config, symbols, conn)
+        exit_signals = _precompute_exit_signals(config, symbols, conn, price_index=price_index)
         total_exit = sum(len(v) for v in exit_signals.values())
         print(f"Found {total_exit} exit signal dates across {len(exit_signals)} tickers")
 

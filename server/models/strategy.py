@@ -248,7 +248,12 @@ class MarginCollapseExit(BaseModel):
 
 
 ExitCondition = Annotated[
-    RevenueDecelerationExit | MarginCollapseExit,
+    RevenueDecelerationExit | MarginCollapseExit
+    # The same generic conditions used for entries are valid as exits — fire
+    # on every (symbol, date) where the rule matches; the engine flags any
+    # open position for exit on those dates. Lets a strategy say "exit when
+    # the entry signal reverses" without inventing a parametric reversal type.
+    | FeatureThresholdCondition | FeaturePercentileCondition,
     Field(discriminator="type"),
 ]
 
@@ -450,6 +455,13 @@ class StrategyConfig(BaseModel):
     take_profit: TakeProfitConfig | None = None
     time_stop: TimeStopConfig | None = None
     exit_conditions: list[ExitCondition] | None = None
+    exit_logic: Literal["any", "all"] = Field(
+        default="any",
+        description="How to combine multiple exit_conditions. 'any' (default) "
+                    "= OR; any condition firing exits the position. 'all' = AND; "
+                    "every listed condition must fire on the same (symbol, date) "
+                    "to trigger an exit.",
+    )
     ranking: RankingConfig | None = None
     rebalancing: RebalancingConfig = Field(default_factory=RebalancingConfig)
     sizing: SizingConfig = Field(default_factory=SizingConfig)
