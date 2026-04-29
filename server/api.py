@@ -1230,12 +1230,18 @@ async def list_strategies(_: str = Depends(verify_api_key)):
     for r in rows:
         config = json.loads(r["config"])
         config = _normalize_config(config)
+        # `_normalize_config` runs the unified-exit migrator, which strips
+        # legacy stop_loss/take_profit/time_stop fields and folds them into
+        # `exit`. Return the unified shape; keep the legacy fields in the
+        # response for back-compat (they'll be None for migrated configs —
+        # the FE should read `exit` going forward).
         results.append({
             "strategy_id": r["strategy_id"],
             "name": r["name"],
             "version": config.get("version"),
             "universe": config.get("universe", {}),
             "entry": config.get("entry", {}),
+            "exit": config.get("exit", {"guards": [], "rules": [], "logic": "any"}),
             "stop_loss": config.get("stop_loss"),
             "take_profit": config.get("take_profit"),
             "time_stop": config.get("time_stop"),
