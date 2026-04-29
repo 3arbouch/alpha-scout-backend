@@ -133,6 +133,18 @@ _TP_CONFIG_KEYS_BY_TYPE = {
     "realized_vol_multiple": ["k", "window_days", "sigma_source"],
 }
 
+# Unified-exits per-type config keys. Used by compute_frozen_exit_prices to
+# build the canonical signal record for any rule that has frozen-at-entry math.
+_EXIT_RULE_CONFIG_KEYS = {
+    "atr_stop":             ["k", "window_days", "cooldown_days"],
+    "atr_target":           ["k", "window_days"],
+    "realized_vol_stop":    ["k", "window_days", "sigma_source", "cooldown_days"],
+    "realized_vol_target":  ["k", "window_days", "sigma_source"],
+}
+_FROZEN_PRICING_TYPES = set(_EXIT_RULE_CONFIG_KEYS)
+_STOP_FROZEN_TYPES = {"atr_stop", "realized_vol_stop"}
+_TARGET_FROZEN_TYPES = {"atr_target", "realized_vol_target"}
+
 
 def compute_stop_pricing(
     strategy_config: dict,
@@ -245,6 +257,90 @@ def compute_stop_pricing(
         out["take_profit_price"] = price
         out["tp_record"] = _make_record(
             tp, _TP_CONFIG_KEYS_BY_TYPE.get(tp_type, []), observed,
+        )
+
+    return out
+
+
+def compute_frozen_exit_prices(
+    exit_config: dict,
+    symbol: str,
+    entry_date: str,
+    entry_price: float,
+    ohlc_fetcher: Callable[[str, str, int], list[tuple[float, float, float]]] | None,
+) -> dict:
+    """Walk exit.guards + exit.rules and compute frozen prices for any
+    atr_stop / atr_target / realized_vol_stop / realized_vol_target rule.
+
+    Returns:
+      {
+        "frozen_prices": dict[int, float]  # rule_idx (over guards+rules concat) → price
+        "records":       dict[int, dict]   # rule_idx → canonical {type, config, observed}
+        "abort":         bool              # True if any frozen-pricing rule had insufficient history
+      }
+
+    Rule indexing convention: guards are 0..G-1, rules are G..G+R-1 (concat).
+    The engine's per-position frozen_prices uses these indices directly.
+    """
+    out = {"frozen_prices": {}, "records": {}, "abort": False}
+    guards = exit_config.get("guards") or []
+    rules = exit_config.get("rules") or []
+    flat = list(guards) + list(rules)
+
+    # Find frozen-pricing rules and the largest window they need.
+    frozen_indices: list[int] = []
+    windows: list[int] = []
+    for i, rule in enumerate(flat):
+        if not isinstance(rule, dict):
+            continue
+        if rule.get("type") in _FROZEN_PRICING_TYPES:
+            frozen_indices.append(i)
+            w = rule.get("window_days")
+            if isinstance(w, int) and w > 0:
+                windows.append(w)
+    if not frozen_indices:
+        return out
+
+    if ohlc_fetcher is None:
+        out["abort"] = True
+        return out
+
+    max_window = max(windows)
+    bars = ohlc_fetcher(symbol, entry_date, max_window + 1)
+    if not bars or len(bars) < max_window + 1:
+        out["abort"] = True
+        return out
+    closes = [c for _, _, c in bars]
+
+    for i in frozen_indices:
+        rule = flat[i]
+        rtype = rule["type"]
+        k = rule.get("k")
+        window = rule.get("window_days")
+        sign = -1 if rtype in _STOP_FROZEN_TYPES else +1
+        observed: dict | None = None
+        price: float | None = None
+
+        if rtype in ("atr_stop", "atr_target"):
+            atr = compute_atr(bars, window)
+            if atr is None or atr <= 0:
+                out["abort"] = True
+                return out
+            price = entry_price + sign * (k * atr)
+            observed = {"atr": round(atr, 6), "frozen_price": round(price, 6)}
+        elif rtype in ("realized_vol_stop", "realized_vol_target"):
+            sigma_source = rule.get("sigma_source", "historical")
+            sigma = compute_realized_vol(closes, window, sigma_source)
+            if sigma is None or sigma <= 0:
+                out["abort"] = True
+                return out
+            move = k * sigma
+            price = entry_price * (1 + sign * move)
+            observed = {"sigma": round(sigma, 8), "frozen_price": round(price, 6)}
+
+        out["frozen_prices"][i] = price
+        out["records"][i] = _make_record(
+            rule, _EXIT_RULE_CONFIG_KEYS.get(rtype, []), observed,
         )
 
     return out

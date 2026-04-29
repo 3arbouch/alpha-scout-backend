@@ -1307,6 +1307,90 @@ def _precompute_technical_condition(condition_config: dict, symbols: list[str], 
     return signals
 
 
+def _precompute_exit_signals_per_rule(config: dict, symbols: list[str], conn,
+                                       price_index: dict | None = None) -> dict[int, dict]:
+    """Precompute event-driven exit-rule fires, keyed by flat rule index.
+
+    Walks exit.guards then exit.rules (concatenated, indices 0..G+R-1) and
+    for each rule of an event-driven type (feature_threshold,
+    feature_percentile, revenue_deceleration, margin_collapse) runs the
+    corresponding precompute. Returns:
+
+        {rule_idx: {symbol: {date: metadata}}}
+
+    State-based rules (drawdown, gain, trailing, time, atr_*, realized_vol_*)
+    are not in this map — they're evaluated dynamically per-bar by check_exit_rule.
+    """
+    exit_cfg = config.get("exit") or {}
+    guards = list(exit_cfg.get("guards") or [])
+    rules = list(exit_cfg.get("rules") or [])
+    flat = guards + rules
+
+    bt_start = config["backtest"]["start"]
+    bt_end = config["backtest"]["end"]
+    out: dict[int, dict] = {}
+
+    for i, rule in enumerate(flat):
+        if not isinstance(rule, dict):
+            continue
+        rtype = rule.get("type")
+        try:
+            if rtype == "feature_threshold":
+                feat = _precompute_feature_threshold(
+                    rule, symbols, conn, bt_start, bt_end, price_index=price_index,
+                )
+                out[i] = {sym: {d: {"feature": rule.get("feature"), "value": v}
+                                for d, v in dates.items()}
+                          for sym, dates in feat.items()}
+            elif rtype == "feature_percentile":
+                feat = _precompute_feature_percentile(
+                    rule, symbols, conn, bt_start, bt_end, price_index=price_index,
+                )
+                out[i] = {sym: {d: {"feature": rule.get("feature"), "value": v}
+                                for d, v in dates.items()}
+                          for sym, dates in feat.items()}
+            elif rtype == "revenue_deceleration":
+                per: dict = {}
+                for symbol in symbols:
+                    raw = find_revenue_deceleration(
+                        symbol,
+                        min_quarters=rule.get("min_quarters", 2),
+                        require_margin_compression=rule.get("require_margin_compression", True),
+                        margin_metric=rule.get("metric", "net_margin"),
+                        start=bt_start, end=bt_end, conn=conn,
+                    )
+                    if raw:
+                        for entry in raw:
+                            sd = entry["signal_date"]
+                            per.setdefault(symbol, {})[sd] = {
+                                k: v for k, v in entry.items() if k != "signal_date"
+                            }
+                if per:
+                    out[i] = per
+            elif rtype == "margin_collapse":
+                per = {}
+                for symbol in symbols:
+                    raw = find_margin_collapse(
+                        symbol,
+                        metric=rule.get("metric", "net_margin"),
+                        threshold_bps=rule.get("threshold_bps", -500),
+                        min_quarters=rule.get("min_quarters", 2),
+                        start=bt_start, end=bt_end, conn=conn,
+                    )
+                    if raw:
+                        for entry in raw:
+                            sd = entry["signal_date"]
+                            per.setdefault(symbol, {})[sd] = {
+                                k: v for k, v in entry.items() if k != "signal_date"
+                            }
+                if per:
+                    out[i] = per
+        except Exception as e:
+            print(f"  [exit-precompute] rule#{i} type={rtype} failed: {e}")
+            continue
+    return out
+
+
 def _precompute_exit_signals(config: dict, symbols: list[str], conn,
                               price_index: dict | None = None) -> dict:
     """
@@ -1672,18 +1756,17 @@ class Position:
 
     def __init__(self, symbol: str, entry_date: str, entry_price: float,
                  shares: float, peak_price: float = None, signal_detail: dict = None,
-                 stop_price: float | None = None, take_profit_price: float | None = None):
+                 frozen_prices: dict[int, float] | None = None):
         self.symbol = symbol
         self.entry_date = entry_date
         self.entry_price = entry_price
         self.shares = shares
-        self.peak_price = peak_price or entry_price  # pre-selloff peak for above_peak TP
+        self.peak_price = peak_price or entry_price  # for trailing_from_peak
         self.high_since_entry = entry_price
         self.signal_detail = signal_detail  # entry signal info, carried to SELL trades
-        # Frozen exit prices for vol-adaptive modes (atr_multiple, realized_vol_multiple).
-        # None for legacy modes — those use the dynamic pnl_pct check.
-        self.stop_price = stop_price
-        self.take_profit_price = take_profit_price
+        # Per-rule frozen exit prices (rule_idx in flat guards+rules concat → price).
+        # Computed once at entry by compute_frozen_exit_prices for atr_*/realized_vol_*.
+        self.frozen_prices = frozen_prices or {}
 
     def market_value(self, current_price: float) -> float:
         return self.shares * current_price
@@ -1719,39 +1802,71 @@ class Portfolio:
     def open_position(self, symbol: str, date: str, price: float,
                       amount: float, slippage_bps: float = 0,
                       peak_price: float = None, signal_detail: dict = None):
-        """Open a new position. Skips silently if vol-adaptive stop pricing
+        """Open a new position. Skips silently if frozen-at-entry exit pricing
         can't be computed (insufficient history)."""
         # Apply slippage
         exec_price = price * (1 + slippage_bps / 10000)
 
-        # Vol-adaptive stop/TP: compute frozen exit prices once at entry.
-        # Legacy modes get None for the prices (engine uses the dynamic check)
-        # but still get a unified record in signal_detail for the FE.
-        from stop_pricing import compute_stop_pricing
-        pricing = compute_stop_pricing(
-            self.strategy_config, symbol, date, exec_price, self.ohlc_fetcher,
+        # Frozen-at-entry pricing for atr_*/realized_vol_* exit rules. Walk the
+        # unified exit config; compute one frozen price per such rule.
+        from stop_pricing import compute_frozen_exit_prices
+        exit_config = self.strategy_config.get("exit") or {}
+        pricing = compute_frozen_exit_prices(
+            exit_config, symbol, date, exec_price, self.ohlc_fetcher,
         )
         if pricing["abort"]:
-            # Insufficient history for the requested vol-adaptive mode — skip
-            # the entry. Same effect as a missing price: no Position, no trade.
-            print(f"  [vol-stops] skip {symbol} @ {date}: insufficient history")
+            print(f"  [exit-pricing] skip {symbol} @ {date}: insufficient history")
             return
 
-        # Build signal_detail. If no stop and no take_profit are configured,
-        # preserve the original shape (a list of entry-condition records) so
-        # legacy backtests are byte-identical. Otherwise normalize to a dict
-        # with `entries` + `stop?` + `take_profit?` so the FE has one path
-        # regardless of which exit modes are in use.
-        if pricing["stop_record"] is None and pricing["tp_record"] is None:
+        # Build signal_detail. If NO exit rules are configured at all and there's
+        # no entry-side signal, leave it as the bare list (byte-identical legacy
+        # shape for tests/clients that expect the original list-of-entries form).
+        # Otherwise normalize to a dict with `entries` + per-rule canonical
+        # envelope records. Every configured exit rule contributes a record;
+        # frozen-pricing rules carry observed={atr/sigma, frozen_price}, others
+        # carry observed={} (matches the original canonical-envelope contract
+        # where every rule has a record so the FE has uniform rendering).
+        guards_list = exit_config.get("guards") or []
+        rules_list = exit_config.get("rules") or []
+        n_guards = len(guards_list)
+        all_rules = list(guards_list) + list(rules_list)
+
+        if not all_rules and signal_detail is None:
+            merged_signal = None
+        elif not all_rules:
             merged_signal = signal_detail
         else:
-            merged_signal = {}
+            merged_signal: dict = {}
             if signal_detail is not None:
                 merged_signal["entries"] = signal_detail
-            if pricing["stop_record"]:
-                merged_signal["stop"] = pricing["stop_record"]
-            if pricing["tp_record"]:
-                merged_signal["take_profit"] = pricing["tp_record"]
+            # Stop/target slot semantics: stops (loss-bound) get `stop`;
+            # targets (gain-bound) and time/trailing/feature get `take_profit`
+            # (back-compat with the old FE contract). Multi-occurrence falls
+            # back to keys suffixed with rule_idx.
+            STOP_TYPES = {"drawdown_from_entry", "atr_stop", "realized_vol_stop"}
+            TARGET_TYPES = {"gain_from_entry", "atr_target", "realized_vol_target",
+                            "trailing_from_peak", "above_peak"}
+            for i, rule in enumerate(all_rules):
+                if not isinstance(rule, dict):
+                    continue
+                rtype = rule.get("type")
+                config_keys = {k: v for k, v in rule.items() if k != "type"}
+                # Frozen rules already have a canonical record from pricing["records"].
+                if i in pricing["records"]:
+                    record = pricing["records"][i]
+                else:
+                    record = {"type": rtype, "config": config_keys, "observed": {}}
+                if rtype in STOP_TYPES:
+                    key = "stop"
+                elif rtype in TARGET_TYPES:
+                    key = "take_profit"
+                else:
+                    # time_max_days, feature_threshold, feature_percentile, etc.
+                    # Use the rule type as the slot name for clarity.
+                    key = rtype
+                if key in merged_signal:
+                    key = f"{key}_{i}"
+                merged_signal[key] = record
 
         shares = amount / exec_price
 
@@ -1769,8 +1884,7 @@ class Portfolio:
                 shares=shares,
                 peak_price=peak_price,
                 signal_detail=merged_signal,
-                stop_price=pricing["stop_price"],
-                take_profit_price=pricing["take_profit_price"],
+                frozen_prices=pricing["frozen_prices"],
             )
 
         self.cash -= amount
@@ -1786,9 +1900,17 @@ class Portfolio:
         })
 
     def close_position(self, symbol: str, date: str, price: float,
-                       reason: str, slippage_bps: float = 0,
+                       reason, slippage_bps: float = 0,
                        partial_pct: float = 100):
-        """Close (or partially close) a position."""
+        """Close (or partially close) a position.
+
+        `reason` is either a string (legacy callers: 'backtest_end',
+        'rebalance', 'manual') OR a canonical exit-rule envelope
+        {type, config, observed} (unified-exit dispatcher path). When an
+        envelope is provided, the trade record's `reason` field is set to the
+        envelope's `type` (a string, hashable for downstream metrics) and the
+        full envelope is stored in `exit_signal_detail`.
+        """
         if symbol not in self.positions:
             return
 
@@ -1796,11 +1918,9 @@ class Portfolio:
         exec_price = price * (1 - slippage_bps / 10000)
 
         if partial_pct >= 100:
-            # Full close
             shares_to_sell = pos.shares
             del self.positions[symbol]
         else:
-            # Partial close
             shares_to_sell = pos.shares * (partial_pct / 100)
             pos.shares -= shares_to_sell
 
@@ -1811,11 +1931,19 @@ class Portfolio:
         pnl = proceeds - cost_basis
         pnl_pct = ((exec_price - pos.entry_price) / pos.entry_price) * 100
 
+        # Normalize reason: string for the metric-key field, full envelope for the FE.
+        if isinstance(reason, dict):
+            reason_str = reason.get("type", "exit_rule")
+            exit_envelope = reason
+        else:
+            reason_str = reason
+            exit_envelope = None
+
         trade = {
             "date": date,
             "symbol": symbol,
             "action": "SELL",
-            "reason": reason,
+            "reason": reason_str,
             "price": round(exec_price, 2),
             "shares": round(shares_to_sell, 4),
             "amount": round(proceeds, 2),
@@ -1824,7 +1952,8 @@ class Portfolio:
             "entry_date": pos.entry_date,
             "entry_price": round(pos.entry_price, 2),
             "days_held": pos.days_held(date),
-            "signal_detail": pos.signal_detail,  # carry entry signal to SELL
+            "signal_detail": pos.signal_detail,  # entry signal envelope
+            "exit_signal_detail": exit_envelope,  # which exit rule fired (None for legacy reasons)
         }
         self.trades.append(trade)
         self.closed_trades.append(trade)
@@ -1888,60 +2017,70 @@ class Portfolio:
 # ---------------------------------------------------------------------------
 # Exit Checks
 # ---------------------------------------------------------------------------
-def check_stop_loss(pos: Position, current_price: float, config: dict) -> bool:
-    """Check if stop loss is triggered."""
-    sl = config.get("stop_loss")
-    if not sl:
-        return False
+def check_exit_rule(rule: dict, rule_idx: int, pos: Position,
+                    current_price: float, current_date: str,
+                    rule_signals: dict | None) -> tuple[bool, dict | None]:
+    """Evaluate one exit rule against an open position on one bar.
 
-    sl_type = sl.get("type")
+    Returns (fired, reason_envelope). The envelope follows the canonical
+    {type, config, observed} shape so the FE has one rendering path.
 
-    # Vol-adaptive modes: stop_price was frozen at entry. Trigger on price cross.
-    if sl_type in ("atr_multiple", "realized_vol_multiple"):
-        return pos.stop_price is not None and current_price <= pos.stop_price
+    `rule_signals` is the per-rule precomputed map for event-driven rules
+    (feature_threshold, feature_percentile, revenue_deceleration,
+    margin_collapse): {symbol: {date: metadata}}. None for state-based rules.
+    """
+    rtype = rule.get("type")
+    fired = False
+    observed: dict = {}
 
-    if sl_type == "drawdown_from_entry":
-        sl_value = sl.get("value", -25)
+    if rtype == "drawdown_from_entry":
         pnl = pos.pnl_pct(current_price)
-        return pnl <= sl_value
+        fired = pnl <= rule.get("value", -25)
+        observed = {"pnl_pct": round(pnl, 4)}
 
-    return False
-
-
-def check_take_profit(pos: Position, current_price: float, config: dict) -> bool:
-    """Check if take profit is triggered."""
-    tp = config.get("take_profit")
-    if not tp:
-        return False
-
-    tp_type = tp.get("type")
-
-    # Vol-adaptive modes: tp_price was frozen at entry. Trigger on price cross.
-    if tp_type in ("atr_multiple", "realized_vol_multiple"):
-        return pos.take_profit_price is not None and current_price >= pos.take_profit_price
-
-    tp_value = tp.get("value", 10)
-
-    if tp_type == "gain_from_entry":
+    elif rtype == "gain_from_entry":
         pnl = pos.pnl_pct(current_price)
-        return pnl >= tp_value
+        fired = pnl >= rule.get("value", 10)
+        observed = {"pnl_pct": round(pnl, 4)}
 
-    elif tp_type == "above_peak":
+    elif rtype == "trailing_from_peak":
         if pos.peak_price and pos.peak_price > 0:
-            gain_from_peak = ((current_price - pos.peak_price) / pos.peak_price) * 100
-            return gain_from_peak >= tp_value
+            pct_from_peak = ((current_price - pos.peak_price) / pos.peak_price) * 100
+            fired = pct_from_peak <= rule.get("value", -8)
+            observed = {"pct_from_peak": round(pct_from_peak, 4),
+                        "peak_price": round(pos.peak_price, 4)}
 
-    return False
+    elif rtype == "time_max_days":
+        days = pos.days_held(current_date)
+        fired = days >= rule.get("value", 365)
+        observed = {"days_held": days}
 
+    elif rtype in ("atr_stop", "realized_vol_stop"):
+        frozen = pos.frozen_prices.get(rule_idx)
+        if frozen is not None:
+            fired = current_price <= frozen
+            observed = {"frozen_price": frozen, "current_price": round(current_price, 4)}
 
-def check_time_stop(pos: Position, current_date: str, config: dict) -> bool:
-    """Check if time stop is triggered."""
-    ts = config.get("time_stop")
-    if not ts:
-        return False
+    elif rtype in ("atr_target", "realized_vol_target"):
+        frozen = pos.frozen_prices.get(rule_idx)
+        if frozen is not None:
+            fired = current_price >= frozen
+            observed = {"frozen_price": frozen, "current_price": round(current_price, 4)}
 
-    max_days = ts.get("max_days", 365)
-    return pos.days_held(current_date) >= max_days
+    elif rtype in ("feature_threshold", "feature_percentile",
+                   "revenue_deceleration", "margin_collapse"):
+        if rule_signals is not None:
+            sig = rule_signals.get(pos.symbol, {}).get(current_date)
+            if sig is not None:
+                fired = True
+                observed = sig if isinstance(sig, dict) else {"value": sig}
+
+    if not fired:
+        return False, None
+
+    # Canonical envelope. Drop `type` from the config mirror to avoid duplication.
+    config = {k: v for k, v in rule.items() if k != "type"}
+    return True, {"type": rtype, "config": config, "observed": observed}
 
 
 # ---------------------------------------------------------------------------
@@ -1991,6 +2130,13 @@ def run_backtest(config: dict, force_close_at_end: bool = True,
         - closed_trades: completed round-trips
         - metrics: summary statistics
     """
+    # Migrate legacy exit fields (stop_loss/take_profit/time_stop/exit_conditions/
+    # exit_logic) into unified ExitConfig if the caller passed a legacy-shaped dict.
+    # Idempotent — no-op if already unified. Mutates the config dict in place.
+    sys.path.insert(0, str(Path(__file__).parent.parent / "server"))
+    from models.strategy import migrate_legacy_exits_to_unified
+    migrate_legacy_exits_to_unified(config)
+
     stamp_strategy_id(config)
     conn = get_connection()
 
@@ -2019,13 +2165,18 @@ def run_backtest(config: dict, force_close_at_end: bool = True,
     total_signals = sum(len(v) for v in signals.values())
     print(f"Found {total_signals} signal dates across {len(signals)} tickers")
 
-    # Pre-compute exit signals (fundamental + registry-driven exits)
-    exit_signals = {}
-    if config.get("exit_conditions"):
+    # Pre-compute event-driven exit-rule fires, keyed by flat rule index over
+    # exit.guards + exit.rules.
+    exit_signals: dict[int, dict] = {}
+    exit_cfg = config.get("exit") or {}
+    if exit_cfg.get("guards") or exit_cfg.get("rules"):
         print("Pre-computing exit signals...")
-        exit_signals = _precompute_exit_signals(config, symbols, conn, price_index=price_index)
-        total_exit = sum(len(v) for v in exit_signals.values())
-        print(f"Found {total_exit} exit signal dates across {len(exit_signals)} tickers")
+        exit_signals = _precompute_exit_signals_per_rule(config, symbols, conn, price_index=price_index)
+        total_exit = sum(
+            sum(len(d) for d in by_sym.values())
+            for by_sym in exit_signals.values()
+        )
+        print(f"Found {total_exit} exit signal dates across {len(exit_signals)} rules")
 
     # Load earnings data for rebalancing
     print("Loading earnings data...")
@@ -2069,11 +2220,18 @@ def run_backtest(config: dict, force_close_at_end: bool = True,
     # Track pending entries (for next_close execution)
     pending_entries = []  # [(symbol, peak_price)]
     last_rebal_date = None
-    stop_loss_cooldowns = {}  # {symbol: last_stop_loss_date}
-    cooldown_days = 0
-    if config.get("stop_loss"):
-        cooldown_calendar = config["stop_loss"].get("cooldown_days", 0)
-        cooldown_days = _calendar_to_trading_days(cooldown_calendar) if cooldown_calendar > 0 else 0
+    stop_loss_cooldowns = {}  # {symbol: last_exit_date_with_cooldown}
+    # Cooldown for re-entry is the largest cooldown_days across any guard or
+    # rule that carries one. Conservative: re-entry blocked for the longest of
+    # the configured cooldowns regardless of which rule fired. (The per-rule
+    # cooldown also gets recorded individually in the exit, but the global
+    # bound here is what blocks new entries below.)
+    _all_exit_rules = list(exit_cfg.get("guards") or []) + list(exit_cfg.get("rules") or [])
+    cooldown_calendar = max(
+        (r.get("cooldown_days", 0) for r in _all_exit_rules if isinstance(r, dict)),
+        default=0,
+    )
+    cooldown_days = _calendar_to_trading_days(cooldown_calendar) if cooldown_calendar > 0 else 0
     entry_priority = config.get("entry", {}).get("priority", "worst_drawdown")
 
     print(f"Running simulation with ${initial_cash:,.0f}...")
@@ -2137,32 +2295,67 @@ def run_backtest(config: dict, force_close_at_end: bool = True,
             if not price:
                 continue
 
-            # Check stop loss
-            if check_stop_loss(pos, price, config):
-                portfolio.close_position(symbol, date, price, "stop_loss", slippage)
+            # Unified exit evaluation: guards first (any one fires → exit),
+            # then rules combined via exit.logic. exit_signals here is
+            # {rule_idx: {symbol: {date: metadata}}} from the per-rule precompute.
+            exit_cfg = config.get("exit") or {}
+            guards_list = exit_cfg.get("guards") or []
+            rules_list = exit_cfg.get("rules") or []
+            n_guards = len(guards_list)
+
+            fired_guard_reason = None
+            fired_guard_idx = None
+            for gi, guard in enumerate(guards_list):
+                rule_signals = exit_signals.get(gi)
+                fired, reason = check_exit_rule(guard, gi, pos, price, date, rule_signals)
+                if fired:
+                    fired_guard_reason = reason
+                    fired_guard_idx = gi
+                    break
+
+            if fired_guard_reason is not None:
+                portfolio.close_position(symbol, date, price, fired_guard_reason, slippage)
                 closed_today.append(symbol)
-                if cooldown_days > 0:
+                # Cooldown: respect the guard's own cooldown_days, if any.
+                cd = guards_list[fired_guard_idx].get("cooldown_days", 0)
+                if cd > 0:
                     stop_loss_cooldowns[symbol] = date
                 continue
 
-            # Check take profit
-            if check_take_profit(pos, price, config):
-                portfolio.close_position(symbol, date, price, "take_profit", slippage)
-                closed_today.append(symbol)
-                continue
+            # No guard fired — evaluate rules through the combinator.
+            if rules_list:
+                fired_rules: list[tuple[int, dict]] = []
+                for ri, rule in enumerate(rules_list):
+                    rule_idx = n_guards + ri  # flat index into precompute
+                    rule_signals = exit_signals.get(rule_idx)
+                    fired, reason = check_exit_rule(rule, rule_idx, pos, price, date, rule_signals)
+                    if fired:
+                        fired_rules.append((ri, reason))
 
-            # Check time stop
-            if check_time_stop(pos, date, config):
-                portfolio.close_position(symbol, date, price, "time_stop", slippage)
-                closed_today.append(symbol)
-                continue
-
-            # Check fundamental exit conditions
-            if exit_signals.get(symbol, {}).get(date):
-                reason = exit_signals[symbol][date].get("reason", "fundamental_exit")
-                portfolio.close_position(symbol, date, price, reason, slippage)
-                closed_today.append(symbol)
-                continue
+                logic = exit_cfg.get("logic", "any")
+                should_exit = (
+                    bool(fired_rules) if logic == "any"
+                    else len(fired_rules) == len(rules_list)
+                )
+                if should_exit:
+                    if logic == "any":
+                        primary_reason = fired_rules[0][1]
+                    else:
+                        # Compose AND reason: list of all firing rules' envelopes.
+                        primary_reason = {
+                            "type": "compound_all",
+                            "config": {"logic": "all"},
+                            "observed": {"components": [r[1] for r in fired_rules]},
+                        }
+                    portfolio.close_position(symbol, date, price, primary_reason, slippage)
+                    closed_today.append(symbol)
+                    # Cooldown: if any firing rule has cooldown_days, apply it.
+                    for ri, _ in fired_rules:
+                        cd = rules_list[ri].get("cooldown_days", 0)
+                        if cd > 0:
+                            stop_loss_cooldowns[symbol] = date
+                            break
+                    continue
 
         # --- Check rebalancing (only if regime gate is on) ---
         rebal_freq = config.get("rebalancing", {}).get("frequency", "none")

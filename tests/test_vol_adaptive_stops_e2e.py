@@ -160,9 +160,10 @@ sells_atr = [t for t in result_atr["trades"] if t["action"] == "SELL"]
 check("ATR mode produces buys", len(buys_atr) > 0, f"buys={len(buys_atr)}")
 
 # Every BUY must have stop record in canonical envelope.
+# Type names: legacy 'atr_multiple' migrates to 'atr_stop' under unified exits.
 all_have_stop_meta = all(
     isinstance(t.get("signal_detail"), dict)
-    and t["signal_detail"].get("stop", {}).get("type") == "atr_multiple"
+    and t["signal_detail"].get("stop", {}).get("type") == "atr_stop"
     and "atr" in t["signal_detail"]["stop"].get("observed", {})
     and "frozen_price" in t["signal_detail"]["stop"]["observed"]
     and "k" in t["signal_detail"]["stop"].get("config", {})
@@ -170,26 +171,27 @@ all_have_stop_meta = all(
 )
 check("every BUY has ATR canonical-envelope stop record", all_have_stop_meta)
 
-# Every SELL flagged stop_loss must execute at <= frozen stop_price (after slippage).
-sl_fires = [t for t in sells_atr if t.get("reason") == "stop_loss"]
+# Every SELL flagged atr_stop must execute at <= frozen stop_price (after slippage).
+# Under unified exits, the SELL trade's `reason` is the rule's type, not "stop_loss".
+sl_fires = [t for t in sells_atr if t.get("reason") == "atr_stop"]
 print(f"  ATR stop-loss fires: {len(sl_fires)}")
 for t in sl_fires:
     sd = t.get("signal_detail") or {}
     frozen = ((sd.get("stop") or {}).get("observed") or {}).get("frozen_price")
     if frozen is None:
-        check(f"stop_loss SELL has frozen_price ({t['symbol']}@{t['date']})", False)
+        check(f"atr_stop SELL has frozen_price ({t['symbol']}@{t['date']})", False)
         continue
     ok = t["price"] <= frozen * 1.01
     check(f"ATR SELL price ≤ frozen stop ({t['symbol']}@{t['date']}: "
           f"price={t['price']:.2f}, frozen={frozen:.2f})", ok)
 
-tp_fires = [t for t in sells_atr if t.get("reason") == "take_profit"]
+tp_fires = [t for t in sells_atr if t.get("reason") == "atr_target"]
 print(f"  ATR take-profit fires: {len(tp_fires)}")
 for t in tp_fires:
     sd = t.get("signal_detail") or {}
     frozen_tp = ((sd.get("take_profit") or {}).get("observed") or {}).get("frozen_price")
     if frozen_tp is None:
-        check(f"take_profit SELL has frozen_price ({t['symbol']}@{t['date']})", False)
+        check(f"atr_target SELL has frozen_price ({t['symbol']}@{t['date']})", False)
         continue
     ok = t["price"] >= frozen_tp * 0.99
     check(f"ATR SELL price ≥ frozen tp ({t['symbol']}@{t['date']}: "
@@ -212,7 +214,7 @@ check("realized_vol historical produces buys", len(buys_rv) > 0,
       f"buys={len(buys_rv)}")
 all_have_meta = all(
     isinstance(t.get("signal_detail"), dict)
-    and t["signal_detail"].get("stop", {}).get("type") == "realized_vol_multiple"
+    and t["signal_detail"].get("stop", {}).get("type") == "realized_vol_stop"
     and t["signal_detail"]["stop"]["config"].get("sigma_source") == "historical"
     and "sigma" in t["signal_detail"]["stop"].get("observed", {})
     for t in buys_rv
@@ -248,7 +250,7 @@ check("EWMA mode produces buys", len(buys_e) > 0)
 # Both records present in canonical envelope.
 mixed_ok = all(
     isinstance(t.get("signal_detail"), dict)
-    and t["signal_detail"].get("stop", {}).get("type") == "realized_vol_multiple"
+    and t["signal_detail"].get("stop", {}).get("type") == "realized_vol_stop"
     and t["signal_detail"]["stop"]["config"].get("sigma_source") == "ewma"
     and t["signal_detail"].get("take_profit", {}).get("type") == "gain_from_entry"
     and t["signal_detail"]["take_profit"].get("observed") == {}
