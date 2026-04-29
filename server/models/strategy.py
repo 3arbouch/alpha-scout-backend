@@ -14,8 +14,15 @@ from pydantic import BaseModel, Field, model_validator
 
 # Import the registry first — the library modules register features at import
 # time, so feature_names() returns a complete tuple by the time we use it
-# below to build the FeatureName Literal.
-from server.factors import feature_names as _registry_feature_names
+# below to build the FeatureName Literal. Try both import paths so this
+# module loads whether the API is started from the repo root or from server/.
+try:
+    from server.factors import feature_names as _registry_feature_names
+except ModuleNotFoundError:
+    import sys as _sys
+    from pathlib import Path as _Path
+    _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent.parent))
+    from server.factors import feature_names as _registry_feature_names
 
 _FEATURE_NAMES = _registry_feature_names()
 
