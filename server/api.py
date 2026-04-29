@@ -1085,7 +1085,7 @@ def _nulls_to_zero(obj):
 # Backward compat (tickers→symbols, trigger/confirm→conditions, etc.) is handled
 # by model_validators on the domain models themselves.
 # ---------------------------------------------------------------------------
-from pydantic import BaseModel as _BM, Field
+from pydantic import BaseModel as _BM, Field, model_validator
 from typing import Literal
 from enum import Enum
 import hashlib
@@ -1095,7 +1095,7 @@ from models.strategy import (
     UniverseConfig, EntryConfig, EntryCondition,
     StopLossConfig, TakeProfitConfig, TimeStopConfig,
     RebalancingConfig, RebalancingRules, SizingConfig,
-    RankingConfig, ExitCondition, BacktestParams,
+    RankingConfig, ExitCondition, ExitConfig, BacktestParams,
 )
 from models.portfolio import (
     SleeveConfig, PortfolioConfig, InlineRegimeDefinition,
@@ -1118,13 +1118,25 @@ class StrategyCreate(_BM):
     author: AuthorConfig = AuthorConfig()
     universe: UniverseConfig
     entry: EntryConfig
-    stop_loss: StopLossConfig | None = Field(default=None, description="Stop loss configuration. Omit or set to null to disable.")
-    take_profit: TakeProfitConfig | None = Field(default=None, description="Take profit configuration. Omit or set to null to disable.")
-    time_stop: TimeStopConfig | None = Field(default=None, description="Time-based exit. Omit or set to null to hold indefinitely.")
-    exit_conditions: list[ExitCondition] | None = Field(default=None, description="Fundamental exit triggers (OR logic).")
+    # Unified exit configuration — preferred shape for new strategies.
+    exit: ExitConfig = Field(default_factory=ExitConfig, description="Unified exit config: guards (always fire) + rules (combined via logic).")
+    # Legacy exit fields — accepted for back-compat. If present, the model
+    # validator translates them into `exit` and clears the legacy fields.
+    stop_loss: StopLossConfig | None = Field(default=None, description="DEPRECATED — use `exit.guards`.")
+    take_profit: TakeProfitConfig | None = Field(default=None, description="DEPRECATED — use `exit.guards`.")
+    time_stop: TimeStopConfig | None = Field(default=None, description="DEPRECATED — use `exit.guards` with `time_max_days`.")
+    exit_conditions: list[ExitCondition] | None = Field(default=None, description="DEPRECATED — use `exit.rules`.")
+    exit_logic: Literal["any", "all"] = Field(default="any", description="DEPRECATED — use `exit.logic`.")
     ranking: RankingConfig | None = Field(default=None, description="Rank candidates by metric before applying max_positions.")
     rebalancing: RebalancingConfig = Field(default=RebalancingConfig(), description="Periodic rebalancing settings.")
     sizing: SizingConfig = Field(default=SizingConfig(), description="Position sizing settings.")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy(cls, data):
+        """Run the same legacy → unified migration as StrategyConfig."""
+        from models.strategy import migrate_legacy_exits_to_unified
+        return migrate_legacy_exits_to_unified(data)
 
 
 def _normalize_config(config: dict) -> dict:

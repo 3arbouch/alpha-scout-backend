@@ -1079,6 +1079,23 @@ async def get_experiment(run_id: str, experiment_id: str):
             except (json.JSONDecodeError, TypeError):
                 pass
 
+    # Normalize the stored portfolio_config: run the unified-exit migrator on
+    # each sleeve's strategy_config so the FE sees the new shape regardless
+    # of when the experiment was originally run.
+    pc = result.get("portfolio_config")
+    if isinstance(pc, dict) and "sleeves" in pc:
+        try:
+            import sys as _sys
+            from pathlib import Path as _Path
+            _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+            from server.models.strategy import migrate_legacy_exits_to_unified
+            for sleeve in pc.get("sleeves", []):
+                sc = sleeve.get("strategy_config") or sleeve.get("config")
+                if isinstance(sc, dict):
+                    migrate_legacy_exits_to_unified(sc)
+        except Exception:
+            pass  # best-effort; if it fails, return raw
+
     return result
 
 
