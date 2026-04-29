@@ -42,13 +42,21 @@ def generate_run_id() -> str:
 
 
 def _load_schemas() -> str:
-    """Load strategy and portfolio schemas from the engines."""
+    """Load strategy and portfolio schemas from the engines.
+
+    Schemas are dumped compactly (separators=',:') because the SDK launches
+    the bundled Claude binary as a subprocess and passes the system prompt
+    as a CLI argument. Linux's MAX_ARG_STRLEN is 128 KiB per single argument;
+    the verbose pretty-printed schemas alone exceed that on configs with
+    discriminated unions of ~10+ types. Compact JSON cuts the schema bytes
+    roughly in half without changing the agent's ability to parse it.
+    """
     import json as _json
     try:
         from backtest_engine import get_config_schema as strategy_schema
         from portfolio_engine import get_config_schema as portfolio_schema
-        strat = _json.dumps(strategy_schema(), indent=2)
-        port = _json.dumps(portfolio_schema(), indent=2)
+        strat = _json.dumps(strategy_schema(), separators=(",", ":"))
+        port = _json.dumps(portfolio_schema(), separators=(",", ":"))
 
         thesis_schema = _json.dumps({
             "thesis": {
@@ -56,7 +64,7 @@ def _load_schemas() -> str:
                 "assumptions": {"type": "array", "items": "string", "description": "List of assumptions that must hold for this thesis to work"},
             },
             "portfolio": "(see Portfolio Config Schema below)",
-        }, indent=2)
+        })
 
         return (
             "### Thesis Output Schema\n\n"
