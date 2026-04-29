@@ -482,7 +482,11 @@ ExitRule = Annotated[
     | TimeMaxDaysExit
     | AtrStopExit | AtrTargetExit
     | RealizedVolStopExit | RealizedVolTargetExit
-    | FeatureThresholdCondition | FeaturePercentileCondition,
+    | FeatureThresholdCondition | FeaturePercentileCondition
+    # Legacy fundamental-deterioration exit types — kept in the union so
+    # stored configs that used them via exit_conditions migrate cleanly.
+    # The engine routes them through _precompute_exit_signals_per_rule.
+    | RevenueDecelerationExit | MarginCollapseExit,
     Field(discriminator="type"),
 ]
 
@@ -504,6 +508,91 @@ class ExitConfig(BaseModel):
     guards: list[ExitRule] = Field(default_factory=list)
     rules: list[ExitRule] = Field(default_factory=list)
     logic: Literal["any", "all"] = Field(default="any")
+
+
+def migrate_legacy_exits_to_unified(data: dict) -> dict:
+    """Translate legacy exit fields into ExitConfig.
+
+    Idempotent: if `exit` is already structured (with guards/rules), returns
+    unchanged. Otherwise: fold stop_loss / take_profit / time_stop /
+    exit_conditions / exit_logic into exit.guards / exit.rules / exit.logic
+    and strip the legacy fields so downstream callers see only the unified shape.
+
+    Type translations:
+      stop_loss.drawdown_from_entry  → drawdown_from_entry (guard)
+      stop_loss.atr_multiple         → atr_stop (guard)
+      stop_loss.realized_vol_multiple → realized_vol_stop (guard)
+      take_profit.gain_from_entry    → gain_from_entry (guard)
+      take_profit.above_peak         → trailing_from_peak (guard, sign flipped to negative)
+      take_profit.atr_multiple       → atr_target (guard)
+      take_profit.realized_vol_multiple → realized_vol_target (guard)
+      time_stop.max_days             → time_max_days (guard)
+      exit_conditions[*]             → rules (unchanged shape)
+      exit_logic                     → exit.logic
+
+    Called both as a Pydantic model_validator and directly by the engine's
+    run_backtest entry point, so engine callers that pass legacy-shaped dicts
+    without going through model_validate also get migrated.
+    """
+    if not isinstance(data, dict):
+        return data
+    existing_exit = data.get("exit")
+    if isinstance(existing_exit, dict) and (
+        "guards" in existing_exit or "rules" in existing_exit
+    ):
+        return data
+
+    guards: list = []
+    rules: list = []
+
+    sl = data.pop("stop_loss", None)
+    if sl:
+        t = sl.get("type")
+        base = {k: v for k, v in sl.items() if k != "type"}
+        if t == "drawdown_from_entry":
+            guards.append({"type": "drawdown_from_entry", **base})
+        elif t == "atr_multiple":
+            guards.append({"type": "atr_stop", **base})
+        elif t == "realized_vol_multiple":
+            guards.append({"type": "realized_vol_stop", **base})
+
+    tp = data.pop("take_profit", None)
+    if tp:
+        t = tp.get("type")
+        base = {k: v for k, v in tp.items() if k != "type"}
+        if t == "gain_from_entry":
+            guards.append({"type": "gain_from_entry", **base})
+        elif t == "above_peak":
+            # above_peak's intent was trailing-from-peak with a positive value
+            # meaning "exit on N% retracement from peak". Translate to
+            # trailing_from_peak with -abs(value).
+            v = base.pop("value", 60)
+            guards.append({"type": "trailing_from_peak", "value": -abs(v), **base})
+        elif t == "atr_multiple":
+            guards.append({"type": "atr_target", **base})
+        elif t == "realized_vol_multiple":
+            guards.append({"type": "realized_vol_target", **base})
+
+    ts = data.pop("time_stop", None)
+    if ts:
+        mx = ts.get("max_days") or ts.get("days")
+        if mx:
+            guards.append({"type": "time_max_days", "value": int(mx)})
+
+    ec = data.pop("exit_conditions", None) or []
+    for cond in ec:
+        if isinstance(cond, dict):
+            rules.append(cond)
+
+    legacy_logic = data.pop("exit_logic", "any")
+
+    if guards or rules:
+        data["exit"] = {
+            "guards": guards,
+            "rules": rules,
+            "logic": legacy_logic,
+        }
+    return data
 
 
 class RankingConfig(BaseModel):
@@ -587,84 +676,5 @@ class StrategyConfig(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def _migrate_legacy_exits_to_unified(cls, data):
-        """Translate legacy exit fields into ExitConfig.
-
-        Idempotent: if `exit` is already structured (with guards/rules), returns
-        unchanged. Otherwise: fold stop_loss / take_profit / time_stop /
-        exit_conditions / exit_logic into exit.guards / exit.rules / exit.logic
-        and strip the legacy fields so Pydantic doesn't see them.
-
-        Type translations:
-          stop_loss.drawdown_from_entry  → drawdown_from_entry (guard)
-          stop_loss.atr_multiple         → atr_stop (guard)
-          stop_loss.realized_vol_multiple → realized_vol_stop (guard)
-          take_profit.gain_from_entry    → gain_from_entry (guard)
-          take_profit.above_peak         → trailing_from_peak (guard, sign flipped to negative)
-          take_profit.atr_multiple       → atr_target (guard)
-          take_profit.realized_vol_multiple → realized_vol_target (guard)
-          time_stop.max_days             → time_max_days (guard)
-          exit_conditions[*]             → rules (unchanged shape)
-          exit_logic                     → exit.logic
-        """
-        if not isinstance(data, dict):
-            return data
-        existing_exit = data.get("exit")
-        if isinstance(existing_exit, dict) and (
-            "guards" in existing_exit or "rules" in existing_exit
-        ):
-            # Already in unified shape — nothing to do.
-            return data
-
-        guards: list = []
-        rules: list = []
-
-        sl = data.pop("stop_loss", None)
-        if sl:
-            t = sl.get("type")
-            base = {k: v for k, v in sl.items() if k != "type"}
-            if t == "drawdown_from_entry":
-                guards.append({"type": "drawdown_from_entry", **base})
-            elif t == "atr_multiple":
-                guards.append({"type": "atr_stop", **base})
-            elif t == "realized_vol_multiple":
-                guards.append({"type": "realized_vol_stop", **base})
-
-        tp = data.pop("take_profit", None)
-        if tp:
-            t = tp.get("type")
-            base = {k: v for k, v in tp.items() if k != "type"}
-            if t == "gain_from_entry":
-                guards.append({"type": "gain_from_entry", **base})
-            elif t == "above_peak":
-                # above_peak's true intent is trailing-from-peak with a positive
-                # threshold meaning "exit on N% retracement from peak". Translate
-                # to trailing_from_peak with a negative value (matches the new
-                # convention where value=-N% means "exit on N% drop from peak").
-                v = base.pop("value", 60)
-                guards.append({"type": "trailing_from_peak", "value": -abs(v), **base})
-            elif t == "atr_multiple":
-                guards.append({"type": "atr_target", **base})
-            elif t == "realized_vol_multiple":
-                guards.append({"type": "realized_vol_target", **base})
-
-        ts = data.pop("time_stop", None)
-        if ts:
-            mx = ts.get("max_days") or ts.get("days")
-            if mx:
-                guards.append({"type": "time_max_days", "value": int(mx)})
-
-        ec = data.pop("exit_conditions", None) or []
-        for cond in ec:
-            if isinstance(cond, dict):
-                rules.append(cond)
-
-        legacy_logic = data.pop("exit_logic", "any")
-
-        if guards or rules:
-            data["exit"] = {
-                "guards": guards,
-                "rules": rules,
-                "logic": legacy_logic,
-            }
-        return data
+    def _migrate_legacy_exits_to_unified_validator(cls, data):
+        return migrate_legacy_exits_to_unified(data)
