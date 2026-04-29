@@ -394,6 +394,118 @@ class TimeStopConfig(BaseModel):
         return data
 
 
+# ---------------------------------------------------------------------------
+# Unified Exit Rules
+#
+# Every exit type — hard stops, take-profits, trailing stops, time stops, and
+# feature-driven thesis exits — is a member of one ExitRule discriminated
+# union. Strategies put rules into ExitConfig.guards (always fire on their
+# own) or ExitConfig.rules (combined via ExitConfig.logic). Position-state
+# rules (drawdown_from_entry, gain_from_entry, trailing_from_peak, time_max_
+# days, atr_*, realized_vol_*) are evaluated every bar against the open
+# position. Event-driven rules (feature_threshold, feature_percentile) are
+# precomputed across (symbol, date) and looked up.
+#
+# Lookahead semantics: position-state rules read the bar's close (known by
+# EOD); atr_/realized_vol_ rules use OHLC strictly before entry; feature-
+# driven rules use the same lookahead-clean factor pipeline as entries.
+# ---------------------------------------------------------------------------
+
+class DrawdownFromEntryExit(BaseModel):
+    """Per-position state. Fires when pnl_pct ≤ value (negative)."""
+    type: Literal["drawdown_from_entry"] = "drawdown_from_entry"
+    value: float = Field(le=0, description="Negative %. e.g. -10 = exit at 10% loss from entry.")
+    cooldown_days: int = Field(ge=0, default=90, description="Days before re-entering same ticker after fire.")
+
+
+class GainFromEntryExit(BaseModel):
+    """Per-position state. Fires when pnl_pct ≥ value (positive)."""
+    type: Literal["gain_from_entry"] = "gain_from_entry"
+    value: float = Field(gt=0, description="Positive %. e.g. 30 = exit at 30% gain from entry.")
+
+
+class TrailingFromPeakExit(BaseModel):
+    """Per-position state. Fires when current price has retraced N% from running peak.
+
+    Distinct from drawdown_from_entry (compares to entry price): this fires
+    even when the position is still in profit, capturing gains given back.
+    """
+    type: Literal["trailing_from_peak"] = "trailing_from_peak"
+    value: float = Field(lt=0, description="Negative %. e.g. -8 = exit if current is 8% below peak price since entry.")
+    cooldown_days: int = Field(ge=0, default=0)
+
+
+class TimeMaxDaysExit(BaseModel):
+    """Per-position state. Fires when calendar days held since entry ≥ value."""
+    type: Literal["time_max_days"] = "time_max_days"
+    value: int = Field(ge=1, description="Calendar-day cap on holding period.")
+
+
+class AtrStopExit(BaseModel):
+    """Per-position, frozen at entry. stop_price = entry − k × ATR(window). Fires on price ≤ stop."""
+    type: Literal["atr_stop"] = "atr_stop"
+    k: float = Field(gt=0, le=10)
+    window_days: int = Field(ge=10, le=252)
+    cooldown_days: int = Field(ge=0, default=90)
+
+
+class AtrTargetExit(BaseModel):
+    """Per-position, frozen at entry. tp_price = entry + k × ATR(window). Fires on price ≥ tp."""
+    type: Literal["atr_target"] = "atr_target"
+    k: float = Field(gt=0, le=10)
+    window_days: int = Field(ge=10, le=252)
+
+
+class RealizedVolStopExit(BaseModel):
+    """Per-position, frozen at entry. stop_price = entry × (1 − k × sigma_daily). Fires on price ≤ stop."""
+    type: Literal["realized_vol_stop"] = "realized_vol_stop"
+    k: float = Field(gt=0, le=10)
+    window_days: int = Field(ge=10, le=252)
+    sigma_source: Literal["historical", "ewma"] = "historical"
+    cooldown_days: int = Field(ge=0, default=90)
+
+
+class RealizedVolTargetExit(BaseModel):
+    """Per-position, frozen at entry. tp_price = entry × (1 + k × sigma_daily). Fires on price ≥ tp."""
+    type: Literal["realized_vol_target"] = "realized_vol_target"
+    k: float = Field(gt=0, le=10)
+    window_days: int = Field(ge=10, le=252)
+    sigma_source: Literal["historical", "ewma"] = "historical"
+
+
+# ExitRule reuses FeatureThresholdCondition and FeaturePercentileCondition
+# from the entry side — the same generic factor-driven rule shape works as a
+# (symbol, date)-keyed exit signal. The factor catalog is registry-driven, so
+# any of the registered factors (see server.factors) can be referenced.
+ExitRule = Annotated[
+    DrawdownFromEntryExit | GainFromEntryExit | TrailingFromPeakExit
+    | TimeMaxDaysExit
+    | AtrStopExit | AtrTargetExit
+    | RealizedVolStopExit | RealizedVolTargetExit
+    | FeatureThresholdCondition | FeaturePercentileCondition,
+    Field(discriminator="type"),
+]
+
+
+class ExitConfig(BaseModel):
+    """Unified exit configuration. Replaces stop_loss + take_profit + time_stop
+    + exit_conditions + exit_logic with one structured field.
+
+    Two semantic tiers:
+      - guards: any guard firing immediately closes the position, regardless
+        of `logic`. Hard stops, take-profits at levels, time stops, any
+        unconditional rule.
+      - rules:  combined via `logic` ('any' = OR; 'all' = AND). Use for
+        thesis exits (signal reversals, fundamental deterioration, compound
+        conditions).
+
+    A position exits when (any guard fires) OR (the rules combine to true).
+    """
+    guards: list[ExitRule] = Field(default_factory=list)
+    rules: list[ExitRule] = Field(default_factory=list)
+    logic: Literal["any", "all"] = Field(default="any")
+
+
 class RankingConfig(BaseModel):
     """Rank qualified candidates by a metric before applying max_positions."""
     by: Literal[
@@ -451,17 +563,21 @@ class StrategyConfig(BaseModel):
     version: int = Field(default=1)
     universe: UniverseConfig
     entry: EntryConfig
-    stop_loss: StopLossConfig | None = None
-    take_profit: TakeProfitConfig | None = None
-    time_stop: TimeStopConfig | None = None
-    exit_conditions: list[ExitCondition] | None = None
-    exit_logic: Literal["any", "all"] = Field(
-        default="any",
-        description="How to combine multiple exit_conditions. 'any' (default) "
-                    "= OR; any condition firing exits the position. 'all' = AND; "
-                    "every listed condition must fire on the same (symbol, date) "
-                    "to trigger an exit.",
-    )
+    # Unified exit configuration. New strategies should use this exclusively.
+    # The legacy fields below (stop_loss, take_profit, time_stop, exit_conditions,
+    # exit_logic) are translated into `exit` via a load-time validator for
+    # back-compat with stored configs; do not author new strategies using them.
+    exit: ExitConfig = Field(default_factory=ExitConfig)
+    stop_loss: StopLossConfig | None = Field(default=None,
+        description="DEPRECATED — use exit.guards with drawdown_from_entry / atr_stop / realized_vol_stop instead.")
+    take_profit: TakeProfitConfig | None = Field(default=None,
+        description="DEPRECATED — use exit.guards with gain_from_entry / atr_target / realized_vol_target / trailing_from_peak instead.")
+    time_stop: TimeStopConfig | None = Field(default=None,
+        description="DEPRECATED — use exit.guards with time_max_days instead.")
+    exit_conditions: list[ExitCondition] | None = Field(default=None,
+        description="DEPRECATED — use exit.rules instead.")
+    exit_logic: Literal["any", "all"] = Field(default="any",
+        description="DEPRECATED — use exit.logic instead.")
     ranking: RankingConfig | None = None
     rebalancing: RebalancingConfig = Field(default_factory=RebalancingConfig)
     sizing: SizingConfig = Field(default_factory=SizingConfig)
