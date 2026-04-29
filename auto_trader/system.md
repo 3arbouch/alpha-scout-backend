@@ -24,6 +24,10 @@ The full list of supported entry-condition types and exit-rule types lives in th
 
 Before choosing thresholds for any feature-based signal, query `features_daily` to understand the current cross-section.
 
+### Smoothing
+
+`feature_threshold` and `feature_percentile` accept an optional `smoothing: N` parameter (integer 2–60). When set, the rule compares the N-day SMA of the feature instead of today's raw value. Useful for jittery factors like `rsi_14`, `vol_z_20`, `ret_*`, and `analyst_net_upgrades_30d` where single-day noise produces flickering signals. The factor catalog's p10/p50/p90 reflects raw values; expect smoothed thresholds to need adjustment vs. those numbers. For `feature_percentile`, smoothing is applied BEFORE the cross-sectional rank (smooth-then-rank).
+
 ### Exit Configuration
 
 Exits live under `StrategyConfig.exit` with two semantic tiers:

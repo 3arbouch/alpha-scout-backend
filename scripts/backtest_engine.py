@@ -456,14 +456,35 @@ def _get_market_conn(conn):
     return sqlite3.connect(mk), True  # new connection, must close
 
 
+def _apply_sma_to_series(pts: list[tuple], window: int) -> list[tuple]:
+    """Replace each (date, value) with (date, mean of trailing `window` values).
+
+    Drops the first `window-1` rows (insufficient history). Lookahead-clean —
+    the smoothed value at index i uses values[i - window + 1 .. i] inclusive,
+    no forward-looking values. Empty list if pts has fewer than `window` rows.
+    """
+    if window < 2 or len(pts) < window:
+        return []
+    out: list[tuple] = []
+    vals = [v for _, v in pts]
+    for i in range(window - 1, len(pts)):
+        out.append((pts[i][0], sum(vals[i - window + 1:i + 1]) / window))
+    return out
+
+
 def _load_feature_series(feature: str, symbols: list[str], start: str, end: str, conn,
-                         price_index: dict | None = None) -> dict:
+                         price_index: dict | None = None,
+                         smoothing: int | None = None) -> dict:
     """Return {symbol: [(date, value), ...]} for `feature` over [start, end].
 
     Registry-aware:
       - precomputed → bulk SELECT from features_daily.
       - on_the_fly  → call FeatureDef.compute_series(symbol, prices) per symbol.
         price_index must be provided (the engine builds it once per backtest).
+
+    `smoothing` (optional, ≥2): apply an N-day SMA to each symbol's series
+    before returning. Replaces (date, value) with (date, trailing_mean_N).
+    Drops insufficient-history rows. Lookahead-clean by construction.
 
     Range is widened 1y before `start` so bisect-as-of can find a value for
     early trading days when the first in-window row hasn't been written yet.
@@ -511,6 +532,10 @@ def _load_feature_series(feature: str, symbols: list[str], start: str, end: str,
             )
             if pts:
                 out[sym] = pts
+        # Apply smoothing if requested (on-the-fly path).
+        if smoothing and isinstance(smoothing, int) and smoothing >= 2:
+            out = {sym: _apply_sma_to_series(pts, smoothing) for sym, pts in out.items()}
+            out = {sym: pts for sym, pts in out.items() if pts}
         return out
 
     # precomputed path — read from features_daily.
@@ -529,6 +554,10 @@ def _load_feature_series(feature: str, symbols: list[str], start: str, end: str,
     out = {}
     for sym, d, v in rows:
         out.setdefault(sym, []).append((d, v))
+    # Apply smoothing if requested (precomputed path).
+    if smoothing and isinstance(smoothing, int) and smoothing >= 2:
+        out = {sym: _apply_sma_to_series(pts, smoothing) for sym, pts in out.items()}
+        out = {sym: pts for sym, pts in out.items() if pts}
     return out
 
 
@@ -564,7 +593,9 @@ def _precompute_feature_threshold(cond: dict, symbols: list[str], conn, start: s
     if op_fn is None:
         raise ValueError(f"Unknown operator: {operator}")
 
-    series = _load_feature_series(feature, symbols, start, end, conn, price_index=price_index)
+    smoothing = cond.get("smoothing")
+    series = _load_feature_series(feature, symbols, start, end, conn,
+                                   price_index=price_index, smoothing=smoothing)
     # Use each symbol's own feature dates as "trading days" — dense: one row per trading day.
     signals: dict = {}
     for sym, pts in series.items():
@@ -592,8 +623,12 @@ def _precompute_feature_percentile(cond: dict, symbols: list[str], conn, start: 
     scope = cond.get("scope", "universe")
     min_value = cond.get("min_value")
     max_value = cond.get("max_value")
+    smoothing = cond.get("smoothing")
 
-    series = _load_feature_series(feature, symbols, start, end, conn, price_index=price_index)
+    # smooth-then-rank semantics: each symbol's series is smoothed first,
+    # then the cross-sectional percentile rank is computed on smoothed values.
+    series = _load_feature_series(feature, symbols, start, end, conn,
+                                   price_index=price_index, smoothing=smoothing)
     if not series:
         return {}
 

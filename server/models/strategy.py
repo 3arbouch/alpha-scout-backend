@@ -168,11 +168,22 @@ FeatureName = Literal[*_FEATURE_NAMES]  # type: ignore[valid-type]
 
 
 class FeatureThresholdCondition(BaseModel):
-    """Fires when the as-of feature value passes operator/value on that day."""
+    """Fires when the as-of feature value passes operator/value on that day.
+
+    `smoothing` (optional, 2–60) replaces today's raw value with the N-day SMA
+    of the feature before applying the comparator. Useful for noisy factors
+    (rsi_14, vol_z_20, ret_*, analyst_net_upgrades_30d) where single-day
+    flicker generates false fires. Lookahead-clean by construction — the SMA
+    at trading day T uses values through T only.
+    """
     type: Literal["feature_threshold"] = "feature_threshold"
     feature: FeatureName
     operator: Literal[">", ">=", "<", "<=", "==", "!="] = ">="
     value: float
+    smoothing: int | None = Field(
+        default=None, ge=2, le=60,
+        description="Optional N-day SMA window applied to the feature before the operator/value comparison. Reduces single-day noise on jittery factors. None = compare today's raw value.",
+    )
 
 
 class FeaturePercentileCondition(BaseModel):
@@ -181,6 +192,10 @@ class FeaturePercentileCondition(BaseModel):
     scope='universe' ranks across all active symbols; 'sector' ranks within GICS sector.
     Optional min_value / max_value filter outliers before ranking (e.g. min_pe=0 to
     exclude negative-earnings names from a cheap-PE screen).
+
+    `smoothing` (optional, 2–60) applies an N-day SMA to each symbol's feature
+    BEFORE the cross-sectional rank, so symbols are ranked on smoothed values
+    rather than today's raw value. Stabilizes the rank when a factor is noisy.
     """
     type: Literal["feature_percentile"] = "feature_percentile"
     feature: FeatureName
@@ -188,6 +203,10 @@ class FeaturePercentileCondition(BaseModel):
     scope: Literal["universe", "sector"] = "universe"
     min_value: float | None = None
     max_value: float | None = None
+    smoothing: int | None = Field(
+        default=None, ge=2, le=60,
+        description="Optional N-day SMA window applied to each symbol's feature BEFORE the cross-sectional rank.",
+    )
 
 
 class DaysToEarningsCondition(BaseModel):
