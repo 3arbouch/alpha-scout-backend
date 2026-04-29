@@ -347,9 +347,14 @@ def build_recent_lessons_context(run_id: str, limit: int = 3) -> str:
     rows = get_recent_lessons(run_id, limit=limit)
     if not rows:
         return ""
-    lines = [f"## Lessons from your last {len(rows)} experiment(s) (most recent first)\n"]
+    lines = [f"## Lessons from prior experiments (most recent first)\n"]
     for r in rows:
-        lines.append(f"### Experiment {r['iteration']}\n")
+        # Header refers to the experiment the lessons reflect on, not the
+        # current iteration. The agent writes these at the end of experiment N
+        # after seeing N's results, so they describe what was learned through
+        # iteration N — labeling them "Lessons after Experiment N" reads
+        # coherently when the agent is on iteration N+1.
+        lines.append(f"### Lessons after Experiment {r['iteration']}\n")
         lines.append(r["lessons"].strip())
         lines.append("")  # blank line between blocks
     return "\n".join(lines)
