@@ -121,18 +121,61 @@ def yoy_pct(latest_q: tuple, year_ago_q: tuple | None, col_idx: int) -> float | 
 # ---------------------------------------------------------------------------
 # Per-symbol data load
 # ---------------------------------------------------------------------------
+# Fallback when a fundamentals row has no matching earnings announcement.
+# 45 calendar days approximates the regulatory deadline for 10-Q filings.
+_FILING_LAG_FALLBACK_DAYS = 45
+
+
+def _annotate_with_availability(rows: list[tuple], earnings_dates: list[str]) -> list[tuple]:
+    """Append an `available_from` field to each fundamentals row.
+
+    available_from = earliest earnings.date with date >= row.period_end (within
+    a 60-day window), else period_end + 45 calendar days. This is the moment
+    the row's data was actually public. Rows are then re-sorted by
+    available_from so as-of bisection on the last column is correct.
+
+    Drops rows where available_from would precede period_end (malformed data).
+    """
+    from bisect import bisect_left
+    from datetime import datetime, timedelta
+
+    out: list[tuple] = []
+    for r in rows:
+        period_end = r[0]
+        idx = bisect_left(earnings_dates, period_end)
+        # Only accept an earnings event that's within 60d of period_end —
+        # matches scripts/signals.py:_load_quarterly_income semantics.
+        cutoff = (datetime.strptime(period_end, "%Y-%m-%d") + timedelta(days=60)).strftime("%Y-%m-%d")
+        if idx < len(earnings_dates) and earnings_dates[idx] <= cutoff:
+            available_from = earnings_dates[idx]
+        else:
+            d = datetime.strptime(period_end, "%Y-%m-%d") + timedelta(days=_FILING_LAG_FALLBACK_DAYS)
+            available_from = d.strftime("%Y-%m-%d")
+        if available_from < period_end:
+            continue  # negative-lag is malformed; drop
+        out.append(r + (available_from,))
+    out.sort(key=lambda x: x[-1])
+    return out
+
+
 def _load_symbol_bundles(conn: sqlite3.Connection, symbol: str):
-    """Return sorted-ascending lists of (date, ...) tuples for each table.
+    """Return sorted-by-available_from lists of (period_end, ..., available_from) tuples.
 
-    Income columns (positional): date, revenue, net_income, ebitda, eps_diluted,
-    shares_diluted, gross_profit, operating_income.
-    Balance: date, total_equity, net_debt, total_debt.
-    Cashflow: date, free_cash_flow, dividends_paid.
-    Prices: date, close.
+    Income columns (positional, 9 fields):
+      date, revenue, net_income, ebitda, eps_diluted, shares_diluted,
+      gross_profit, operating_income, available_from
+    Balance (5):
+      date, total_equity, net_debt, total_debt, available_from
+    Cashflow (4):
+      date, free_cash_flow, dividends_paid, available_from
+    Prices (2):
+      date, close
 
-    Returns (income, balance, cashflow, prices). For backwards compat the
-    function signature is unchanged — earnings and analyst-grades bundles
-    are loaded by separate helpers below.
+    Lists are sorted by available_from (the announcement date). Bisect on
+    the last column for point-in-time as-of semantics. The first column
+    (period_end) is kept for legacy positional callers and for fiscal-period
+    matching (YoY logic compares quarters by position in the announcement-
+    ordered slice, which matches fiscal order in normal cases).
     """
     cur = conn.cursor()
     income = cur.execute(
@@ -152,6 +195,14 @@ def _load_symbol_bundles(conn: sqlite3.Connection, symbol: str):
         "SELECT date, close FROM prices WHERE symbol=? AND close IS NOT NULL "
         "ORDER BY date ASC", (symbol,)
     ).fetchall()
+
+    earnings_dates = [r[0] for r in cur.execute(
+        "SELECT date FROM earnings WHERE symbol=? ORDER BY date ASC", (symbol,)
+    ).fetchall()]
+
+    income = _annotate_with_availability(income, earnings_dates)
+    balance = _annotate_with_availability(balance, earnings_dates)
+    cashflow = _annotate_with_availability(cashflow, earnings_dates)
     return income, balance, cashflow, prices
 
 

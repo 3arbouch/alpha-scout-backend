@@ -18,14 +18,20 @@ from functools import cached_property
 
 
 # Column indices inside the income tuple loaded as
-# (date, revenue, net_income, ebitda, eps_diluted, shares_diluted,
-#  gross_profit, operating_income)
+# (period_end, revenue, net_income, ebitda, eps_diluted, shares_diluted,
+#  gross_profit, operating_income, available_from)
+# Rows are SORTED BY available_from (last column). Bisect on the last column
+# for as-of point-in-time semantics; period_end is kept for legacy callers
+# and fiscal-period matching.
 I_DATE, I_REV, I_NI, I_EBITDA, I_EPS_D, I_SHARES = 0, 1, 2, 3, 4, 5
 I_GROSS_PROFIT, I_OP_INCOME = 6, 7
-# Balance: (date, total_equity, net_debt, total_debt)
+I_AVAIL = 8
+# Balance: (period_end, total_equity, net_debt, total_debt, available_from)
 B_EQUITY, B_NET_DEBT, B_TOTAL_DEBT = 1, 2, 3
-# Cashflow: (date, free_cash_flow, dividends_paid)
+B_AVAIL = 4
+# Cashflow: (period_end, free_cash_flow, dividends_paid, available_from)
 C_FCF, C_DIV = 1, 2
+C_AVAIL = 3
 
 
 def _ttm(quarters: list[tuple], col_idx: int) -> float | None:
@@ -51,19 +57,21 @@ def _yoy_pct(latest: tuple, prior: tuple | None, col_idx: int) -> float | None:
     return (curr - prev) / abs(prev) * 100.0
 
 
-def _as_of(rows: list[tuple], target_date: str) -> tuple | None:
+def _as_of(rows: list[tuple], target_date: str, key_idx: int = 0) -> tuple | None:
+    """Last row whose row[key_idx] <= target_date. Rows must be sorted by key_idx ascending."""
     if not rows:
         return None
-    dates = [r[0] for r in rows]
-    idx = bisect_right(dates, target_date) - 1
+    keys = [r[key_idx] for r in rows]
+    idx = bisect_right(keys, target_date) - 1
     return rows[idx] if idx >= 0 else None
 
 
-def _as_of_slice(rows: list[tuple], target_date: str) -> list[tuple]:
+def _as_of_slice(rows: list[tuple], target_date: str, key_idx: int = 0) -> list[tuple]:
+    """All rows whose row[key_idx] <= target_date. Rows must be sorted by key_idx ascending."""
     if not rows:
         return []
-    dates = [r[0] for r in rows]
-    idx = bisect_right(dates, target_date)
+    keys = [r[key_idx] for r in rows]
+    idx = bisect_right(keys, target_date)
     return rows[:idx]
 
 
@@ -225,7 +233,9 @@ def build_context(
     work whether or not they're provided. The daily update job loads them
     once per symbol and threads them through.
     """
-    income_slice = _as_of_slice(income, date)
+    # Fundamentals: bisect on available_from (last column), so we only see
+    # rows whose data was actually public on or before `date`.
+    income_slice = _as_of_slice(income, date, key_idx=I_AVAIL)
     if not income_slice:
         return None
     shares = income_slice[-1][I_SHARES]
@@ -236,8 +246,10 @@ def build_context(
         date=date,
         close=close,
         income_slice=income_slice,
-        balance_asof=_as_of(balance, date),
-        cashflow_slice=_as_of_slice(cashflow, date),
+        balance_asof=_as_of(balance, date, key_idx=B_AVAIL),
+        cashflow_slice=_as_of_slice(cashflow, date, key_idx=C_AVAIL),
         earnings_dates=list(earnings_dates) if earnings_dates else [],
+        # Grades and earnings are real-world events — date IS the announce date,
+        # so legacy index-0 bisect remains correct for them.
         grades_slice=_as_of_slice(grades, date) if grades else [],
     )
