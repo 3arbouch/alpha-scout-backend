@@ -86,6 +86,7 @@ class ComputeContext:
     cashflow_slice: list[tuple]    # ascending, all rows with date <= self.date
     earnings_dates: list[str] = field(default_factory=list)   # ascending, all symbol earnings (past + scheduled)
     grades_slice: list[tuple] = field(default_factory=list)   # ascending (date, action), all rows with date <= self.date
+    prices_history: list[tuple] = field(default_factory=list)  # ascending (date, close); the symbol's full price history. Used by return-based features that need T-N day lookback.
 
     @cached_property
     def latest_q(self) -> tuple | None:
@@ -199,6 +200,39 @@ class ComputeContext:
         d1 = datetime.strptime(self.date, "%Y-%m-%d")
         return (d1 - d0).days
 
+    # ---- Price-history helpers for return-based features --------------------
+    @cached_property
+    def _prices_dates_idx(self) -> dict[str, int]:
+        """Map every price date to its index in prices_history. Built lazily."""
+        return {d: i for i, (d, _) in enumerate(self.prices_history)}
+
+    def _current_price_idx(self) -> int | None:
+        """Index of self.date in prices_history. None if not present (no price for this trading day)."""
+        return self._prices_dates_idx.get(self.date)
+
+    def trailing_return(self, lookback: int, skip: int = 0) -> float | None:
+        """Pct return between two trading days in this symbol's price history.
+
+        - lookback: number of trading days back from `skip` (so the return runs
+          from prices[idx - lookback] to prices[idx - skip]).
+        - skip: trading days to skip from today before measuring (skip=0 means
+          measure to today; skip=21 means measure to 1-month-ago — the
+          textbook 12-1 momentum semantics).
+
+        Returns None when prices_history is missing, when self.date isn't a
+        price date, or when there's insufficient history.
+        """
+        if not self.prices_history:
+            return None
+        idx = self._current_price_idx()
+        if idx is None or idx - skip - lookback < 0:
+            return None
+        cur = self.prices_history[idx - skip][1]
+        prev = self.prices_history[idx - skip - lookback][1]
+        if not prev or prev <= 0:
+            return None
+        return (cur / prev - 1.0) * 100.0
+
     # ---- Analyst-grade window helpers --------------------------------------
     def grades_in_window(self, days: int) -> list[tuple]:
         """Grade rows with date in [self.date - days + 1, self.date]."""
@@ -220,6 +254,7 @@ def build_context(
     cashflow: list[tuple],
     earnings_dates: list[str] | None = None,
     grades: list[tuple] | None = None,
+    prices: list[tuple] | None = None,
 ) -> ComputeContext | None:
     """Slice raw symbol bundles to the as-of view for `date` and wrap them.
 
@@ -252,4 +287,7 @@ def build_context(
         # Grades and earnings are real-world events — date IS the announce date,
         # so legacy index-0 bisect remains correct for them.
         grades_slice=_as_of_slice(grades, date) if grades else [],
+        # Full price history for the symbol — needed by return-based features
+        # that look back N trading days. List of (date, close) ascending.
+        prices_history=list(prices) if prices else [],
     )
