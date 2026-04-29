@@ -129,6 +129,30 @@ def get_experiment_history(run_id: str, limit: int = 20) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def get_recent_lessons(run_id: str, limit: int = 3) -> list[dict]:
+    """Most recent N experiments' lessons (skips rows where lessons is NULL/empty).
+
+    Separated from get_experiment_history (which deliberately excludes the
+    lessons column to avoid biasing the agent on aggregated self-interpretation):
+    this helper surfaces only the LAST few lessons so the agent has its most
+    recent reflections in context for the next iteration. Returns most-recent
+    first; iterations are not necessarily contiguous if some had null lessons.
+    """
+    conn = get_db()
+    rows = conn.execute(
+        """SELECT iteration, lessons
+           FROM experiments
+           WHERE run_id = ?
+             AND lessons IS NOT NULL
+             AND TRIM(lessons) != ''
+           ORDER BY iteration DESC
+           LIMIT ?""",
+        (run_id, limit),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
 def get_best_experiment(run_id: str, higher_is_better: bool = True) -> dict | None:
     """Get the best KEEP experiment for a run."""
     order = "DESC" if higher_is_better else "ASC"

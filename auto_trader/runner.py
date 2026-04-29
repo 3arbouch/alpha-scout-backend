@@ -31,7 +31,10 @@ PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
-from auto_trader.schema import log_experiment, get_experiment_history, get_best_experiment, get_run_summary, get_db
+from auto_trader.schema import (
+    log_experiment, get_experiment_history, get_best_experiment,
+    get_run_summary, get_db, get_recent_lessons,
+)
 from auto_trader.tools import create_auto_trader_tools
 from auto_trader.events import emit as emit_event
 
@@ -329,6 +332,29 @@ def _get_trade_summary(exp_id: str) -> dict | None:
     }
 
 
+def build_recent_lessons_context(run_id: str, limit: int = 3) -> str:
+    """Format the last N experiments' lessons for inclusion in the user prompt.
+
+    This is intentionally narrow (default last 3) — different from
+    build_history_context, which deliberately excludes lessons across the
+    aggregated history to avoid anchoring the agent on its own past
+    interpretation. Surfacing only the *most recent* lessons strikes a
+    balance: the agent gets continuity from its immediate prior reflections
+    without compounding bias across the full run.
+
+    Returns "" if no lessons are recorded yet (e.g. experiment 1).
+    """
+    rows = get_recent_lessons(run_id, limit=limit)
+    if not rows:
+        return ""
+    lines = [f"## Lessons from your last {len(rows)} experiment(s) (most recent first)\n"]
+    for r in rows:
+        lines.append(f"### Experiment {r['iteration']}\n")
+        lines.append(r["lessons"].strip())
+        lines.append("")  # blank line between blocks
+    return "\n".join(lines)
+
+
 def build_history_context(run_id: str, target_metric: str, limit: int = 20) -> str:
     """Build full history of past experiments for the agent to learn from.
 
@@ -338,6 +364,10 @@ def build_history_context(run_id: str, target_metric: str, limit: int = 20) -> s
     agent on its own past self-interpretation. `get_experiment_history()`
     intentionally does not SELECT the column so the data isn't available
     at this layer. Do not change either without reading the design rationale.
+
+    NOTE: build_recent_lessons_context() above does surface the LAST N
+    lessons separately — that's a deliberate scoped exception, not a
+    contradiction. See its docstring.
     """
     history = get_experiment_history(run_id, limit=limit)
     if not history:
@@ -639,6 +669,7 @@ async def run_agent_iteration(
     # Build the prompt
     program = load_program()
     history = build_history_context(run_id, target_metric)
+    recent_lessons = build_recent_lessons_context(run_id, limit=3)
 
     conditions_desc = ", ".join(
         f"{c['metric']} {c['operator']} {c['value']}" for c in conditions
@@ -665,6 +696,7 @@ You are researching as of {backtest_end}. You do not know what happens after thi
 
 Use the `query_market_data` tool for all data queries. Use `validate_portfolio` to check your config before outputting.
 
+{recent_lessons}
 {history}"""
 
     # Run the agent with skill discovery + query_market_data + validate_portfolio
