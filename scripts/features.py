@@ -122,15 +122,17 @@ def yoy_pct(latest_q: tuple, year_ago_q: tuple | None, col_idx: int) -> float | 
 # Per-symbol data load
 # ---------------------------------------------------------------------------
 def _load_symbol_bundles(conn: sqlite3.Connection, symbol: str):
-    """Return sorted-ascending lists of (date, ...) tuples for each fundamentals table.
+    """Return sorted-ascending lists of (date, ...) tuples for each table.
 
     Income columns (positional): date, revenue, net_income, ebitda, eps_diluted,
-    shares_diluted, gross_profit, operating_income. The first 6 are the legacy
-    layout; gross_profit and operating_income are appended so existing indices
-    stay valid for callers that still index positionally.
+    shares_diluted, gross_profit, operating_income.
+    Balance: date, total_equity, net_debt, total_debt.
+    Cashflow: date, free_cash_flow, dividends_paid.
+    Prices: date, close.
 
-    Balance columns: date, total_equity, net_debt, total_debt. total_debt is
-    appended for the same reason.
+    Returns (income, balance, cashflow, prices). For backwards compat the
+    function signature is unchanged — earnings and analyst-grades bundles
+    are loaded by separate helpers below.
     """
     cur = conn.cursor()
     income = cur.execute(
@@ -151,6 +153,21 @@ def _load_symbol_bundles(conn: sqlite3.Connection, symbol: str):
         "ORDER BY date ASC", (symbol,)
     ).fetchall()
     return income, balance, cashflow, prices
+
+
+def _load_earnings_dates(conn: sqlite3.Connection, symbol: str) -> list[str]:
+    """Ascending list of earnings event dates (past actuals + scheduled future)."""
+    return [r[0] for r in conn.execute(
+        "SELECT date FROM earnings WHERE symbol=? ORDER BY date ASC", (symbol,)
+    ).fetchall()]
+
+
+def _load_grades(conn: sqlite3.Connection, symbol: str) -> list[tuple]:
+    """Ascending (date, action) where action ∈ {'upgrade','downgrade','maintain'}."""
+    return [(d, a) for d, a in conn.execute(
+        "SELECT date, action FROM analyst_grades WHERE symbol=? ORDER BY date ASC",
+        (symbol,),
+    ).fetchall()]
 
 
 # Column indices inside the income tuple (date is idx 0)
@@ -281,6 +298,8 @@ def build_symbol(conn: sqlite3.Connection, symbol: str, start_date: str | None =
     income, balance, cashflow, prices = _load_symbol_bundles(conn, symbol)
     if not income or not prices:
         return 0
+    earnings_dates = _load_earnings_dates(conn, symbol)
+    grades = _load_grades(conn, symbol)
 
     cols = _materialized_columns()
     feats = materialized_features()
@@ -290,7 +309,10 @@ def build_symbol(conn: sqlite3.Connection, symbol: str, start_date: str | None =
             continue
         if close is None or close <= 0:
             continue
-        ctx = build_context(symbol, date, close, income, balance, cashflow)
+        ctx = build_context(
+            symbol, date, close, income, balance, cashflow,
+            earnings_dates=earnings_dates, grades=grades,
+        )
         if ctx is None:
             continue
         values = tuple(f.compute(ctx) for f in feats)

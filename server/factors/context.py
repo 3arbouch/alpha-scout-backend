@@ -12,7 +12,8 @@ parity test verifies.
 from __future__ import annotations
 
 from bisect import bisect_right
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from functools import cached_property
 
 
@@ -75,6 +76,8 @@ class ComputeContext:
     income_slice: list[tuple]      # ascending, all rows with date <= self.date
     balance_asof: tuple | None     # last balance row with date <= self.date
     cashflow_slice: list[tuple]    # ascending, all rows with date <= self.date
+    earnings_dates: list[str] = field(default_factory=list)   # ascending, all symbol earnings (past + scheduled)
+    grades_slice: list[tuple] = field(default_factory=list)   # ascending (date, action), all rows with date <= self.date
 
     @cached_property
     def latest_q(self) -> tuple | None:
@@ -157,6 +160,48 @@ class ComputeContext:
         """Same fiscal quarter one year before the prior quarter (5 back from latest)."""
         return self.income_slice[-6] if len(self.income_slice) >= 6 else None
 
+    # ---- Earnings-calendar primitives ---------------------------------------
+    @cached_property
+    def next_earnings_date(self) -> str | None:
+        """Earliest scheduled earnings date strictly greater than self.date."""
+        idx = bisect_right(self.earnings_dates, self.date)
+        return self.earnings_dates[idx] if idx < len(self.earnings_dates) else None
+
+    @cached_property
+    def last_earnings_date(self) -> str | None:
+        """Latest earnings date <= self.date."""
+        idx = bisect_right(self.earnings_dates, self.date) - 1
+        return self.earnings_dates[idx] if idx >= 0 else None
+
+    @cached_property
+    def days_to_next_earnings(self) -> int | None:
+        """Calendar days from self.date to next earnings. None if no future earnings."""
+        if self.next_earnings_date is None:
+            return None
+        d0 = datetime.strptime(self.date, "%Y-%m-%d")
+        d1 = datetime.strptime(self.next_earnings_date, "%Y-%m-%d")
+        return (d1 - d0).days
+
+    @cached_property
+    def days_since_last_earnings(self) -> int | None:
+        """Calendar days from last earnings to self.date. None if no past earnings."""
+        if self.last_earnings_date is None:
+            return None
+        d0 = datetime.strptime(self.last_earnings_date, "%Y-%m-%d")
+        d1 = datetime.strptime(self.date, "%Y-%m-%d")
+        return (d1 - d0).days
+
+    # ---- Analyst-grade window helpers --------------------------------------
+    def grades_in_window(self, days: int) -> list[tuple]:
+        """Grade rows with date in [self.date - days + 1, self.date]."""
+        from datetime import timedelta
+        cutoff = (datetime.strptime(self.date, "%Y-%m-%d") - timedelta(days=days - 1)).strftime("%Y-%m-%d")
+        # grades_slice is ascending; bisect for the window start.
+        dates = [g[0] for g in self.grades_slice]
+        from bisect import bisect_left
+        lo = bisect_left(dates, cutoff)
+        return self.grades_slice[lo:]
+
 
 def build_context(
     symbol: str,
@@ -165,6 +210,8 @@ def build_context(
     income: list[tuple],
     balance: list[tuple],
     cashflow: list[tuple],
+    earnings_dates: list[str] | None = None,
+    grades: list[tuple] | None = None,
 ) -> ComputeContext | None:
     """Slice raw symbol bundles to the as-of view for `date` and wrap them.
 
@@ -173,6 +220,10 @@ def build_context(
       - the latest as-of income row has no usable shares_diluted.
     Both are conditions under which every materialized feature would be None,
     so we skip the row to match scripts/features.py:compute_features_for_day.
+
+    earnings_dates and grades are optional — features that don't need them
+    work whether or not they're provided. The daily update job loads them
+    once per symbol and threads them through.
     """
     income_slice = _as_of_slice(income, date)
     if not income_slice:
@@ -187,4 +238,6 @@ def build_context(
         income_slice=income_slice,
         balance_asof=_as_of(balance, date),
         cashflow_slice=_as_of_slice(cashflow, date),
+        earnings_dates=list(earnings_dates) if earnings_dates else [],
+        grades_slice=_as_of_slice(grades, date) if grades else [],
     )
