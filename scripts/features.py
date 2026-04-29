@@ -363,6 +363,7 @@ def build_symbol(conn: sqlite3.Connection, symbol: str, start_date: str | None =
         ctx = build_context(
             symbol, date, close, income, balance, cashflow,
             earnings_dates=earnings_dates, grades=grades,
+            prices=prices,
         )
         if ctx is None:
             continue
