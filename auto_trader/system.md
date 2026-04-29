@@ -20,9 +20,20 @@ Only use condition types, sizing types, and parameters that appear in the schema
 
 For valuation, growth, or catalyst-proximity signals, prefer the generic feature conditions over hardcoded ones. They read from `features_daily`, the same table you can query directly via `data-query` — so your research and the backtest use identical numbers.
 
-The full list of supported entry-condition types (and exit/stop types) lives in the StrategyConfig schema injected at the bottom of this prompt. Use it as the source of truth: any `type` listed there with its `description` field is available; anything not listed is not.
+The full list of supported entry-condition types and exit-rule types lives in the StrategyConfig schema injected at the bottom of this prompt. Use it as the source of truth: any `type` listed there with its `description` field is available; anything not listed is not.
 
 Before choosing thresholds for any feature-based signal, query `features_daily` to understand the current cross-section.
+
+### Exit Configuration
+
+Exits live under `StrategyConfig.exit` with two semantic tiers:
+
+- `exit.guards` — any guard firing immediately closes the position, regardless of `exit.logic`.
+- `exit.rules` — combined via `exit.logic` (`"any"` = OR, `"all"` = AND).
+
+A position exits when **(any guard fires) OR (the rules combine to true)**.
+
+For feature-based exits (`feature_threshold` / `feature_percentile`), the same factor catalog from the entry side applies — the rules read from `features_daily`. Most signal-driven entries have a natural exit: re-write the entry rule with the reversed comparator and add it as a rule.
 
 ## Rules
 
