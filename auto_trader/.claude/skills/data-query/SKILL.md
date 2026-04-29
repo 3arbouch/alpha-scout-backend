@@ -227,33 +227,77 @@ WHERE m.series='brent' AND m.date >= '2023-01-01' GROUP BY month ORDER BY month;
 
 ## Table: features_daily (~1.4M rows)
 
-Point-in-time derived valuation & growth features per `(symbol, date)`. One row per
-trading day per symbol. Price-dependent ratios reflect that day's close; TTM
-numerators/denominators come from the most recent filed quarter as of the same day.
+Point-in-time derived factors per `(symbol, date)`. One row per trading day per symbol. 24 factor columns covering valuation, yield, growth, quality, earnings calendar, and analyst sentiment.
 
-**This is the same table the backtest engine reads** for `feature_threshold` /
-`feature_percentile` conditions and for ranking — values you see here are byte-identical
-to what the engine evaluates against. Use it to screen the universe before choosing
-thresholds in your portfolio config.
+**This is the same table the backtest engine reads** for `feature_threshold` / `feature_percentile` conditions — values you see here are byte-identical to what the engine evaluates against. Use it to screen the universe before choosing thresholds in your portfolio config.
+
+**Point-in-time correctness (no lookahead).** Fundamentals values reflect the most recent quarter that had been **announced** as of the trading day. Each quarter is bound to the earliest matching earnings-table date within 60 days of period-end (else period-end + 45 days as a conservative fallback). At trading date T, you only see data the market actually had at T — not data from a quarter that ended before T but wasn't reported until later.
 
 ```
 symbol TEXT, date TEXT,
-pe REAL,          -- market_cap / TTM net_income (NULL if earnings <= 0)
-ps REAL,          -- market_cap / TTM revenue
-p_b REAL,         -- market_cap / total_equity
-ev_ebitda REAL,   -- (market_cap + net_debt) / TTM ebitda
-ev_sales REAL,    -- (market_cap + net_debt) / TTM revenue
-fcf_yield REAL,   -- TTM free_cash_flow / market_cap, percent
-div_yield REAL,   -- TTM |dividends_paid| / market_cap, percent
-eps_yoy REAL,     -- latest Q eps_diluted vs same-Q prior year, percent
-rev_yoy REAL      -- latest Q revenue vs same-Q prior year, percent
+
+-- Valuation (5)
+pe REAL,                       -- market_cap / TTM net_income (NULL if <= 0)
+ps REAL,                       -- market_cap / TTM revenue
+p_b REAL,                      -- market_cap / total_equity
+ev_ebitda REAL,                -- (market_cap + net_debt) / TTM ebitda
+ev_sales REAL,                 -- (market_cap + net_debt) / TTM revenue
+
+-- Yield (2)
+fcf_yield REAL,                -- TTM free_cash_flow / market_cap, percent
+div_yield REAL,                -- TTM abs(dividends_paid) / market_cap, percent
+
+-- Growth (6)
+eps_yoy REAL,                  -- latest-Q eps_diluted vs same-Q prior year, percent
+rev_yoy REAL,                  -- latest-Q revenue vs same-Q prior year, percent
+eps_yoy_accel REAL,            -- eps_yoy(latest Q) - eps_yoy(prior Q), in pp
+rev_yoy_accel REAL,            -- rev_yoy(latest Q) - rev_yoy(prior Q), in pp
+net_margin_yoy_delta REAL,     -- net_margin(latest Q) - net_margin(same-Q prior year), in pp
+op_margin_yoy_delta REAL,      -- op_margin(latest Q) - op_margin(same-Q prior year), in pp
+
+-- Quality (6)
+net_margin REAL,               -- TTM net_income / TTM revenue, percent
+op_margin REAL,                -- TTM operating_income / TTM revenue, percent
+gross_margin REAL,             -- TTM gross_profit / TTM revenue, percent
+roe REAL,                      -- TTM net_income / total_equity, percent
+roic REAL,                     -- TTM operating_income / (equity + total_debt), percent (proxy)
+debt_to_equity REAL,           -- total_debt / total_equity, ratio
+
+-- Earnings calendar (3)
+days_to_next_earnings INT,     -- calendar days to next scheduled earnings event
+days_since_last_earnings INT,  -- calendar days since most recent earnings event
+pre_earnings_window_5d INT,    -- 1 if next earnings <= 5 days away, else 0
+
+-- Analyst sentiment (2)
+analyst_net_upgrades_30d INT,  -- (upgrades - downgrades) in trailing 30 calendar days
+analyst_net_upgrades_90d INT   -- (upgrades - downgrades) in trailing 90 calendar days
 ```
 
+**On-the-fly factors NOT in this table** (computed during backtests, not queryable here): `rsi_14`, `ret_1m`, `ret_3m`, `ret_6m`, `ret_12m`, `ret_12_1m`, `drawdown_60d`, `drawdown_252d`, `drawdown_alltime`, `vol_z_20`, `dollar_vol_20`. The agent uses these in portfolio configs via `feature_threshold(feature="rsi_14", ...)` etc. — they get computed on demand when the backtest runs.
+
 ```sql
--- What's cheap today on EV/EBITDA?
-SELECT symbol, ev_ebitda, fcf_yield FROM features_daily
-WHERE date = (SELECT MAX(date) FROM features_daily) AND ev_ebitda BETWEEN 0 AND 8
+-- What's cheap today on EV/EBITDA with positive accelerating growth?
+SELECT symbol, ev_ebitda, fcf_yield, rev_yoy_accel
+FROM features_daily
+WHERE date = (SELECT MAX(date) FROM features_daily)
+  AND ev_ebitda BETWEEN 0 AND 8
+  AND rev_yoy_accel > 0
 ORDER BY ev_ebitda LIMIT 20;
+
+-- High-quality compounders: ROIC + margin expansion
+SELECT symbol, roic, net_margin, net_margin_yoy_delta
+FROM features_daily
+WHERE date = (SELECT MAX(date) FROM features_daily)
+  AND roic > 15 AND net_margin_yoy_delta > 1
+ORDER BY roic DESC LIMIT 20;
+
+-- Pre-earnings momentum candidates with analyst tailwind
+SELECT symbol, pre_earnings_window_5d, analyst_net_upgrades_90d, days_to_next_earnings
+FROM features_daily
+WHERE date = (SELECT MAX(date) FROM features_daily)
+  AND pre_earnings_window_5d = 1
+  AND analyst_net_upgrades_90d >= 3
+ORDER BY analyst_net_upgrades_90d DESC;
 
 -- Sector-relative cheap PE snapshot
 SELECT f.symbol, u.sector, f.pe FROM features_daily f
@@ -261,14 +305,9 @@ JOIN universe_profiles u ON u.symbol=f.symbol
 WHERE f.date=(SELECT MAX(date) FROM features_daily) AND f.pe BETWEEN 0 AND 100
 ORDER BY u.sector, f.pe;
 
--- High-growth + cheap combo screen
-SELECT symbol, pe, eps_yoy, rev_yoy FROM features_daily
-WHERE date=(SELECT MAX(date) FROM features_daily)
-  AND pe BETWEEN 0 AND 20 AND eps_yoy > 20 AND rev_yoy > 15
-ORDER BY eps_yoy DESC LIMIT 20;
-
--- Historical PE percentile for one name
-SELECT date, pe FROM features_daily
+-- Historical factor cross-section for one name (5y)
+SELECT date, pe, fcf_yield, rev_yoy, net_margin
+FROM features_daily
 WHERE symbol='NVDA' AND pe IS NOT NULL
   AND date >= date('now', '-5 years')
 ORDER BY date;
