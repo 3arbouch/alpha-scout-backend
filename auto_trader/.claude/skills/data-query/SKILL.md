@@ -36,7 +36,7 @@ symbol TEXT, date TEXT, open REAL, high REAL, low REAL, close REAL, volume INT, 
 
 Primary key: (symbol, date). `change_pct` = daily return in percent.
 
-**Sector ETFs available:** SPY (broad), XLK (Tech), XLF (Financials), XLE (Energy), XLV (Healthcare), XLP (Consumer Def), XLY (Consumer Cyc), XLI (Industrials), XLB (Materials), XLRE (Real Estate), XLC (Comms), XLU (Utilities)
+**Sector ETFs available:** SPY (broad), XLK (Tech), XLF (Financials), XLE (Energy), XLV (Healthcare)
 
 ```sql
 -- Monthly closes for 2024

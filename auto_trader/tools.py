@@ -110,13 +110,20 @@ def execute_query(sql: str) -> dict:
         SYMBOL_TABLES = {"prices", "income", "balance", "cashflow", "earnings",
                          "insider_trades", "analyst_grades"}
 
+        # Benchmark/sector ETFs — always queryable regardless of sector scope so the
+        # agent can compare against SPY or its sector ETF. ETFs are absent from
+        # universe_profiles, so the sector subquery would otherwise exclude them.
+        BENCHMARK_ETFS = ("SPY", "XLK", "XLF", "XLE", "XLV")
+        etf_list = ", ".join(f"'{s}'" for s in BENCHMARK_ETFS)
+
         for table, date_col in DATE_COLUMN_MAP.items():
             conditions = []
             if _STOP_DATE:
                 conditions.append(f"{date_col} <= '{_STOP_DATE}'")
             if _SECTOR and table in SYMBOL_TABLES:
                 conditions.append(
-                    f"symbol IN (SELECT symbol FROM main.universe_profiles WHERE sector = '{_SECTOR}')"
+                    f"(symbol IN (SELECT symbol FROM main.universe_profiles WHERE sector = '{_SECTOR}') "
+                    f"OR symbol IN ({etf_list}))"
                 )
             if conditions:
                 where = " AND ".join(conditions)
