@@ -281,6 +281,255 @@ def _resolve_ic_universe(
     ]
 
 
+ROLLING_WINDOWS = (63, 252, 504)        # ~3m, 1y, 2y — standard quant horizons
+LARGEST_SHIFT_LOOKBACK = 60              # days, for the rolling 60d shift z-score
+LARGEST_SHIFT_TOP_K = 5
+CUSUM_ALPHA = 0.05                       # significance level for change-points
+CUSUM_MAX_DEPTH = 2                      # recursive split depth → up to ~7 breaks max
+ROLLING_MIN_FRACTION = 1.2               # need n_obs ≥ window × 1.2 to use a window
+
+
+def _rolling_ic_series(
+    ic_values: list[float], ic_dates: list[str], window_days: int
+) -> list[dict]:
+    """Daily-step rolling stats over the IC time series.
+
+    For each end_idx ∈ [window_days-1, n-1], compute mean/stdev/IR over the
+    trailing window and emit one snapshot. Returns [] if n < window_days.
+    """
+    import numpy as np
+    n = len(ic_values)
+    if n < window_days:
+        return []
+    arr = np.array(ic_values)
+    out = []
+    for end_idx in range(window_days - 1, n):
+        win = arr[end_idx - window_days + 1: end_idx + 1]
+        m = float(win.mean())
+        s = float(win.std(ddof=1)) if len(win) > 1 else 0.0
+        ir = m / s if s > 0 else 0.0
+        out.append({
+            "date": ic_dates[end_idx],
+            "ir": round(ir, 4),
+            "ic_mean": round(m, 4),
+            "ic_stdev": round(s, 4),
+            "n_obs": int(len(win)),
+        })
+    return out
+
+
+def _ic_distribution(ir_series: list[float]) -> dict:
+    """Percentiles of the rolling-IR series + where current sits within it."""
+    import numpy as np
+    if not ir_series:
+        return {}
+    arr = np.array(ir_series, dtype=float)
+    if len(arr) == 0:
+        return {}
+    # current_percentile: rank of last value in the distribution, 0-100.
+    last = arr[-1]
+    pct = float((arr <= last).sum()) / len(arr) * 100
+    return {
+        "p10": round(float(np.percentile(arr, 10)), 4),
+        "p25": round(float(np.percentile(arr, 25)), 4),
+        "p50": round(float(np.percentile(arr, 50)), 4),
+        "p75": round(float(np.percentile(arr, 75)), 4),
+        "p90": round(float(np.percentile(arr, 90)), 4),
+        "current_percentile": round(pct, 1),
+    }
+
+
+def _largest_shifts(
+    ir_series: list[float],
+    dates: list[str],
+    lookback: int = LARGEST_SHIFT_LOOKBACK,
+    top_k: int = LARGEST_SHIFT_TOP_K,
+) -> list[dict]:
+    """Top-K rolling 60d shifts ranked by z-score normalized to the shift
+    distribution's own stdev. Distribution-driven — no absolute thresholds.
+
+    For each interior point i, compute mean(ir[i-lookback:i]) vs
+    mean(ir[i:i+lookback]); shift = after - before. The z-score normalizes
+    each shift by stdev of all shifts in the series.
+
+    Dedupe: drop any shift whose date is within `lookback // 2` trading days
+    of an already-kept shift (avoids piling up around the same break).
+    """
+    import numpy as np
+    n = len(ir_series)
+    if n < 2 * lookback:
+        return []
+    arr = np.array(ir_series, dtype=float)
+    befores = np.zeros(n)
+    afters = np.zeros(n)
+    valid = np.zeros(n, dtype=bool)
+    for i in range(lookback, n - lookback):
+        befores[i] = arr[i - lookback: i].mean()
+        afters[i] = arr[i: i + lookback].mean()
+        valid[i] = True
+    shifts = afters - befores
+    shifts_v = shifts[valid]
+    if len(shifts_v) < 2:
+        return []
+    sigma = shifts_v.std(ddof=1)
+    if sigma <= 0:
+        return []
+    z = shifts / sigma
+    # Sort interior points by |z| desc, keep top_k after dedup.
+    interior = np.where(valid)[0]
+    order = sorted(interior, key=lambda i: -abs(z[i]))
+    kept: list[dict] = []
+    dedupe_window = lookback // 2
+    for i in order:
+        if any(abs(int(np.argmax(np.array(dates) == d["date"])) - i) < dedupe_window
+               for d in kept):
+            continue
+        kept.append({
+            "date": dates[i],
+            "ir_before_60d": round(float(befores[i]), 4),
+            "ir_after_60d": round(float(afters[i]), 4),
+            "shift_z_score": round(float(z[i]), 4),
+        })
+        if len(kept) >= top_k:
+            break
+    # Sort by date for readability.
+    kept.sort(key=lambda d: d["date"])
+    return kept
+
+
+def _cusum_p_value(stat: float) -> float:
+    """Asymptotic p-value for the supremum-of-Brownian-bridge test statistic.
+
+    Under H0 of no break in mean, sqrt(n) * max|S_t/n| / sigma → sup|B(t)|
+    where B is a standard Brownian bridge. The CDF of sup|B(t)| is:
+        P(sup|B| ≤ x) = 1 - 2·Σ_{k=1}^∞ (-1)^{k+1} exp(-2 k² x²)
+    For practical use, two terms give ≥ 4 decimals of accuracy for x > 0.5.
+    """
+    from math import exp
+    if stat <= 0:
+        return 1.0
+    # Truncate the alternating series at k=4; remainder < 1e-10 for x > 0.4.
+    s = 0.0
+    sign = 1
+    for k in range(1, 5):
+        s += sign * exp(-2 * (k * stat) ** 2)
+        sign = -sign
+    p = 2 * s
+    if p < 0:
+        p = 0.0
+    if p > 1:
+        p = 1.0
+    return p
+
+
+def _cusum_single_break(arr) -> tuple[int, float]:
+    """Best single break-point in `arr` (numpy array of IR values).
+
+    Returns (break_idx, p_value). break_idx is the index in `arr` (0-based)
+    where the cumulative deviation peaks; p_value is the asymptotic
+    significance under H0 of constant mean.
+    """
+    import numpy as np
+    n = len(arr)
+    if n < 4:
+        return -1, 1.0
+    mu = arr.mean()
+    sigma = arr.std(ddof=1)
+    if sigma <= 0:
+        return -1, 1.0
+    cum = np.cumsum(arr - mu)
+    # Standardize: cum[i] / (sigma * sqrt(n)) — sup of standardized Brownian bridge.
+    stat_series = np.abs(cum) / (sigma * (n ** 0.5))
+    idx = int(np.argmax(stat_series))
+    stat = float(stat_series[idx])
+    return idx, _cusum_p_value(stat)
+
+
+def _cusum_change_points(
+    ir_series: list[float],
+    dates: list[str],
+    alpha: float = CUSUM_ALPHA,
+    max_depth: int = CUSUM_MAX_DEPTH,
+) -> list[dict]:
+    """Recursive single-break CUSUM. Reports breaks with their local p-value.
+
+    Recurses with a depth cap; in practice yields up to ~2^(d+1)-1 breaks.
+    Local p-value means: significance within the sub-segment, NOT corrected
+    for multiple comparisons. Agent reads p-values, decides what to trust.
+    """
+    import numpy as np
+    if len(ir_series) < 4:
+        return []
+    arr_full = np.array(ir_series, dtype=float)
+    breaks: list[dict] = []
+
+    def recurse(start: int, end: int, depth: int) -> None:
+        if depth > max_depth or end - start < 60:
+            return
+        sub = arr_full[start:end]
+        local_idx, p = _cusum_single_break(sub)
+        if local_idx < 0 or p >= alpha:
+            return
+        global_idx = start + local_idx
+        breaks.append({
+            "date": dates[global_idx],
+            "p_value": round(p, 6),
+            "depth": depth,
+        })
+        recurse(start, global_idx, depth + 1)
+        recurse(global_idx + 1, end, depth + 1)
+
+    recurse(0, len(arr_full), 0)
+    breaks.sort(key=lambda b: b["date"])
+    return breaks
+
+
+def _build_rolling_block(
+    ic_values: list[float],
+    ic_dates: list[str],
+    include_series: bool,
+) -> dict:
+    """Per-window rolling diagnostics. Distribution-driven, no absolute thresholds.
+
+    Output (per window):
+      summary:        ir_first/last/current/min/max/n_observations/n_snapshots
+      ir_distribution: percentiles of the rolling-IR distribution
+      largest_shifts: top-K 60d shifts ranked by z-score
+      change_points_cusum: recursive-CUSUM break dates with p-values
+      series:         daily-step snapshots (only when include_series=True)
+
+    Skips a window if n_observations < window_days × ROLLING_MIN_FRACTION.
+    """
+    out_windows = []
+    for w in ROLLING_WINDOWS:
+        if len(ic_values) < int(w * ROLLING_MIN_FRACTION):
+            continue
+        snaps = _rolling_ic_series(ic_values, ic_dates, w)
+        if len(snaps) < 2:
+            continue
+        ir_only = [s["ir"] for s in snaps]
+        snap_dates = [s["date"] for s in snaps]
+        block = {
+            "window_days": w,
+            "summary": {
+                "ir_first": snaps[0]["ir"],
+                "ir_last": snaps[-1]["ir"],
+                "ir_current": snaps[-1]["ir"],
+                "ir_min": min(ir_only),
+                "ir_max": max(ir_only),
+                "n_observations": len(ic_values),
+                "n_snapshots": len(snaps),
+            },
+            "ir_distribution": _ic_distribution(ir_only),
+            "largest_shifts": _largest_shifts(ir_only, snap_dates),
+            "change_points_cusum": _cusum_change_points(ir_only, snap_dates),
+        }
+        if include_series:
+            block["series"] = snaps
+        out_windows.append(block)
+    return {"windows": out_windows}
+
+
 def _compute_ic(
     signal_config: dict,
     conn: sqlite3.Connection,
@@ -291,6 +540,7 @@ def _compute_ic(
     horizon_days: int,
     all_dates_extended: list[str],
     price_index: dict,
+    include_rolling_series: bool = False,
 ) -> dict:
     """Cross-sectional Information Coefficient (Spearman rank correlation).
 
@@ -388,7 +638,8 @@ def _compute_ic(
         R[valid, j] = (p_fwd[valid] - p[valid]) / p[valid]
 
     # Per-day Spearman = Pearson on ranks of jointly-valid cells.
-    ic_values = []
+    ic_values: list[float] = []
+    ic_dates: list[str] = []
     for i in range(n_days):
         f_row = F[i]
         r_row = R[i]
@@ -405,6 +656,7 @@ def _compute_ic(
         if np.isnan(corr):
             continue
         ic_values.append(corr)
+        ic_dates.append(ic_walk[i])
 
     n_obs = len(ic_values)
     if n_obs < 5:
@@ -419,7 +671,10 @@ def _compute_ic(
     ir = ic_mean / ic_stdev if ic_stdev > 0 else 0.0
     ic_t_stat = ir * (n_obs ** 0.5)
 
+    rolling_block = _build_rolling_block(ic_values, ic_dates, include_rolling_series)
+
     return {
+        "ic_rolling": rolling_block,
         "ic_mean": round(ic_mean, 4),
         "ic_stdev": round(ic_stdev, 4),
         "ir": round(ir, 4),
@@ -611,11 +866,12 @@ def evaluate_signal(
         entries, conn, walk_dates, horizon_days, price_index, sector
     )
 
-    # Cross-sectional IC — cheap diagnostic of factor quality independent
-    # of the threshold the agent picked.
+    # Cross-sectional IC + rolling regime diagnostics. evaluate_signal is a
+    # single-signal deep dive — emit the full daily rolling series.
     ic = _compute_ic(
         signal_config, conn, start, end, sector, universe,
         horizon_days, all_dates_extended, price_index,
+        include_rolling_series=True,
     )
 
     conn.close()
