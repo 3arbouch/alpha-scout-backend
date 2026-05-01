@@ -239,13 +239,33 @@ async def validate_portfolio_tool(args: dict[str, Any]) -> dict[str, Any]:
 
 @tool(
     "evaluate_signal",
-    "Test how a single entry signal performed historically. "
-    "Scans the full universe over the given period, finds every time the signal fired, "
-    "and measures forward returns at the target horizon. "
-    "Use this during research to investigate whether a signal pattern actually predicts returns. "
-    "Returns trigger count, win rate, average return, Sharpe, and sample events (best/worst).\n\n"
+    "Score a single entry signal as a long-only equal-weight factor portfolio "
+    "using the SAME metrics the backtest engine reports. Each signal-fire opens "
+    "a unit-weight position held for target_horizon trading days; the daily NAV "
+    "is the basket of currently-open positions. No costs, no capacity caps — "
+    "this is an UPPER BOUND on what a real portfolio can achieve.\n\n"
+    "Returns:\n"
+    "  portfolio_metrics: sharpe_ratio (basis-aware, same definition as run_backtest), "
+    "sharpe_ratio_annualized, sharpe_ratio_period, sharpe_basis, sortino_ratio, "
+    "annualized_return_pct, annualized_volatility_pct, max_drawdown_pct, "
+    "alpha_vs_market_pct (vs SPY), alpha_vs_sector_pct (vs the sector ETF when "
+    "sector is set; null otherwise), trading_days, risk_free_rate_pct.\n"
+    "  ic: cross-sectional Information Coefficient — Spearman rank correlation "
+    "between factor value and forward return, daily, then aggregated to "
+    "ic_mean / ic_stdev / ir / ic_t_stat / n_observations / ic_basis. "
+    "ic_basis='continuous' when the signal is feature_threshold/feature_percentile "
+    "(IC computed on the raw factor, threshold-independent); 'binary' otherwise "
+    "(currently returned with reason='binary_ic_not_yet_supported').\n"
+    "  benchmark_used: 'XLK' / 'XLF' / 'XLE' / 'XLV' for matched sectors, else 'SPY'.\n"
+    "  trigger_count, unique_stocks, yearly_breakdown, top_stocks, bottom_stocks: "
+    "coverage diagnostics.\n\n"
+    "How to read: check IC FIRST. ir < 0.1 or |ic_t_stat| < 2 → factor is noise "
+    "regardless of Sharpe (the headline number was likely market beta). Only then "
+    "look at portfolio_metrics. The Sharpe and alpha_vs_sector here are directly "
+    "comparable to what run_backtest will report — but expect the backtest to be "
+    "lower because it has costs, capacity caps, and exit rules.\n\n"
     "signal_config: An entry condition config dict. Same format as portfolio entry conditions. "
-    "Examples (prefer feature_threshold / feature_percentile / days_to_earnings / analyst_upgrades for valuation, growth, and catalyst signals):\n"
+    "Examples:\n"
     '  {"type": "feature_percentile", "feature": "ev_ebitda", "max_percentile": 20, "scope": "sector", "min_value": 0, "max_value": 25}\n'
     '  {"type": "feature_threshold", "feature": "fcf_yield", "operator": ">=", "value": 5}\n'
     '  {"type": "feature_threshold", "feature": "eps_yoy", "operator": ">=", "value": 20}\n'
@@ -254,7 +274,7 @@ async def validate_portfolio_tool(args: dict[str, Any]) -> dict[str, Any]:
     '  {"type": "momentum_rank", "lookback": 63, "operator": ">=", "value": 80}\n'
     '  {"type": "current_drop", "threshold": -15, "window_days": 90}\n'
     '  {"type": "rsi", "period": 14, "operator": "<=", "value": 30}\n\n'
-    "target_horizon: Forward return horizon. e.g. '3m', '6m', '12m'.",
+    "target_horizon: Hold period and IC horizon. e.g. '3m', '6m', '12m'.",
     {"signal_config": dict, "target_horizon": str},
 )
 async def evaluate_signal_tool(args: dict[str, Any]) -> dict[str, Any]:
@@ -274,8 +294,10 @@ async def evaluate_signal_tool(args: dict[str, Any]) -> dict[str, Any]:
 
     text = json.dumps(result, default=str)
     if len(text) > 50000:
-        # Truncate sample events to fit context
-        result["sample_events"] = result.get("sample_events", [])[:10]
+        # Trim coverage diagnostics; keep portfolio_metrics + ic intact.
+        result["top_stocks"] = result.get("top_stocks", [])[:5]
+        result["bottom_stocks"] = result.get("bottom_stocks", [])[:5]
+        result["yearly_breakdown"] = result.get("yearly_breakdown", [])
         result["truncated"] = True
         text = json.dumps(result, default=str)
     return {"content": [{"type": "text", "text": text}]}
@@ -283,14 +305,29 @@ async def evaluate_signal_tool(args: dict[str, Any]) -> dict[str, Any]:
 
 @tool(
     "rank_signals",
-    "Rank multiple candidate entry signals and find the optimal combination. "
-    "Tests each signal independently, then runs forward selection: starts with the best single signal, "
-    "greedily adds the next best, stops when adding hurts Sharpe. "
-    "Combination = intersection (trigger counts only when ALL signals agree on the same stock+date). "
-    "Use this after investigating signals with evaluate_signal to decide the final signal set.\n\n"
-    "candidate_signals: List of entry condition config dicts (same format as evaluate_signal). "
-    "Provide 2-8 candidates for meaningful results.\n\n"
-    "target_horizon: Forward return horizon. e.g. '3m', '6m', '12m'.",
+    "Score multiple entry signals on the same metric set as evaluate_signal "
+    "(portfolio_metrics + IC) and find an independent combination via forward "
+    "selection. Combination = AND-intersection: an entry counts only when ALL "
+    "selected signals fire on the same (symbol, date). Forward selection ranks "
+    "on portfolio.sharpe_ratio (NAV-based, same definition as the backtest).\n\n"
+    "Returns:\n"
+    "  individual_signals: per-candidate full block (portfolio_metrics, ic, "
+    "benchmark_used, trigger_count, unique_stocks).\n"
+    "  correlation_matrix: pairwise Pearson correlation of candidates' daily "
+    "factor-portfolio returns. Pairs > 0.7 are essentially the same factor — "
+    "AND-ing them adds no information. Look at this BEFORE the forward_selection.\n"
+    "  forward_selection: per step, {sharpe, sharpe_delta, "
+    "correlation_with_running_combo, trigger_count, alpha_vs_sector_pct, "
+    "max_drawdown_pct, verdict, reason}. Stops when Sharpe doesn't improve OR "
+    "correlation with the running combo > 0.8 (configurable).\n"
+    "  recommended_signals: the kept set.\n\n"
+    "How to read: 1) screen individual candidates by IC (ir < 0.1 or |t| < 2 → "
+    "drop). 2) inspect correlation_matrix — pairs > 0.7 are redundant. "
+    "3) read forward_selection only after the above two filters.\n\n"
+    "candidate_signals: List of entry condition config dicts (same format as "
+    "evaluate_signal). Provide 3-6 IC-screened, low-correlation candidates for "
+    "meaningful results.\n\n"
+    "target_horizon: Hold period and IC horizon. e.g. '3m', '6m', '12m'.",
     {"candidate_signals": list, "target_horizon": str},
 )
 async def rank_signals_tool(args: dict[str, Any]) -> dict[str, Any]:
@@ -310,9 +347,12 @@ async def rank_signals_tool(args: dict[str, Any]) -> dict[str, Any]:
 
     text = json.dumps(result, default=str)
     if len(text) > 50000:
-        # Trim individual signal sample events
+        # Trim per-candidate coverage; keep portfolio_metrics, ic, and the
+        # correlation matrix intact (those are the load-bearing outputs).
         for sig in result.get("individual_signals", []):
-            sig.pop("sample_events", None)
+            sig.pop("top_stocks", None)
+            sig.pop("bottom_stocks", None)
+            sig.pop("yearly_breakdown", None)
         result["truncated"] = True
         text = json.dumps(result, default=str)
     return {"content": [{"type": "text", "text": text}]}
