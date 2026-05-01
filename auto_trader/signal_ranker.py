@@ -150,6 +150,110 @@ def _ann_return_from_compounded(
     return total_return_pct, ann_return_pct
 
 
+def _metrics_from_entries(
+    entries: list[tuple[str, str]],
+    conn: sqlite3.Connection,
+    walk_dates: list[str],
+    horizon_days: int,
+    price_index: dict,
+    sector: str | None,
+) -> tuple[dict, list[float], str]:
+    """Build factor-portfolio NAV from entries; compute the unified metric block.
+
+    Returns (portfolio_metrics, daily_returns, benchmark_used). The
+    portfolio_metrics dict matches the schema run_backtest's
+    compute_metrics emits (Sharpe family, Sortino, MDD, alpha vs market,
+    alpha vs sector, trading_days, risk_free_rate_pct).
+    """
+    daily_returns = _build_factor_portfolio_nav(
+        entries, price_index, walk_dates, horizon_days
+    )
+    n_nav = len(walk_dates)
+    total_return_pct, ann_return_pct = _ann_return_from_compounded(
+        daily_returns, n_nav
+    )
+
+    # Max drawdown from cumulative NAV.
+    cum = 1.0
+    peak = 1.0
+    max_dd = 0.0
+    for r in daily_returns:
+        cum *= 1 + r
+        if cum > peak:
+            peak = cum
+        if peak > 0:
+            dd = (cum - peak) / peak * 100
+            if dd < max_dd:
+                max_dd = dd
+
+    rf_pct = load_risk_free_ann_pct(walk_dates[0], walk_dates[-1])
+    nav_stats = compute_nav_stats(
+        daily_returns, n_nav, total_return_pct, ann_return_pct, rf_pct
+    )
+
+    # Benchmarks: market = SPY always; sector = mapped ETF when sector set.
+    market_rets = _load_benchmark_returns(conn, "SPY", walk_dates)
+    _, market_ann = _ann_return_from_compounded(market_rets, n_nav)
+
+    benchmark_used = "SPY"
+    sector_ann = None
+    if sector:
+        sector_ticker = _resolve_benchmark_ticker(conn, sector)
+        if sector_ticker != "SPY":
+            sector_rets = _load_benchmark_returns(conn, sector_ticker, walk_dates)
+            _, sector_ann = _ann_return_from_compounded(sector_rets, n_nav)
+            benchmark_used = sector_ticker
+
+    def _r(v, ndigits=4):
+        return None if v is None else round(v, ndigits)
+
+    alpha_vs_market = (
+        ann_return_pct - market_ann
+        if (ann_return_pct is not None and market_ann is not None) else None
+    )
+    alpha_vs_sector = (
+        ann_return_pct - sector_ann
+        if (ann_return_pct is not None and sector_ann is not None) else None
+    )
+
+    portfolio_metrics = {
+        "total_return_pct": round(total_return_pct, 2),
+        "annualized_return_pct": _r(ann_return_pct, 2),
+        "annualized_volatility_pct": _r(nav_stats["annualized_volatility_pct"], 2),
+        "sharpe_ratio": _r(nav_stats["sharpe_ratio"], 4),
+        "sharpe_ratio_annualized": _r(nav_stats["sharpe_ratio_annualized"], 4),
+        "sharpe_ratio_period": _r(nav_stats["sharpe_ratio_period"], 4),
+        "sharpe_basis": nav_stats["sharpe_basis"],
+        "sortino_ratio": _r(nav_stats["sortino_ratio"], 4),
+        "max_drawdown_pct": round(max_dd, 2),
+        "alpha_vs_market_pct": _r(alpha_vs_market, 2),
+        "alpha_vs_sector_pct": _r(alpha_vs_sector, 2),
+        "trading_days": n_nav,
+        "risk_free_rate_pct": round(rf_pct, 2),
+    }
+    return portfolio_metrics, daily_returns, benchmark_used
+
+
+def _entries_from_signal_data(
+    signal_data: dict, price_index: dict, start: str, end: str
+) -> list[tuple[str, str]]:
+    """Extract (symbol, date) pairs where the signal fires AND the entry
+    has a valid price within [start, end]."""
+    out = []
+    for symbol, date_signals in signal_data.items():
+        sym_prices = price_index.get(symbol, {})
+        if not sym_prices:
+            continue
+        for date in date_signals:
+            if date < start or date > end:
+                continue
+            entry_price = sym_prices.get(date)
+            if entry_price is None or entry_price <= 0:
+                continue
+            out.append((symbol, date))
+    return out
+
+
 def _resolve_ic_universe(
     conn: sqlite3.Connection,
     sector: str | None,
@@ -503,28 +607,8 @@ def evaluate_signal(
 
     # === Factor-portfolio NAV + unified metrics ===
     walk_dates = trading_dates
-    daily_returns = _build_factor_portfolio_nav(
-        entries, price_index, walk_dates, horizon_days
-    )
-    n_nav = len(walk_dates)
-    total_return_pct, ann_return_pct = _ann_return_from_compounded(daily_returns, n_nav)
-
-    # Max drawdown from the cumulative NAV.
-    cum = 1.0
-    peak = 1.0
-    max_dd = 0.0
-    for r in daily_returns:
-        cum *= 1 + r
-        if cum > peak:
-            peak = cum
-        if peak > 0:
-            dd = (cum - peak) / peak * 100
-            if dd < max_dd:
-                max_dd = dd
-
-    rf_pct = load_risk_free_ann_pct(walk_dates[0], walk_dates[-1])
-    nav_stats = compute_nav_stats(
-        daily_returns, n_nav, total_return_pct, ann_return_pct, rf_pct
+    portfolio_metrics, _daily_returns, benchmark_used = _metrics_from_entries(
+        entries, conn, walk_dates, horizon_days, price_index, sector
     )
 
     # Cross-sectional IC — cheap diagnostic of factor quality independent
@@ -534,48 +618,7 @@ def evaluate_signal(
         horizon_days, all_dates_extended, price_index,
     )
 
-    # Benchmarks: market = SPY always; sector = mapped ETF when sector is set.
-    market_rets = _load_benchmark_returns(conn, "SPY", walk_dates)
-    _, market_ann = _ann_return_from_compounded(market_rets, n_nav)
-
-    benchmark_used = "SPY"
-    sector_ann = None
-    if sector:
-        sector_ticker = _resolve_benchmark_ticker(conn, sector)
-        if sector_ticker != "SPY":
-            sector_rets = _load_benchmark_returns(conn, sector_ticker, walk_dates)
-            _, sector_ann = _ann_return_from_compounded(sector_rets, n_nav)
-            benchmark_used = sector_ticker
-
     conn.close()
-
-    def _r(v, ndigits=4):
-        return None if v is None else round(v, ndigits)
-
-    alpha_vs_market = (
-        ann_return_pct - market_ann
-        if (ann_return_pct is not None and market_ann is not None) else None
-    )
-    alpha_vs_sector = (
-        ann_return_pct - sector_ann
-        if (ann_return_pct is not None and sector_ann is not None) else None
-    )
-
-    portfolio_metrics = {
-        "total_return_pct": round(total_return_pct, 2),
-        "annualized_return_pct": _r(ann_return_pct, 2),
-        "annualized_volatility_pct": _r(nav_stats["annualized_volatility_pct"], 2),
-        "sharpe_ratio": _r(nav_stats["sharpe_ratio"], 4),
-        "sharpe_ratio_annualized": _r(nav_stats["sharpe_ratio_annualized"], 4),
-        "sharpe_ratio_period": _r(nav_stats["sharpe_ratio_period"], 4),
-        "sharpe_basis": nav_stats["sharpe_basis"],
-        "sortino_ratio": _r(nav_stats["sortino_ratio"], 4),
-        "max_drawdown_pct": round(max_dd, 2),
-        "alpha_vs_market_pct": _r(alpha_vs_market, 2),
-        "alpha_vs_sector_pct": _r(alpha_vs_sector, 2),
-        "trading_days": n_nav,
-        "risk_free_rate_pct": round(rf_pct, 2),
-    }
 
     # Per-event diagnostics — coverage of where/when the signal fires.
     if events:
@@ -646,48 +689,47 @@ def rank_signals(
     end: str,
     sector: str | None = None,
     universe: list[str] | None = None,
+    correlation_stop_threshold: float = 0.8,
 ) -> dict:
-    """
-    Rank candidate signals and find the optimal combination via forward selection.
+    """Rank candidate signals using the same metrics as the backtest engine.
 
-    Steps:
-    1. Evaluate each signal independently (per-signal stats).
-    2. Forward selection: start with best single signal, greedily add the
-       next best combination, stop when adding hurts Sharpe.
+    For each candidate: build a long-only equal-weight factor portfolio
+    (same construction as evaluate_signal) and compute Sharpe / Sortino /
+    alpha-vs-sector / IC. Then build the correlation matrix of all
+    candidates' daily portfolio-return series. Forward selection greedily
+    AND-intersects entries to find the best combination, stopping when
+    Sharpe doesn't improve OR the candidate's daily-return correlation
+    with the running combo exceeds correlation_stop_threshold (default
+    0.8 — guards against correlated signals masquerading as independent
+    lift).
 
-    "Combining" signals means intersection: a trigger event counts only when
-    ALL signals in the combination fire for the same stock on the same date.
-
-    Args:
-        candidate_signals: List of entry condition config dicts
-        target_horizon: Forward return horizon, e.g. "6m"
-        db_path: Path to market.db
-        start: Period start date
-        end: Period end date
-        sector: Optional sector filter
-        universe: Optional explicit list of symbols
+    Combination semantic: an entry is included only when ALL selected
+    signals fire on the same (symbol, date).
 
     Returns:
         {
-            "individual_signals": [ ... per-signal stats ... ],
-            "forward_selection": [ ... step-by-step combination results ... ],
-            "recommended_signals": [ ... winning signal configs ... ],
+          individual_signals: [{signal, portfolio_metrics, ic, benchmark_used,
+                                trigger_count, ...}],
+          correlation_matrix: {labels: [...], matrix: [[...]]},
+          forward_selection: [{step, added_signal, sharpe, sharpe_delta,
+                               correlation_with_running_combo, trigger_count,
+                               verdict, reason}],
+          recommended_signals: [...],
         }
     """
+    import numpy as np
+
     conn = sqlite3.connect(str(db_path))
     horizon_days = _horizon_to_trading_days(target_horizon)
 
-    # Resolve universe
     if universe:
         symbols = universe
     else:
         symbols = _get_universe(conn, sector)
-
     if not symbols:
         conn.close()
         return {"error": "No symbols found."}
 
-    # Load extended price data
     all_dates_extended = _get_trading_dates(conn, start, "2099-12-31")
     trading_dates = _get_trading_dates(conn, start, end)
     if not trading_dates:
@@ -700,20 +742,21 @@ def rank_signals(
         extended_end = all_dates_extended[-1] if all_dates_extended else end
 
     price_index = _load_price_index(conn, symbols, start, extended_end)
-
-    # Filter symbols to only those with price data (avoids KeyError in
-    # cross-sectional computations like momentum_rank)
     symbols = [s for s in symbols if s in price_index]
+    walk_dates = trading_dates
 
-    date_to_idx = {d: i for i, d in enumerate(all_dates_extended)}
+    # Earnings data — only loaded if any candidate needs it.
+    needs_earnings = any(
+        c.get("type") == "earnings_momentum" for c in candidate_signals
+    )
+    earnings_data = (
+        load_earnings_data(symbols, conn) if needs_earnings else None
+    )
 
-    # Load earnings data once (shared across signals)
-    earnings_data = load_earnings_data(symbols, conn)
-
-    # Step 1: Evaluate each signal independently
-    # Store both stats and raw trigger sets for combination testing
-    signal_triggers = []  # list of {(symbol, date): fwd_return} per signal
-    individual_results = []
+    # Per-candidate evaluation.
+    individual_results: list[dict] = []
+    candidate_entries: list[set[tuple[str, str]]] = []
+    candidate_daily_returns: list[list[float]] = []
 
     for sig_config in candidate_signals:
         try:
@@ -725,154 +768,167 @@ def rank_signals(
             individual_results.append({
                 "signal": sig_config,
                 "error": str(e),
+                "portfolio_metrics": None,
+                "ic": None,
                 "trigger_count": 0,
-                "win_rate": 0.0,
-                "avg_return": 0.0,
-                "sharpe": 0.0,
             })
-            signal_triggers.append({})
+            candidate_entries.append(set())
+            candidate_daily_returns.append([])
             continue
 
-        # Build trigger map: {(symbol, date): fwd_return}
-        triggers = {}
-        for symbol, date_signals in sig_data.items():
-            sym_prices = price_index.get(symbol, {})
-            if not sym_prices:
-                continue
-            for date in date_signals:
-                entry_price = sym_prices.get(date)
-                if entry_price is None or entry_price <= 0:
-                    continue
-                entry_idx = date_to_idx.get(date)
-                if entry_idx is None:
-                    continue
-                fwd_idx = entry_idx + horizon_days
-                if fwd_idx >= len(all_dates_extended):
-                    continue
-                fwd_date = all_dates_extended[fwd_idx]
-                fwd_price = sym_prices.get(fwd_date)
-                if fwd_price is None or fwd_price <= 0:
-                    continue
-                fwd_return = (fwd_price - entry_price) / entry_price
-                triggers[(symbol, date)] = fwd_return
+        entries_list = _entries_from_signal_data(sig_data, price_index, start, end)
+        entries_set = set(entries_list)
+        candidate_entries.append(entries_set)
 
-        signal_triggers.append(triggers)
+        portfolio_metrics, daily_returns, benchmark_used = _metrics_from_entries(
+            entries_list, conn, walk_dates, horizon_days, price_index, sector
+        )
+        candidate_daily_returns.append(daily_returns)
 
-        # Compute stats
-        returns = np.array(list(triggers.values())) if triggers else np.array([])
-        if len(returns) > 0:
-            win_count = int(np.sum(returns > 0))
-            avg_ret = float(np.mean(returns))
-            std_ret = float(np.std(returns)) if len(returns) > 1 else 0.0
-            sharpe = avg_ret / std_ret if std_ret > 0 else 0.0
-            individual_results.append({
-                "signal": sig_config,
-                "trigger_count": len(returns),
-                "win_count": win_count,
-                "win_rate": round(win_count / len(returns), 4),
-                "avg_return": round(avg_ret, 4),
-                "median_return": round(float(np.median(returns)), 4),
-                "std_return": round(std_ret, 4),
-                "sharpe": round(sharpe, 4),
-            })
-        else:
-            individual_results.append({
-                "signal": sig_config,
-                "trigger_count": 0,
-                "win_rate": 0.0,
-                "avg_return": 0.0,
-                "sharpe": 0.0,
-            })
+        ic = _compute_ic(
+            sig_config, conn, start, end, sector, universe,
+            horizon_days, all_dates_extended, price_index,
+        )
 
-    conn.close()
+        individual_results.append({
+            "signal": sig_config,
+            "portfolio_metrics": portfolio_metrics,
+            "ic": ic,
+            "benchmark_used": benchmark_used,
+            "trigger_count": len(entries_list),
+            "unique_stocks": len({s for s, _ in entries_list}),
+        })
 
-    # Step 2: Forward selection
+    # Correlation matrix of candidates' daily portfolio returns.
     n_signals = len(candidate_signals)
-    if n_signals == 0:
-        return {
-            "individual_signals": [],
-            "forward_selection": [],
-            "recommended_signals": [],
+    valid_idx = [
+        i for i, dr in enumerate(candidate_daily_returns)
+        if len(dr) > 0 and not all(r == 0.0 for r in dr)
+    ]
+    correlation_matrix: dict = {"labels": [], "matrix": []}
+    if len(valid_idx) >= 2:
+        labels = [
+            individual_results[i].get("signal", {}).get("feature")
+            or individual_results[i].get("signal", {}).get("type")
+            or f"signal_{i}"
+            for i in valid_idx
+        ]
+        stack = np.array([candidate_daily_returns[i] for i in valid_idx])
+        cm = np.corrcoef(stack)
+        # Replace NaN (degenerate constant series) with 0 for JSON safety.
+        cm = np.where(np.isnan(cm), 0.0, cm)
+        correlation_matrix = {
+            "labels": labels,
+            "indices": valid_idx,
+            "matrix": [[round(float(v), 4) for v in row] for row in cm],
         }
 
+    # Forward selection on portfolio sharpe_ratio with correlation guard.
+    forward_selection_steps: list[dict] = []
+    selected: list[int] = []
     remaining = set(range(n_signals))
-    selected = []
-    forward_selection_steps = []
     best_sharpe = -float("inf")
+    running_returns: np.ndarray | None = None
+
+    def _entries_intersection(idxs: list[int]) -> list[tuple[str, str]]:
+        if not idxs:
+            return []
+        acc = set(candidate_entries[idxs[0]])
+        for i in idxs[1:]:
+            acc &= candidate_entries[i]
+        return list(acc)
 
     while remaining:
-        best_candidate = None
-        best_candidate_sharpe = -float("inf")
-        best_candidate_stats = None
+        best_idx = None
+        best_metrics = None
+        best_sharpe_combo = -float("inf")
+        best_corr = None
+        best_returns: list[float] | None = None
+        best_entries_count = 0
 
         for idx in remaining:
-            # Combine: intersection of selected + this candidate
-            if not signal_triggers[idx]:
+            if not candidate_entries[idx]:
+                continue
+            combined_entries = _entries_intersection(selected + [idx])
+            if len(combined_entries) < 5:
+                continue
+            pm, dr, _bm = _metrics_from_entries(
+                combined_entries, conn, walk_dates, horizon_days, price_index, sector
+            )
+            sharpe = pm.get("sharpe_ratio")
+            if sharpe is None:
                 continue
 
-            if selected:
-                # Intersection of all selected triggers + candidate
-                combined_keys = set(signal_triggers[selected[0]].keys())
-                for sel_idx in selected[1:]:
-                    combined_keys &= set(signal_triggers[sel_idx].keys())
-                combined_keys &= set(signal_triggers[idx].keys())
-            else:
-                combined_keys = set(signal_triggers[idx].keys())
+            # Correlation between this candidate's daily returns and the
+            # running combo's daily returns (None on step 1).
+            corr = None
+            if running_returns is not None and len(dr) == len(running_returns):
+                cand_arr = np.array(candidate_daily_returns[idx])
+                if cand_arr.std() > 0 and running_returns.std() > 0:
+                    corr = float(np.corrcoef(cand_arr, running_returns)[0, 1])
 
-            if len(combined_keys) < 5:
-                # Too few triggers for reliable stats
-                continue
+            if sharpe > best_sharpe_combo:
+                best_idx = idx
+                best_metrics = pm
+                best_sharpe_combo = sharpe
+                best_corr = corr
+                best_returns = dr
+                best_entries_count = len(combined_entries)
 
-            # Use the candidate signal's forward returns for the intersection
-            # (all signals agree on these events, returns are the same regardless
-            # of which signal's return we take — they're all the same stock+date)
-            combined_returns = np.array([signal_triggers[idx][k] for k in combined_keys])
-            avg_ret = float(np.mean(combined_returns))
-            std_ret = float(np.std(combined_returns)) if len(combined_returns) > 1 else 0.0
-            combo_sharpe = avg_ret / std_ret if std_ret > 0 else 0.0
-
-            if combo_sharpe > best_candidate_sharpe:
-                best_candidate = idx
-                best_candidate_sharpe = combo_sharpe
-                best_candidate_stats = {
-                    "trigger_count": len(combined_keys),
-                    "win_rate": round(float(np.sum(combined_returns > 0)) / len(combined_returns), 4),
-                    "avg_return": round(avg_ret, 4),
-                    "sharpe": round(combo_sharpe, 4),
-                }
-
-        if best_candidate is None:
+        if best_idx is None:
             break
 
-        # Check if adding this candidate improves Sharpe
-        delta = round(best_candidate_sharpe - best_sharpe, 4) if best_sharpe > -float("inf") else None
+        sharpe_delta = (
+            round(best_sharpe_combo - best_sharpe, 4)
+            if best_sharpe > -float("inf") else None
+        )
         step = {
             "step": len(selected) + 1,
-            "added_signal": candidate_signals[best_candidate],
-            "combined_sharpe": round(best_candidate_sharpe, 4),
-            "delta": delta,
-            **best_candidate_stats,
+            "added_signal": candidate_signals[best_idx],
+            "sharpe": round(best_sharpe_combo, 4),
+            "sharpe_delta": sharpe_delta,
+            "correlation_with_running_combo": (
+                round(best_corr, 4) if best_corr is not None else None
+            ),
+            "trigger_count": best_entries_count,
+            "alpha_vs_sector_pct": best_metrics.get("alpha_vs_sector_pct"),
+            "alpha_vs_market_pct": best_metrics.get("alpha_vs_market_pct"),
+            "max_drawdown_pct": best_metrics.get("max_drawdown_pct"),
         }
 
-        if best_candidate_sharpe <= best_sharpe and len(selected) > 0:
-            # Adding hurts — stop. Record as "dropped"
+        # Stop rules: no Sharpe improvement OR high correlation with running combo.
+        if selected and best_sharpe_combo <= best_sharpe:
             step["verdict"] = "dropped"
+            step["reason"] = "no_sharpe_improvement"
+            forward_selection_steps.append(step)
+            break
+        if (
+            selected
+            and best_corr is not None
+            and abs(best_corr) > correlation_stop_threshold
+        ):
+            step["verdict"] = "dropped"
+            step["reason"] = (
+                f"correlation_with_running_combo={round(best_corr,3)} > "
+                f"{correlation_stop_threshold}"
+            )
             forward_selection_steps.append(step)
             break
 
         step["verdict"] = "kept"
         forward_selection_steps.append(step)
-        selected.append(best_candidate)
-        remaining.discard(best_candidate)
-        best_sharpe = best_candidate_sharpe
+        selected.append(best_idx)
+        remaining.discard(best_idx)
+        best_sharpe = best_sharpe_combo
+        running_returns = np.array(best_returns)
 
-    # Any remaining signals not tested (because earlier ones had no triggers)
-    # are implicitly dropped
+    conn.close()
 
     recommended = [candidate_signals[i] for i in selected]
 
     return {
         "individual_signals": individual_results,
+        "correlation_matrix": correlation_matrix,
         "forward_selection": forward_selection_steps,
         "recommended_signals": recommended,
     }
