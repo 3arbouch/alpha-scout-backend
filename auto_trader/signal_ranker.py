@@ -150,6 +150,182 @@ def _ann_return_from_compounded(
     return total_return_pct, ann_return_pct
 
 
+def _resolve_ic_universe(
+    conn: sqlite3.Connection,
+    sector: str | None,
+    universe: list[str] | None,
+) -> list[str]:
+    """IC cross-section universe: single names only, no benchmark ETFs.
+
+    Explicit `universe` arg wins. Otherwise sector members from
+    universe_profiles, else the full base universe. ETFs aren't in
+    universe_profiles, so they're naturally excluded — which is what we
+    want for cross-sectional ranking.
+    """
+    if universe:
+        return list(universe)
+    if sector:
+        return [
+            r[0]
+            for r in conn.execute(
+                "SELECT symbol FROM universe_profiles WHERE sector = ?", (sector,)
+            ).fetchall()
+        ]
+    return [
+        r[0]
+        for r in conn.execute("SELECT symbol FROM universe_profiles").fetchall()
+    ]
+
+
+def _compute_ic(
+    signal_config: dict,
+    conn: sqlite3.Connection,
+    start: str,
+    end: str,
+    sector: str | None,
+    universe: list[str] | None,
+    horizon_days: int,
+    all_dates_extended: list[str],
+    price_index: dict,
+) -> dict:
+    """Cross-sectional Information Coefficient (Spearman rank correlation).
+
+    For each trading day D in [start, end - horizon_days], rank IC-universe
+    names by factor value at D, rank by forward return D → D + horizon_days,
+    compute Spearman rank correlation. Aggregate to ic_mean, ic_stdev, IR,
+    and t-statistic.
+
+    Continuous-factor IC (feature_threshold / feature_percentile): IC on the
+    raw feature value, regardless of the threshold the agent picked.
+    Other condition types: returned with `ic_basis = "binary"` and
+    `reason = "binary_ic_not_yet_supported"` for now.
+
+    Universe rules: sector members only (no benchmark ETFs); custom
+    `universe` arg verbatim. <10 names total → return null block.
+    Per-day filter: skip days with <10 valid cross-section or constant
+    factor. n_observations < 5 total → return null block.
+    """
+    import numpy as np
+    from scipy import stats as scipy_stats
+
+    null_block = lambda reason, n_obs=0, basis=None, fact=None: {
+        "ic_mean": None, "ic_stdev": None, "ir": None, "ic_t_stat": None,
+        "n_observations": n_obs,
+        "ic_basis": basis, "factor_used_for_ic": fact,
+        "reason": reason,
+    }
+
+    ic_symbols = _resolve_ic_universe(conn, sector, universe)
+    if len(ic_symbols) < 10:
+        return null_block("insufficient_cross_section")
+
+    ctype = signal_config.get("type")
+    is_continuous = ctype in ("feature_threshold", "feature_percentile")
+    if not is_continuous:
+        return null_block(
+            "binary_ic_not_yet_supported", basis="binary", fact=None
+        )
+
+    feature = signal_config.get("feature")
+    if not feature:
+        return null_block("missing_feature_in_signal_config", basis="continuous")
+
+    # Bulk-load feature time series for the IC universe.
+    from backtest_engine import _load_feature_series
+    series = _load_feature_series(feature, ic_symbols, start, end, conn)
+    if not series:
+        return null_block(
+            "no_feature_data", basis="continuous", fact=feature
+        )
+
+    # IC walk window: D ∈ [start, end] AND D + horizon_days < len(extended).
+    date_to_ext_idx = {d: i for i, d in enumerate(all_dates_extended)}
+    last_valid_idx = len(all_dates_extended) - horizon_days - 1
+    ic_walk = [
+        d for d in all_dates_extended
+        if start <= d <= end and date_to_ext_idx[d] <= last_valid_idx
+    ]
+    if len(ic_walk) < 10:
+        return null_block(
+            "insufficient_walk_window", basis="continuous", fact=feature
+        )
+
+    n_days = len(ic_walk)
+    n_names = len(ic_symbols)
+
+    # Factor matrix via vectorized as-of lookup.
+    # For each symbol's sorted feature dates, np.searchsorted maps each
+    # walk date to the index of the most-recent at-or-before observation.
+    ic_walk_arr = np.array(ic_walk)
+    F = np.full((n_days, n_names), np.nan)
+    for j, sym in enumerate(ic_symbols):
+        pts = series.get(sym, [])
+        if not pts:
+            continue
+        dates_sym = np.array([p[0] for p in pts])
+        vals_sym = np.array([p[1] for p in pts], dtype=float)
+        # 'right' so equal dates use the value AT date D (already known by close).
+        idx = np.searchsorted(dates_sym, ic_walk_arr, side="right") - 1
+        valid = idx >= 0
+        F[valid, j] = vals_sym[idx[valid]]
+
+    # Forward-return matrix — vectorized via aligned price arrays per symbol.
+    R = np.full((n_days, n_names), np.nan)
+    fwd_idxs = np.array([date_to_ext_idx[d] + horizon_days for d in ic_walk])
+    fwd_dates = np.array([all_dates_extended[i] for i in fwd_idxs])
+    for j, sym in enumerate(ic_symbols):
+        sym_prices = price_index.get(sym, {})
+        if not sym_prices:
+            continue
+        # Vectorized lookup via two parallel arrays
+        p = np.array([sym_prices.get(d, np.nan) for d in ic_walk_arr], dtype=float)
+        p_fwd = np.array([sym_prices.get(d, np.nan) for d in fwd_dates], dtype=float)
+        valid = (~np.isnan(p)) & (~np.isnan(p_fwd)) & (p > 0) & (p_fwd > 0)
+        R[valid, j] = (p_fwd[valid] - p[valid]) / p[valid]
+
+    # Per-day Spearman = Pearson on ranks of jointly-valid cells.
+    ic_values = []
+    for i in range(n_days):
+        f_row = F[i]
+        r_row = R[i]
+        valid = ~(np.isnan(f_row) | np.isnan(r_row))
+        if valid.sum() < 10:
+            continue
+        f_v = f_row[valid]
+        r_v = r_row[valid]
+        if np.std(f_v) == 0:
+            continue
+        f_ranks = scipy_stats.rankdata(f_v)
+        r_ranks = scipy_stats.rankdata(r_v)
+        corr = np.corrcoef(f_ranks, r_ranks)[0, 1]
+        if np.isnan(corr):
+            continue
+        ic_values.append(corr)
+
+    n_obs = len(ic_values)
+    if n_obs < 5:
+        return null_block(
+            "insufficient_cross_section", n_obs=n_obs,
+            basis="continuous", fact=feature,
+        )
+
+    arr = np.array(ic_values)
+    ic_mean = float(arr.mean())
+    ic_stdev = float(arr.std(ddof=1)) if n_obs > 1 else 0.0
+    ir = ic_mean / ic_stdev if ic_stdev > 0 else 0.0
+    ic_t_stat = ir * (n_obs ** 0.5)
+
+    return {
+        "ic_mean": round(ic_mean, 4),
+        "ic_stdev": round(ic_stdev, 4),
+        "ir": round(ir, 4),
+        "ic_t_stat": round(ic_t_stat, 4),
+        "n_observations": n_obs,
+        "ic_basis": "continuous",
+        "factor_used_for_ic": feature,
+    }
+
+
 def _get_universe(conn: sqlite3.Connection, sector: str | None) -> list[str]:
     """Get list of symbols, optionally filtered by sector."""
     cur = conn.cursor()
@@ -351,6 +527,13 @@ def evaluate_signal(
         daily_returns, n_nav, total_return_pct, ann_return_pct, rf_pct
     )
 
+    # Cross-sectional IC — cheap diagnostic of factor quality independent
+    # of the threshold the agent picked.
+    ic = _compute_ic(
+        signal_config, conn, start, end, sector, universe,
+        horizon_days, all_dates_extended, price_index,
+    )
+
     # Benchmarks: market = SPY always; sector = mapped ETF when sector is set.
     market_rets = _load_benchmark_returns(conn, "SPY", walk_dates)
     _, market_ann = _ann_return_from_compounded(market_rets, n_nav)
@@ -436,6 +619,7 @@ def evaluate_signal(
         "target_horizon": target_horizon,
         "period": {"start": start, "end": end},
         "portfolio_metrics": portfolio_metrics,
+        "ic": ic,
         "benchmark_used": benchmark_used,
         "note": (
             "Long-only equal-weight factor portfolio: each signal-fire opens a "
