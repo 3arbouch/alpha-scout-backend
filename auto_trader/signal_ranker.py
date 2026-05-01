@@ -218,32 +218,25 @@ def evaluate_signal(
     """
     Evaluate a single signal historically.
 
-    Scans the full universe over the given period. Every time the signal fires
-    for a stock, records the forward return at the target horizon.
+    Constructs a long-only equal-weight factor portfolio from the signal's
+    triggers, holds each position for `target_horizon` trading days, and
+    reports portfolio metrics computed with the same formulas as
+    `run_backtest`. Sharpe / Sortino / alpha-vs-sector are directly
+    comparable to the backtest's metrics — but represent an upper bound
+    (no costs, no capacity caps, no exits other than the fixed hold).
 
     Args:
-        signal_config: Entry condition config dict, e.g. {"type": "momentum_rank", "lookback": 63, "operator": ">=", "value": 80}
-        target_horizon: Forward return horizon, e.g. "3m", "6m", "12m"
-        db_path: Path to market.db
-        start: Period start date (YYYY-MM-DD)
-        end: Period end date (YYYY-MM-DD)
-        sector: Optional sector filter
-        universe: Optional explicit list of symbols (overrides sector)
+        signal_config: Entry condition config dict.
+        target_horizon: Hold period and forward-return horizon, e.g. "3m".
+        db_path: Path to market.db.
+        start: Period start date (YYYY-MM-DD).
+        end: Period end date (YYYY-MM-DD).
+        sector: Optional sector filter (used for both universe and benchmark).
+        universe: Optional explicit list of symbols (overrides sector).
 
-    Returns:
-        {
-            "signal": signal_config,
-            "target_horizon": target_horizon,
-            "period": {"start": start, "end": end},
-            "trigger_count": int,
-            "win_count": int,
-            "win_rate": float,
-            "avg_return": float,
-            "median_return": float,
-            "std_return": float,
-            "sharpe": float,
-            "sample_events": [ ... top 20 events ... ],
-        }
+    Returns: see implementation. Top-level keys include `portfolio_metrics`,
+    `benchmark_used`, `trigger_count`, `unique_stocks`, `yearly_breakdown`,
+    `top_stocks`, `bottom_stocks`.
     """
     conn = sqlite3.connect(str(db_path))
     horizon_days = _horizon_to_trading_days(target_horizon)
@@ -298,130 +291,159 @@ def evaluate_signal(
         conn.close()
         return {"error": f"Signal computation failed: {str(e)}"}
 
-    conn.close()
-
-    # Collect trigger events with forward returns
-    events = []
+    # Collect entries (every signal-fire with valid entry price) and events
+    # (subset with full forward-return window — used for per-event diagnostics).
+    entries: list[tuple[str, str]] = []
+    events: list[dict] = []
     for symbol, date_signals in signal_data.items():
         sym_prices = price_index.get(symbol, {})
         if not sym_prices:
             continue
 
-        for date, metadata in date_signals.items():
+        for date in date_signals:
             entry_price = sym_prices.get(date)
             if entry_price is None or entry_price <= 0:
                 continue
+            entries.append((symbol, date))
 
-            # Find the price `horizon_days` trading days forward
             entry_idx = date_to_idx.get(date)
             if entry_idx is None:
                 continue
-
             fwd_idx = entry_idx + horizon_days
             if fwd_idx >= len(all_dates_extended):
-                continue  # not enough forward data
-
+                continue
             fwd_date = all_dates_extended[fwd_idx]
             fwd_price = sym_prices.get(fwd_date)
             if fwd_price is None or fwd_price <= 0:
                 continue
-
             fwd_return = (fwd_price - entry_price) / entry_price
             events.append({
-                "symbol": symbol,
-                "date": date,
+                "symbol": symbol, "date": date,
                 "entry_price": round(entry_price, 2),
                 "fwd_date": fwd_date,
                 "fwd_price": round(fwd_price, 2),
                 "fwd_return": round(fwd_return, 4),
             })
 
-    # Compute stats
-    if not events:
-        return {
-            "signal": signal_config,
-            "target_horizon": target_horizon,
-            "period": {"start": start, "end": end},
-            "trigger_count": 0,
-            "unique_stocks": 0,
-            "win_count": 0,
-            "win_rate": 0.0,
-            "avg_return": 0.0,
-            "median_return": 0.0,
-            "std_return": 0.0,
-            "sharpe": 0.0,
-            "return_percentiles": {},
-            "yearly_breakdown": [],
-            "top_stocks": [],
-            "bottom_stocks": [],
-        }
+    # === Factor-portfolio NAV + unified metrics ===
+    walk_dates = trading_dates
+    daily_returns = _build_factor_portfolio_nav(
+        entries, price_index, walk_dates, horizon_days
+    )
+    n_nav = len(walk_dates)
+    total_return_pct, ann_return_pct = _ann_return_from_compounded(daily_returns, n_nav)
 
-    returns = np.array([e["fwd_return"] for e in events])
-    win_count = int(np.sum(returns > 0))
-    avg_ret = float(np.mean(returns))
-    std_ret = float(np.std(returns)) if len(returns) > 1 else 0.0
-    sharpe = avg_ret / std_ret if std_ret > 0 else 0.0
+    # Max drawdown from the cumulative NAV.
+    cum = 1.0
+    peak = 1.0
+    max_dd = 0.0
+    for r in daily_returns:
+        cum *= 1 + r
+        if cum > peak:
+            peak = cum
+        if peak > 0:
+            dd = (cum - peak) / peak * 100
+            if dd < max_dd:
+                max_dd = dd
 
-    # Return distribution percentiles
-    return_percentiles = {
-        "p10": round(float(np.percentile(returns, 10)), 4),
-        "p25": round(float(np.percentile(returns, 25)), 4),
-        "p50": round(float(np.percentile(returns, 50)), 4),
-        "p75": round(float(np.percentile(returns, 75)), 4),
-        "p90": round(float(np.percentile(returns, 90)), 4),
+    rf_pct = load_risk_free_ann_pct(walk_dates[0], walk_dates[-1])
+    nav_stats = compute_nav_stats(
+        daily_returns, n_nav, total_return_pct, ann_return_pct, rf_pct
+    )
+
+    # Benchmarks: market = SPY always; sector = mapped ETF when sector is set.
+    market_rets = _load_benchmark_returns(conn, "SPY", walk_dates)
+    _, market_ann = _ann_return_from_compounded(market_rets, n_nav)
+
+    benchmark_used = "SPY"
+    sector_ann = None
+    if sector:
+        sector_ticker = _resolve_benchmark_ticker(conn, sector)
+        if sector_ticker != "SPY":
+            sector_rets = _load_benchmark_returns(conn, sector_ticker, walk_dates)
+            _, sector_ann = _ann_return_from_compounded(sector_rets, n_nav)
+            benchmark_used = sector_ticker
+
+    conn.close()
+
+    def _r(v, ndigits=4):
+        return None if v is None else round(v, ndigits)
+
+    alpha_vs_market = (
+        ann_return_pct - market_ann
+        if (ann_return_pct is not None and market_ann is not None) else None
+    )
+    alpha_vs_sector = (
+        ann_return_pct - sector_ann
+        if (ann_return_pct is not None and sector_ann is not None) else None
+    )
+
+    portfolio_metrics = {
+        "total_return_pct": round(total_return_pct, 2),
+        "annualized_return_pct": _r(ann_return_pct, 2),
+        "annualized_volatility_pct": _r(nav_stats["annualized_volatility_pct"], 2),
+        "sharpe_ratio": _r(nav_stats["sharpe_ratio"], 4),
+        "sharpe_ratio_annualized": _r(nav_stats["sharpe_ratio_annualized"], 4),
+        "sharpe_ratio_period": _r(nav_stats["sharpe_ratio_period"], 4),
+        "sharpe_basis": nav_stats["sharpe_basis"],
+        "sortino_ratio": _r(nav_stats["sortino_ratio"], 4),
+        "max_drawdown_pct": round(max_dd, 2),
+        "alpha_vs_market_pct": _r(alpha_vs_market, 2),
+        "alpha_vs_sector_pct": _r(alpha_vs_sector, 2),
+        "trading_days": n_nav,
+        "risk_free_rate_pct": round(rf_pct, 2),
     }
 
-    # Yearly breakdown
-    yearly = defaultdict(list)
-    for e in events:
-        year = int(e["date"][:4])
-        yearly[year].append(e["fwd_return"])
+    # Per-event diagnostics — coverage of where/when the signal fires.
+    if events:
+        yearly = defaultdict(list)
+        for e in events:
+            yearly[int(e["date"][:4])].append(e["fwd_return"])
+        yearly_breakdown = []
+        for year in sorted(yearly):
+            yr = yearly[year]
+            yearly_breakdown.append({
+                "year": year,
+                "triggers": len(yr),
+                "win_rate": round(sum(1 for r in yr if r > 0) / len(yr), 4),
+                "avg_return": round(sum(yr) / len(yr), 4),
+            })
 
-    yearly_breakdown = []
-    for year in sorted(yearly):
-        yr_returns = np.array(yearly[year])
-        yr_std = float(np.std(yr_returns)) if len(yr_returns) > 1 else 0.0
-        yearly_breakdown.append({
-            "year": year,
-            "triggers": len(yr_returns),
-            "win_rate": round(float(np.sum(yr_returns > 0)) / len(yr_returns), 4),
-            "avg_return": round(float(np.mean(yr_returns)), 4),
-            "sharpe": round(float(np.mean(yr_returns)) / yr_std, 4) if yr_std > 0 else 0.0,
-        })
-
-    # Per-stock aggregation
-    stock_stats = defaultdict(list)
-    for e in events:
-        stock_stats[e["symbol"]].append(e["fwd_return"])
-
-    stock_summaries = []
-    for sym, sym_returns in stock_stats.items():
-        arr = np.array(sym_returns)
-        stock_summaries.append({
-            "symbol": sym,
-            "triggers": len(arr),
-            "win_rate": round(float(np.sum(arr > 0)) / len(arr), 4),
-            "avg_return": round(float(np.mean(arr)), 4),
-        })
-
-    # Top 20 (best avg return) and bottom 20 (worst avg return)
-    sorted_by_avg = sorted(stock_summaries, key=lambda s: s["avg_return"], reverse=True)
-    top_stocks = sorted_by_avg[:20]
-    bottom_stocks = sorted_by_avg[-20:][::-1]  # worst first
+        stock_stats: dict[str, list[float]] = defaultdict(list)
+        for e in events:
+            stock_stats[e["symbol"]].append(e["fwd_return"])
+        stock_summaries = [
+            {
+                "symbol": sym,
+                "triggers": len(rs),
+                "win_rate": round(sum(1 for r in rs if r > 0) / len(rs), 4),
+                "avg_return": round(sum(rs) / len(rs), 4),
+            }
+            for sym, rs in stock_stats.items()
+        ]
+        sorted_by_avg = sorted(stock_summaries, key=lambda s: s["avg_return"], reverse=True)
+        top_stocks = sorted_by_avg[:20]
+        bottom_stocks = sorted_by_avg[-20:][::-1]
+        unique_stocks = len(stock_stats)
+    else:
+        yearly_breakdown = []
+        top_stocks = []
+        bottom_stocks = []
+        unique_stocks = len({sym for sym, _ in entries})
 
     return {
         "signal": signal_config,
         "target_horizon": target_horizon,
         "period": {"start": start, "end": end},
-        "trigger_count": len(events),
-        "unique_stocks": len(stock_stats),
-        "win_count": win_count,
-        "win_rate": round(win_count / len(events), 4),
-        "avg_return": round(avg_ret, 4),
-        "median_return": round(float(np.median(returns)), 4),
-        "std_return": round(std_ret, 4),
-        "sharpe": round(sharpe, 4),
-        "return_percentiles": return_percentiles,
+        "portfolio_metrics": portfolio_metrics,
+        "benchmark_used": benchmark_used,
+        "note": (
+            "Long-only equal-weight factor portfolio: each signal-fire opens a "
+            "unit-weight position held for the full horizon. No costs / no "
+            "capacity caps / no early exits — upper bound on realizable Sharpe."
+        ),
+        "trigger_count": len(entries),
+        "unique_stocks": unique_stocks,
         "yearly_breakdown": yearly_breakdown,
         "top_stocks": top_stocks,
         "bottom_stocks": bottom_stocks,
