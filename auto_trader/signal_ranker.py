@@ -24,12 +24,131 @@ from collections import defaultdict
 SCRIPT_DIR = Path(__file__).parent.parent / "scripts"
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from backtest_engine import precompute_condition, load_earnings_data
+from backtest_engine import precompute_condition, load_earnings_data, SECTOR_ETF_MAP
+from _nav_metrics import compute_nav_stats, load_risk_free_ann_pct
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _build_factor_portfolio_nav(
+    entries: list[tuple[str, str]],
+    price_index: dict,
+    walk_dates: list[str],
+    horizon_days: int,
+) -> list[float]:
+    """Daily-return series for an equal-weight long-only factor portfolio.
+
+    Each entry = (symbol, entry_date) opens a unit-weight long position held
+    for `horizon_days` trading days. On each day in `walk_dates`, the
+    portfolio is the equal-weight basket of currently-open positions; daily
+    return is the mean of constituents' simple returns from the previous day.
+
+    Returns one return per day in `walk_dates` after the first (length =
+    len(walk_dates) - 1). Days with an empty basket get 0.0 (cash).
+
+    Walk semantics: positions opened on D contribute starting D+1 (first
+    return is D → D+1). A position opened on D and held for H days closes
+    after the return on D+H, i.e. it contributes returns on D+1 through D+H.
+    """
+    date_to_walk_idx = {d: i for i, d in enumerate(walk_dates)}
+    by_entry_idx: dict[int, list[str]] = {}
+    for sym, d in entries:
+        idx = date_to_walk_idx.get(d)
+        if idx is None:
+            continue
+        by_entry_idx.setdefault(idx, []).append(sym)
+
+    open_positions: list[tuple[str, int]] = []  # (symbol, entry_walk_idx)
+    daily_returns: list[float] = []
+
+    for i in range(1, len(walk_dates)):
+        # Positions opened at the start of day i-1 contribute starting day i.
+        for sym in by_entry_idx.get(i - 1, []):
+            open_positions.append((sym, i - 1))
+        # Drop positions whose horizon has expired (held > horizon_days).
+        open_positions = [
+            (s, idx) for (s, idx) in open_positions if (i - idx) <= horizon_days
+        ]
+        if not open_positions:
+            daily_returns.append(0.0)
+            continue
+        d_today = walk_dates[i]
+        d_prev = walk_dates[i - 1]
+        rets = []
+        for sym, _ in open_positions:
+            p = price_index.get(sym, {}).get(d_today)
+            p_prev = price_index.get(sym, {}).get(d_prev)
+            if p is not None and p_prev is not None and p_prev > 0:
+                rets.append((p - p_prev) / p_prev)
+        daily_returns.append(sum(rets) / len(rets) if rets else 0.0)
+
+    return daily_returns
+
+
+def _resolve_benchmark_ticker(
+    conn: sqlite3.Connection, sector: str | None
+) -> str:
+    """Pick the sector ETF if it has price data, else fall back to SPY."""
+    if sector and sector in SECTOR_ETF_MAP:
+        candidate = SECTOR_ETF_MAP[sector]
+        n = conn.execute(
+            "SELECT COUNT(*) FROM prices WHERE symbol = ? LIMIT 1", (candidate,)
+        ).fetchone()[0]
+        if n > 0:
+            return candidate
+    return "SPY"
+
+
+def _load_benchmark_returns(
+    conn: sqlite3.Connection, ticker: str, walk_dates: list[str]
+) -> list[float]:
+    """Daily-return series for `ticker`, aligned to `walk_dates[1:]`.
+
+    Length = len(walk_dates) - 1. Missing prices on either side of a
+    consecutive pair → 0.0 for that day (rare for benchmark ETFs).
+    """
+    if not walk_dates:
+        return []
+    rows = conn.execute(
+        "SELECT date, close FROM prices WHERE symbol = ? AND date >= ? AND date <= ? ORDER BY date",
+        (ticker, walk_dates[0], walk_dates[-1]),
+    ).fetchall()
+    by_date = {d: c for d, c in rows}
+    rets = []
+    for i in range(1, len(walk_dates)):
+        p = by_date.get(walk_dates[i])
+        p_prev = by_date.get(walk_dates[i - 1])
+        if p is not None and p_prev is not None and p_prev > 0:
+            rets.append((p - p_prev) / p_prev)
+        else:
+            rets.append(0.0)
+    return rets
+
+
+def _ann_return_from_compounded(
+    daily_returns: list[float], n_nav: int
+) -> tuple[float, float | None]:
+    """Compound daily returns → (total_return_pct, ann_return_pct).
+
+    ann_return is None when the window is shorter than
+    MIN_TRADING_DAYS_FOR_ANNUALIZATION (60), matching the backtest
+    engine's honesty gate. Caller passes that to compute_nav_stats which
+    silently disables Sharpe/Sortino when ann_return is None.
+    """
+    if not daily_returns:
+        return 0.0, None
+    cum = 1.0
+    for r in daily_returns:
+        cum *= 1 + r
+    total_return_pct = (cum - 1) * 100
+    if n_nav < 60:  # MIN_TRADING_DAYS_FOR_ANNUALIZATION
+        return total_return_pct, None
+    years = n_nav / 252.0
+    ann_return_pct = (cum ** (1 / years) - 1) * 100
+    return total_return_pct, ann_return_pct
+
 
 def _get_universe(conn: sqlite3.Connection, sector: str | None) -> list[str]:
     """Get list of symbols, optionally filtered by sector."""
