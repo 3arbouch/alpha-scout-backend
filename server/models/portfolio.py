@@ -83,6 +83,17 @@ class InlineRegimeDefinition(BaseModel):
     """Regime defined inline within a portfolio config (instead of referencing a saved regime)."""
     conditions: list[RegimeCondition] = Field(min_length=1)
     logic: Literal["all", "any"] = Field(default="all")
+    # Hysteresis: filter short-lived condition flips at the source by requiring
+    # K consecutive days of confirming evidence before activation/deactivation.
+    # Defaults to 1 (current behavior — flip on first day of confirming signal).
+    entry_persistence_days: int = Field(
+        default=1, ge=1,
+        description="Consecutive days entry conditions must hold before the regime activates.",
+    )
+    exit_persistence_days: int = Field(
+        default=1, ge=1,
+        description="Consecutive days exit conditions must hold before the regime deactivates.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +152,15 @@ class PortfolioConfig(BaseModel):
     )
     transition_days: int = Field(
         default=1, ge=1,
-        description="Trading days to linearly transition between allocation profiles.",
+        description="Legacy: trading days to linearly transition between allocation profiles. Used for both directions when the asymmetric fields below are not set.",
+    )
+    transition_days_to_defensive: int | None = Field(
+        default=None, ge=1,
+        description="Trading days to lerp toward a profile with LOWER equity weight (more cash). When None, falls back to transition_days. Direction is determined by comparing total non-Cash weight before vs after.",
+    )
+    transition_days_to_offensive: int | None = Field(
+        default=None, ge=1,
+        description="Trading days to lerp toward a profile with HIGHER equity weight (less cash). When None, falls back to transition_days.",
     )
 
     backtest: BacktestParams = Field(default_factory=BacktestParams)

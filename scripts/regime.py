@@ -234,18 +234,23 @@ def evaluate_regime_series(start: str, end: str, regime_configs: list[dict],
                            conn=None) -> dict:
     """
     Evaluate all regime configs for every trading date in range.
-    Uses stateful evaluation with entry/exit conditions and cooldown.
+    Uses stateful evaluation with entry/exit conditions, cooldown, and
+    optional hysteresis on entry/exit.
 
     Regime config supports:
         - "conditions" + "logic" (legacy: symmetric entry=exit, no cooldown)
         - "entry_conditions" + "entry_logic" (new: explicit entry)
         - "exit_conditions" + "exit_logic" (new: explicit exit, defaults to inverse of entry)
         - "min_hold_days" (new: minimum trading days before exit conditions are checked)
+        - "entry_persistence_days" (new, default 1): consecutive days entry
+          must hold before the regime activates. Filters 1-day VIX spikes etc.
+        - "exit_persistence_days" (new, default 1): consecutive days exit
+          must hold before the regime deactivates.
 
     State machine per regime:
-        inactive → (entry conditions met) → active_cooldown
+        inactive → (entry persistent for K days) → active_cooldown
         active_cooldown → (cooldown elapsed) → active_monitoring
-        active_monitoring → (exit conditions met) → inactive
+        active_monitoring → (exit persistent for K days) → inactive
 
     Args:
         start: start date YYYY-MM-DD
@@ -286,8 +291,14 @@ def evaluate_regime_series(start: str, end: str, regime_configs: list[dict],
     if own_conn:
         conn.close()
 
-    # State machine per regime: track activation date and state
-    # States: "inactive", "cooldown", "monitoring"
+    # State machine per regime: track activation date, state, and persistence
+    # counters. States: "inactive", "cooldown", "monitoring".
+    #
+    # Persistence semantics: while inactive we count consecutive raw-entry-met
+    # days; we activate only when the count reaches entry_persistence_days.
+    # While monitoring (post-cooldown active), we count consecutive raw-exit-met
+    # days; we deactivate only when the count reaches exit_persistence_days.
+    # A non-confirming day resets the relevant counter to zero.
     regime_states = {}
     for rc in regime_configs:
         name = rc["name"]
@@ -295,6 +306,10 @@ def evaluate_regime_series(start: str, end: str, regime_configs: list[dict],
             "state": "inactive",
             "activated_day_idx": None,  # index into dates[] when activated
             "min_hold_days": rc.get("min_hold_days", 0),
+            "entry_persistence_days": max(1, int(rc.get("entry_persistence_days", 1))),
+            "exit_persistence_days": max(1, int(rc.get("exit_persistence_days", 1))),
+            "consec_entry_true": 0,
+            "consec_exit_true": 0,
         }
 
     # Evaluate each date with state tracking
@@ -308,24 +323,38 @@ def evaluate_regime_series(start: str, end: str, regime_configs: list[dict],
             st = regime_states[name]
 
             if st["state"] == "inactive":
-                # Check entry conditions
+                # Persistence counter: increment on consecutive entry-met days,
+                # reset to zero on any non-met day.
                 if _evaluate_regime(rc, values):
+                    st["consec_entry_true"] += 1
+                else:
+                    st["consec_entry_true"] = 0
+
+                if st["consec_entry_true"] >= st["entry_persistence_days"]:
                     st["state"] = "cooldown" if st["min_hold_days"] > 0 else "monitoring"
                     st["activated_day_idx"] = day_idx
+                    st["consec_exit_true"] = 0
                     active.append(name)
 
             elif st["state"] == "cooldown":
-                # Active but in cooldown — don't check exit yet
+                # Active but in cooldown — don't check exit yet.
+                # Persistence does not apply during cooldown either.
                 days_held = day_idx - st["activated_day_idx"]
                 active.append(name)
                 if days_held >= st["min_hold_days"]:
                     st["state"] = "monitoring"
 
             elif st["state"] == "monitoring":
-                # Active and past cooldown — check exit
+                # Active and past cooldown — check exit with persistence.
                 if _evaluate_regime_exit(rc, values):
+                    st["consec_exit_true"] += 1
+                else:
+                    st["consec_exit_true"] = 0
+
+                if st["consec_exit_true"] >= st["exit_persistence_days"]:
                     st["state"] = "inactive"
                     st["activated_day_idx"] = None
+                    st["consec_entry_true"] = 0
                 else:
                     active.append(name)
 
