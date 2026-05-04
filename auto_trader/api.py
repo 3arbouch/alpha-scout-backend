@@ -5,6 +5,7 @@ Mounted on the main FastAPI app under /auto-trader/.
 """
 
 import os
+import re
 import sys
 import json
 import signal
@@ -340,7 +341,10 @@ def _get_run(run_id: str) -> dict:
 def _generate_run_id(name: str) -> str:
     import hashlib
     raw = f"{name}:{datetime.now(timezone.utc).isoformat()}"
-    slug = name.lower().replace(" ", "_")[:20]
+    # Strip everything that isn't URL-path-safe (slashes, ?, #, %, etc.) — a
+    # raw `replace(" ", "_")` let "/" survive and broke every by-id route for
+    # names like "Energy quant - 2015/2019".
+    slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")[:20]
     suffix = hashlib.md5(raw.encode()).hexdigest()[:8]
     return f"{slug}_{suffix}"
 
