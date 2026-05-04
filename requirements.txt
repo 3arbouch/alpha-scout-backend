@@ -9,3 +9,5 @@ anthropic>=0.18.0
 claude-agent-sdk>=0.1.61
 PyJWT>=2.8.0
 bcrypt>=4.0.0
+numpy>=1.26
+scipy>=1.10

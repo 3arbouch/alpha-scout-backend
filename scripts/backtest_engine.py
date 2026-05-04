@@ -2681,60 +2681,28 @@ def compute_metrics(portfolio: Portfolio, initial_cash: float,
 
     # Risk-free rate is used for Sharpe/Sortino. Loaded regardless so we can
     # report it even when downstream stats are gated off.
-    risk_free_ann = 0.0
-    try:
-        treasury_path = Path(__file__).parent.parent / "data" / "macro" / "treasury-rates.json"
-        if treasury_path.exists():
-            treasury_data = json.loads(treasury_path.read_text())
-            t_rates = treasury_data.get("data", treasury_data) if isinstance(treasury_data, dict) else treasury_data
-            start_date = nav_series[0]["date"]
-            end_date = nav_series[-1]["date"]
-            period_rates = [r["month3"] for r in t_rates
-                           if start_date <= r["date"] <= end_date and r.get("month3") is not None]
-            if period_rates:
-                risk_free_ann = sum(period_rates) / len(period_rates)
-    except Exception:
-        risk_free_ann = 2.0
+    from _nav_metrics import compute_nav_stats, load_risk_free_ann_pct
+
+    risk_free_ann = load_risk_free_ann_pct(
+        nav_series[0]["date"], nav_series[-1]["date"]
+    )
 
     # Statistical risk metrics — gated by sample size for the same reason as
     # ann_return above. With <60 daily returns, std() and Sharpe have CIs on
     # the order of the point estimate; reporting them is misleading.
-    if daily_returns and ann_return is not None:
-        import statistics
-        import math
-
-        daily_std = statistics.stdev(daily_returns) if len(daily_returns) > 1 else 0
-        ann_vol = daily_std * (252 ** 0.5) * 100
-        excess_return = ann_return - risk_free_ann
-        sharpe_ann = excess_return / ann_vol if ann_vol > 0 else 0
-
-        # Period-basis sharpe for short windows — see portfolio_engine for
-        # rationale. Keeps the displayed sharpe self-consistent with the
-        # displayed period return when the run is < 1 year.
-        n = len(daily_returns)
-        period_vol = daily_std * (n ** 0.5) * 100
-        rf_period = risk_free_ann * (n / 252.0)
-        period_return = total_return  # computed above
-        sharpe_period = (period_return - rf_period) / period_vol if period_vol > 0 else 0
-
-        if n_nav < 252:
-            sharpe = sharpe_period
-            sharpe_basis = "period"
-        else:
-            sharpe = sharpe_ann
-            sharpe_basis = "annualized"
-
-        daily_rf = risk_free_ann / 100 / 252
-        downside_sq = [min(r - daily_rf, 0) ** 2 for r in daily_returns]
-        downside_dev = math.sqrt(sum(downside_sq) / len(downside_sq)) * math.sqrt(252) * 100
-        sortino = excess_return / downside_dev if downside_dev > 0 else 0
-    else:
-        ann_vol = None
-        sharpe = None
-        sharpe_ann = None
-        sharpe_period = None
-        sharpe_basis = None
-        sortino = None
+    _stats = compute_nav_stats(
+        daily_returns=daily_returns,
+        n_nav=n_nav,
+        total_return_pct=total_return,
+        ann_return_pct=ann_return,
+        risk_free_ann_pct=risk_free_ann,
+    )
+    ann_vol = _stats["annualized_volatility_pct"]
+    sharpe = _stats["sharpe_ratio"]
+    sharpe_ann = _stats["sharpe_ratio_annualized"]
+    sharpe_period = _stats["sharpe_ratio_period"]
+    sharpe_basis = _stats["sharpe_basis"]
+    sortino = _stats["sortino_ratio"]
 
     # Utilized capital metrics
     positions_values = [p["positions_value"] for p in nav_series]
