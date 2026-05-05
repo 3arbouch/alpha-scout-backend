@@ -645,6 +645,20 @@ async def run_agent_iteration(
 ) -> dict:
     """Run a single agent iteration. Returns experiment result."""
     from claude_agent_sdk import query, ClaudeAgentOptions
+    from backtest_engine import clear_precompute_cache
+
+    # Reset the per-iteration precompute_condition memoization cache. The
+    # cache speeds up repeated rank_signals/evaluate_signal calls within a
+    # single iteration but must be flushed at iteration boundaries to bound
+    # memory and prevent any cross-iteration drift if market data updates.
+    prior_cache_stats = clear_precompute_cache()
+    if prior_cache_stats.get("entries", 0) > 0:
+        h = prior_cache_stats["hits"]
+        m = prior_cache_stats["misses"]
+        total = h + m
+        hit_rate = (h / total * 100) if total > 0 else 0
+        print(f"  [precompute cache] prior iter: {h} hits / {m} misses "
+              f"({hit_rate:.0f}% hit rate, {prior_cache_stats['entries']} entries)")
 
     t0 = time.time()
 
