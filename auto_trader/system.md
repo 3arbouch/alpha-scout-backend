@@ -40,6 +40,8 @@ Direction is decided by comparing total non-Cash weight before vs. after each pr
 
 **When to override**: persistence filters the signal; transition_days smooths the response. They compose. If your strategy's regime triggers are clean (slow-moving indicators like 200-day MA), lower persistence to 1-2. If your underlying signal is already noise-resistant, set both transition_days to 1. Stacking aggressive persistence + slow recovery can over-dampen — test before combining.
 
+**Rebalance trades are real**: when the active allocation profile changes, the engine emits SELL trades on defensive transitions and BUY trades on offensive transitions, allocated proportionally across the sleeve's currently-held positions. With asymmetric `transition_days_to_offensive > 1`, the offensive refill is spread across multiple consecutive trading days. Each rebalance trade is tagged with a `reason` starting with `rebalance_to_` and is excluded from the strategy's win-rate / pnl statistics — it's pure plumbing. The only NAV impact is slippage cost, applied per the sleeve's `slippage_bps`. Your experiment summary reports a separate **Rebalances** line so you can see how much trading volume your smoothing settings generated.
+
 ## Rules
 
 - DON'T invent condition types or parameters — only use what the schema defines.

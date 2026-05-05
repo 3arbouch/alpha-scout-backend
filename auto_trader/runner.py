@@ -176,9 +176,14 @@ def _get_trade_summary(exp_id: str) -> dict | None:
     """
     from auto_trader.schema import get_db
     conn = get_db()
-    # Aggregate stats — only SELL rows carry pnl
+    # Strategy aggregate stats — exclude portfolio rebalance trades. Rebalance
+    # trades have `reason` starting with "rebalance_to_" and do not carry pnl
+    # (they're zero-NAV-change executions that just shift exposure between
+    # the sleeve and cash). Win-rate / avg-win / avg-loss / days-held describe
+    # strategy decisions, not rebalance plumbing.
+    STRATEGY_FILTER = "(reason IS NULL OR reason NOT LIKE 'rebalance_to_%')"
     agg = conn.execute(
-        """SELECT
+        f"""SELECT
                COUNT(*) AS total_events,
                SUM(CASE WHEN action='BUY' THEN 1 ELSE 0 END) AS buys,
                SUM(CASE WHEN action='SELL' THEN 1 ELSE 0 END) AS sells,
@@ -187,31 +192,47 @@ def _get_trade_summary(exp_id: str) -> dict | None:
                AVG(CASE WHEN action='SELL' AND pnl > 0 THEN pnl_pct END) AS avg_win_pct,
                AVG(CASE WHEN action='SELL' AND pnl <= 0 THEN pnl_pct END) AS avg_loss_pct,
                AVG(CASE WHEN action='SELL' THEN days_held END) AS avg_days_held
-           FROM trades WHERE source_type='experiment' AND source_id = ?""",
+           FROM trades WHERE source_type='experiment' AND source_id = ?
+                       AND {STRATEGY_FILTER}""",
         (exp_id,),
     ).fetchone()
-    if not agg or (agg["total_events"] or 0) == 0:
-        conn.close()
-        return None
 
-    # Exit-reason histogram
+    # Rebalance trade counts (separate bucket — pure plumbing, no win/loss).
+    rebal = conn.execute(
+        """SELECT COUNT(*) AS n_records,
+                  COUNT(DISTINCT date) AS n_dates,
+                  SUM(amount) AS total_dollars
+           FROM trades WHERE source_type='experiment' AND source_id=?
+                       AND reason LIKE 'rebalance_to_%'""",
+        (exp_id,),
+    ).fetchone()
+
+    if not agg or (agg["total_events"] or 0) == 0:
+        if rebal and (rebal["n_records"] or 0) == 0:
+            conn.close()
+            return None
+
+    # Exit-reason histogram (strategy-only).
     reasons = conn.execute(
-        """SELECT reason, COUNT(*) AS n FROM trades
-           WHERE source_type='experiment' AND source_id=? AND action='SELL' AND reason IS NOT NULL
+        f"""SELECT reason, COUNT(*) AS n FROM trades
+           WHERE source_type='experiment' AND source_id=? AND action='SELL'
+                 AND reason IS NOT NULL AND {STRATEGY_FILTER}
            GROUP BY reason ORDER BY n DESC""",
         (exp_id,),
     ).fetchall()
 
-    # Top 3 winners and worst 3 losers by pnl_pct
+    # Top 3 winners and worst 3 losers by pnl_pct (strategy-only).
     winners_rows = conn.execute(
-        """SELECT symbol, pnl_pct, days_held FROM trades
+        f"""SELECT symbol, pnl_pct, days_held FROM trades
            WHERE source_type='experiment' AND source_id=? AND action='SELL' AND pnl > 0
+                 AND {STRATEGY_FILTER}
            ORDER BY pnl_pct DESC LIMIT 3""",
         (exp_id,),
     ).fetchall()
     losers_rows = conn.execute(
-        """SELECT symbol, pnl_pct, days_held FROM trades
+        f"""SELECT symbol, pnl_pct, days_held FROM trades
            WHERE source_type='experiment' AND source_id=? AND action='SELL' AND pnl <= 0
+                 AND {STRATEGY_FILTER}
            ORDER BY pnl_pct ASC LIMIT 3""",
         (exp_id,),
     ).fetchall()
@@ -232,6 +253,10 @@ def _get_trade_summary(exp_id: str) -> dict | None:
         "exit_reasons": [(r["reason"], r["n"]) for r in reasons],
         "top_winners": [(r["symbol"], r["pnl_pct"], r["days_held"]) for r in winners_rows],
         "worst_losers": [(r["symbol"], r["pnl_pct"], r["days_held"]) for r in losers_rows],
+        # Portfolio rebalance bucket (separate from strategy).
+        "rebalance_records": (rebal["n_records"] or 0) if rebal else 0,
+        "rebalance_dates": (rebal["n_dates"] or 0) if rebal else 0,
+        "rebalance_total_dollars": round(rebal["total_dollars"] or 0, 2) if rebal else 0,
     }
 
 
@@ -329,6 +354,18 @@ def build_history_context(run_id: str, target_metric: str, limit: int = 20) -> s
             if summary["worst_losers"]:
                 bot_str = ", ".join(f"{s} {p:+.1f}%/{d}d" for s, p, d in summary["worst_losers"])
                 lines.append(f"**Worst losers:** {bot_str}")
+
+            # Portfolio rebalance bucket — only render when rebalances actually
+            # happened (v2 strategies with allocation_profiles + transitions).
+            # These are PURE PLUMBING, not strategy decisions: they shift sleeve
+            # exposure to match the active allocation profile and don't carry pnl.
+            if summary.get("rebalance_records", 0) > 0:
+                lines.append(
+                    f"**Rebalances:** {summary['rebalance_records']} trade records "
+                    f"across {summary['rebalance_dates']} dates "
+                    f"(${summary['rebalance_total_dollars']:,.0f} gross volume — "
+                    f"slippage cost is the only NAV drag from rebalancing)"
+                )
 
         # Smoothing diagnostic — only render when something non-default was set,
         # so unmodified strategies don't get noise lines in their history block.
@@ -571,11 +608,19 @@ def run_backtest(portfolio_config: dict, start: str, end: str, capital: float,
             "regime_persistence": {},
             "transition_lerp": {},
         }
+        rebalance_summary = result.get("rebalance_summary") or {
+            "rebalance_active": False,
+            "n_rebalance_events": 0,
+            "n_rebalance_trades": 0,
+            "cumulative_slippage_dollars": 0,
+            "cumulative_slippage_pct_of_initial": 0,
+        }
 
         return {
             "metrics": metrics,
             "sleeve_trades": sleeve_trades,
             "smoothing_summary": smoothing_summary,
+            "rebalance_summary": rebalance_summary,
         }
     except Exception as e:
         print(f"  Backtest failed: {e}")

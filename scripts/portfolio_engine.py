@@ -498,12 +498,18 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
             all_dates.add(entry["date"])
     all_dates = sorted(all_dates)
 
-    # Build per-sleeve NAV and positions_value lookups
+    # Build per-sleeve NAV, positions_value, and per-position lookups.
+    # The per-position lookup is needed for portfolio-level rebalance trade
+    # emission (Phase 1 of the rebalance-execution feature): on each lerp day
+    # we trim or top-up across the sleeve's currently-held positions.
     sleeve_nav_lookup = []
     sleeve_pv_lookup = []
+    sleeve_positions_lookup = []
     for result in sleeve_results:
         nav_map = {entry["date"]: entry["nav"] for entry in result["nav_history"]}
         pv_map = {entry["date"]: entry.get("positions_value", 0) for entry in result["nav_history"]}
+        pos_map = {entry["date"]: entry.get("positions") or {} for entry in result["nav_history"]}
+        sleeve_positions_lookup.append(pos_map)
         sleeve_nav_lookup.append(nav_map)
         sleeve_pv_lookup.append(pv_map)
 
@@ -700,6 +706,25 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
     # weighted average of sleeve daily returns according to the current profile.
     incremental_nav = initial_capital  # running portfolio NAV for dynamic mode
 
+    # --- Rebalance trade emission state (v2 dispatch only) ---
+    # On each lerp day, the sleeve's TARGET dollar exposure (incremental_nav ×
+    # day_weight) differs from yesterday's CARRIED exposure (yesterday's target
+    # marked-to-market via sleeve daily return). The gap is the rebalance trade
+    # for today: SELL if target<actual (defensive direction), BUY if
+    # target>actual (offensive). Trades are allocated proportionally across
+    # the sleeve's currently-held standalone positions, tagged with a
+    # `rebalance_to_<profile>` reason. Slippage on the rebalance dollars is
+    # applied to incremental_nav as a daily drag — the real-world friction of
+    # trading. Schema-version gated: existing v1 deployments keep math-only
+    # NAV (zero rebalance trades, zero slippage drag) so their numbers are
+    # byte-identical to pre-feature behavior.
+    REBALANCE_DOLLAR_TOLERANCE = 1.0  # below this, no trade
+    emit_rebalance_trades = (schema_version >= 2)
+    prev_target_dollars = [0.0] * len(sleeves)
+    rebalance_trades_by_sleeve = [[] for _ in sleeves]
+    cumulative_rebalance_slippage = 0.0
+    rebalance_event_count = 0
+
     # Helper: compute raw daily return for a sleeve
     def _sleeve_daily_return(i, date, prev_date):
         """Single-day return for sleeve i. Returns 0.0 if data missing."""
@@ -831,6 +856,66 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
                         daily_ret = _sleeve_daily_return(i, date, prev_date)
                         weighted_return += w * daily_ret
                 incremental_nav *= (1 + weighted_return)
+
+            # --- Emit rebalance trades for the lerp day (v2 dispatch) ---
+            # Each sleeve's rebalance dollar amount = today's target_dollars
+            # minus the carried exposure from yesterday's target marked to
+            # today's prices via the sleeve's daily return. Trades are
+            # distributed across the sleeve's currently-held standalone
+            # positions, proportional to position market value. Slippage
+            # cost is then subtracted from incremental_nav as a daily drag.
+            if emit_rebalance_trades and prev_date is not None:
+                slippage_drag_today = 0.0
+                for i, sleeve in enumerate(sleeves):
+                    if sleeve["label"].lower() == "cash":
+                        continue
+                    w = day_weights[i]
+                    target_dollars = incremental_nav * w
+                    sleeve_daily_ret = _sleeve_daily_return(i, date, prev_date)
+                    carried_dollars = prev_target_dollars[i] * (1 + sleeve_daily_ret)
+                    delta = target_dollars - carried_dollars
+                    if abs(delta) <= REBALANCE_DOLLAR_TOLERANCE:
+                        continue
+                    positions = sleeve_positions_lookup[i].get(date, {}) or {}
+                    total_pv = sum(p.get("market_value", 0) for p in positions.values())
+                    if total_pv <= 0:
+                        # No standalone positions today — rebalance can't be
+                        # allocated to stocks. Effective exposure stays at
+                        # whatever cash we hold; no trade emitted.
+                        continue
+                    fraction = delta / total_pv  # negative = SELL, positive = BUY
+                    action = "SELL" if delta < 0 else "BUY"
+                    profile_label = profile_name or "default"
+                    reason = f"rebalance_to_{profile_label}"
+                    for symbol, p in positions.items():
+                        trade_shares = abs(p.get("shares", 0) * fraction)
+                        price = p.get("price", 0)
+                        trade_dollars = trade_shares * price
+                        if trade_dollars < 1.0:
+                            continue
+                        rebalance_trades_by_sleeve[i].append({
+                            "date": date,
+                            "symbol": symbol,
+                            "action": action,
+                            "shares": round(trade_shares, 4),
+                            "price": round(price, 2),
+                            "amount": round(trade_dollars, 2),
+                            "reason": reason,
+                        })
+                    rebalance_event_count += 1
+                    slip_bps = sleeves[i]["config"].get("backtest", {}).get("slippage_bps", 10)
+                    slippage_drag_today += abs(delta) * slip_bps / 10000
+
+                if slippage_drag_today > 0:
+                    cumulative_rebalance_slippage += slippage_drag_today
+                    incremental_nav -= slippage_drag_today
+
+            # Snapshot today's per-sleeve target dollars for tomorrow's
+            # rebalance reconciliation. Done after slippage drag so the
+            # next-day target is consistent with the realized NAV.
+            if emit_rebalance_trades:
+                for i, _sleeve in enumerate(sleeves):
+                    prev_target_dollars[i] = incremental_nav * day_weights[i]
 
             combined_nav = incremental_nav
 
@@ -1266,6 +1351,35 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
         n_trading_days=len(combined_nav_history),
     )
 
+    # Merge per-sleeve rebalance trades into each sleeve_result's trade list
+    # so downstream consumers (deploy_engine.persist_trades, agent history
+    # context, dashboards) see them as part of the sleeve's trade log,
+    # tagged with `reason` starting with "rebalance_to_". Sleeve metrics
+    # (Sharpe, MDD, etc.) are unchanged — those are computed from the sleeve's
+    # standalone NAV trajectory, not from its trade list.
+    n_rebalance_trades = 0
+    for i, sleeve_result in enumerate(sleeve_results):
+        if rebalance_trades_by_sleeve[i]:
+            sleeve_result.setdefault("trades", []).extend(rebalance_trades_by_sleeve[i])
+            n_rebalance_trades += len(rebalance_trades_by_sleeve[i])
+
+    rebalance_summary = {
+        "schema_version": schema_version,
+        "rebalance_active": emit_rebalance_trades,
+        "n_rebalance_events": rebalance_event_count,
+        "n_rebalance_trades": n_rebalance_trades,
+        "cumulative_slippage_dollars": round(cumulative_rebalance_slippage, 2),
+        "cumulative_slippage_pct_of_initial": (
+            round(cumulative_rebalance_slippage / initial_capital * 100, 4)
+            if initial_capital > 0 else 0
+        ),
+    }
+    if emit_rebalance_trades and rebalance_event_count > 0:
+        print(f"\n  Portfolio rebalances: {rebalance_event_count} events, "
+              f"{n_rebalance_trades} trade records, "
+              f"${cumulative_rebalance_slippage:,.2f} cumulative slippage cost "
+              f"({rebalance_summary['cumulative_slippage_pct_of_initial']:.4f}% of initial)")
+
     return {
         "portfolio": name,
         "portfolio_id": compute_portfolio_id(portfolio_config),
@@ -1278,6 +1392,7 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
         "regime_history": regime_history,
         "allocation_profile_history": allocation_profile_history,
         "smoothing_summary": smoothing_summary,
+        "rebalance_summary": rebalance_summary,
         # Benchmarks
         "benchmark": benchmark,                          # legacy: primary benchmark (sector if available, else market)
         "benchmark_market": market_benchmark,            # always SPY time series + metrics
