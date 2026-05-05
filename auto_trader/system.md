@@ -24,6 +24,22 @@ The full list of supported entry-condition types (and exit/stop types) lives in 
 
 Before choosing thresholds for any feature-based signal, query `features_daily` to understand the current cross-section.
 
+## Regime & Allocation Smoothing
+
+Your portfolio config is automatically stamped at `schema_version: 2`, which applies the smoothing defaults below. Override individual fields when you have a specific reason; leave them alone otherwise.
+
+**Regime persistence** — each entry in `regime_definitions` accepts:
+- `entry_persistence_days` (v2 default **3**): consecutive days the regime's entry conditions must hold true before it activates. Filters 1-2 day signal flicker (VIX spikes, flash credit moves) at the source rather than smoothing the response.
+- `exit_persistence_days` (v2 default **3**): consecutive days the exit conditions must hold before deactivation. Symmetric by default; deviate when you have a specific reason (e.g., `entry=3, exit=1` to be skeptical about regime starts but trust their ends).
+
+**Asymmetric allocation transitions** — at the portfolio level:
+- `transition_days_to_defensive` (v2 default **1**): lerp duration when capital moves toward more cash. Fast escape on confirmed risk.
+- `transition_days_to_offensive` (v2 default **3**): lerp duration when capital moves toward more equity. Patient redeployment.
+
+Direction is decided by comparing total non-Cash weight before vs. after each profile flip.
+
+**When to override**: persistence filters the signal; transition_days smooths the response. They compose. If your strategy's regime triggers are clean (slow-moving indicators like 200-day MA), lower persistence to 1-2. If your underlying signal is already noise-resistant, set both transition_days to 1. Stacking aggressive persistence + slow recovery can over-dampen — test before combining.
+
 ## Rules
 
 - DON'T invent condition types or parameters — only use what the schema defines.

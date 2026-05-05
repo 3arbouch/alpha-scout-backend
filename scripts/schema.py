@@ -642,6 +642,7 @@ def _apply_migrations(conn: sqlite3.Connection):
         _add_column_if_missing(conn, "experiments", "sharpe_basis", "TEXT")
         _add_column_if_missing(conn, "experiments", "sharpe_ratio_annualized", "REAL")
         _add_column_if_missing(conn, "experiments", "sharpe_ratio_period", "REAL")
+        _add_column_if_missing(conn, "experiments", "smoothing_summary", "TEXT")
     if "deployments" in existing_tables:
         _add_column_if_missing(conn, "deployments", "portfolio_id", "TEXT")
         _add_column_if_missing(conn, "deployments", "last_sharpe_basis", "TEXT")

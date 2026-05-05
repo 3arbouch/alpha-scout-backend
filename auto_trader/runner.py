@@ -330,6 +330,46 @@ def build_history_context(run_id: str, target_metric: str, limit: int = 20) -> s
                 bot_str = ", ".join(f"{s} {p:+.1f}%/{d}d" for s, p, d in summary["worst_losers"])
                 lines.append(f"**Worst losers:** {bot_str}")
 
+        # Smoothing diagnostic — only render when something non-default was set,
+        # so unmodified strategies don't get noise lines in their history block.
+        ss_raw = exp.get("smoothing_summary")
+        if ss_raw:
+            try:
+                ss = json.loads(ss_raw) if isinstance(ss_raw, str) else ss_raw
+            except json.JSONDecodeError:
+                ss = None
+            if isinstance(ss, dict):
+                rp = ss.get("regime_persistence", {}) or {}
+                tl = ss.get("transition_lerp", {}) or {}
+                # Only render persistence info for regimes that actually opted
+                # in (entry or exit > 1), and transition info if asymmetric or
+                # legacy td > 1.
+                rp_lines = []
+                for rname, st in rp.items():
+                    e_p = st.get("entry_persistence_days", 1)
+                    x_p = st.get("exit_persistence_days", 1)
+                    if e_p > 1 or x_p > 1:
+                        rp_lines.append(
+                            f"{rname} (entry={e_p}d, exit={x_p}d): "
+                            f"raw_met={st.get('raw_entry_met_days', 0)} → "
+                            f"active={st.get('active_days', 0)} "
+                            f"({st.get('n_activations', 0)} activations, "
+                            f"{st.get('filtered_short_entry_runs', 0)} short runs filtered)"
+                        )
+                if rp_lines:
+                    lines.append("**Regime persistence:** " + "; ".join(rp_lines))
+                if tl.get("asymmetric") or (tl.get("transition_days_legacy", 1) or 1) > 1:
+                    lines.append(
+                        f"**Transition lerp:** "
+                        f"{'asymmetric' if tl.get('asymmetric') else 'symmetric'} "
+                        f"(to_def={tl.get('transition_days_to_defensive') or tl.get('transition_days_legacy')}d, "
+                        f"to_off={tl.get('transition_days_to_offensive') or tl.get('transition_days_legacy')}d) — "
+                        f"{tl.get('n_transitions_total', 0)} flips "
+                        f"({tl.get('n_transitions_defensive', 0)} defensive / "
+                        f"{tl.get('n_transitions_offensive', 0)} offensive), "
+                        f"{tl.get('lerp_days_active', 0)} days mid-lerp"
+                    )
+
         lines.append("")
 
     higher = METRIC_DIRECTION.get(target_metric, True)
@@ -407,6 +447,13 @@ def check_conditions(metrics: dict, conditions: list[dict]) -> tuple[bool, list[
 def normalize_config(portfolio_config: dict) -> dict:
     """Fix common config issues from LLM output before passing to engine."""
     config = dict(portfolio_config)
+
+    # Stamp the latest schema_version on agent-created configs so they pick up
+    # the current default-set (smoothing on). Pre-existing deployments loaded
+    # from app.db do NOT go through this path — they keep their absent
+    # schema_version (treated as v1 = legacy defaults) and thus their
+    # historical behavior is preserved.
+    config.setdefault("schema_version", 2)
 
     for sleeve in config.get("sleeves", []):
         sc = sleeve.get("strategy_config", {})
@@ -516,7 +563,20 @@ def run_backtest(portfolio_config: dict, start: str, end: str, capital: float,
             for i, sr in enumerate(sleeve_results)
         ]
 
-        return {"metrics": metrics, "sleeve_trades": sleeve_trades}
+        # Smoothing diagnostic block — visible to the agent across iterations.
+        # Tells it whether regime persistence filtered any events and how the
+        # transition_days lerp shaped exposure. Always present (zeros / empty
+        # when smoothing knobs aren't set) so downstream consumers can rely on it.
+        smoothing_summary = result.get("smoothing_summary") or {
+            "regime_persistence": {},
+            "transition_lerp": {},
+        }
+
+        return {
+            "metrics": metrics,
+            "sleeve_trades": sleeve_trades,
+            "smoothing_summary": smoothing_summary,
+        }
     except Exception as e:
         print(f"  Backtest failed: {e}")
         import traceback
@@ -731,9 +791,11 @@ Use the `query_market_data` tool for all data queries. Use `validate_portfolio` 
 
     if bt_result is None:
         metrics = None
+        smoothing_summary = None
     else:
         metrics = bt_result["metrics"]
         sleeve_trades = bt_result["sleeve_trades"]
+        smoothing_summary = bt_result.get("smoothing_summary")
 
     if metrics is None:
         exp_id = log_experiment(
@@ -782,6 +844,7 @@ Use the `query_market_data` tool for all data queries. Use `validate_portfolio` 
         session_id=session_id, duration_seconds=duration_total,
         portfolio_id=portfolio_id,
         lessons=lessons,
+        smoothing_summary=smoothing_summary,
     )
 
     # Persist trades per sleeve under source_type='experiment'.

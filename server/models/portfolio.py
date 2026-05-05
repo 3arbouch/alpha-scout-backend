@@ -83,6 +83,19 @@ class InlineRegimeDefinition(BaseModel):
     """Regime defined inline within a portfolio config (instead of referencing a saved regime)."""
     conditions: list[RegimeCondition] = Field(min_length=1)
     logic: Literal["all", "any"] = Field(default="all")
+    # Hysteresis: filter short-lived condition flips at the source by requiring
+    # K consecutive days of confirming evidence before activation/deactivation.
+    # Defaults: 3 days each — long enough to filter most 1-2 day spikes, short
+    # enough not to miss confirmed regime changes. Symmetric exit by default;
+    # deviate when you have a specific reason.
+    entry_persistence_days: int = Field(
+        default=3, ge=1,
+        description="Consecutive days entry conditions must hold before the regime activates. Default 3.",
+    )
+    exit_persistence_days: int = Field(
+        default=3, ge=1,
+        description="Consecutive days exit conditions must hold before the regime deactivates. Default 3.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -90,7 +103,20 @@ class InlineRegimeDefinition(BaseModel):
 # ---------------------------------------------------------------------------
 
 class PortfolioConfig(BaseModel):
-    """Complete portfolio definition."""
+    """Complete portfolio definition.
+
+    `schema_version` controls which DEFAULT-SET the engine applies for the
+    smoothing knobs (regime persistence + asymmetric transition_days). Existing
+    configs in the DB have no `schema_version` field and are treated as v1 —
+    legacy defaults: persistence=1, no asymmetric transitions. New configs are
+    constructed at v2 — defaults: persistence=3, td_def=1, td_off=3. Bumping the
+    version in the future re-applies the dispatch without touching stored data.
+    Explicit smoothing fields on a config always win over the version's defaults.
+    """
+    schema_version: int = Field(
+        default=2, ge=1,
+        description="Versioned default-set: v1=legacy (no smoothing), v2=smoothing on. Existing pre-v2 configs without this field are treated as v1.",
+    )
     portfolio_id: str | None = Field(default=None, description="Deterministic hash of core params.")
     name: str = Field(min_length=1)
     sleeves: list[SleeveConfig] = Field(min_length=1)
@@ -141,7 +167,15 @@ class PortfolioConfig(BaseModel):
     )
     transition_days: int = Field(
         default=1, ge=1,
-        description="Trading days to linearly transition between allocation profiles.",
+        description="Legacy symmetric lerp duration between allocation profiles. Used for both directions only when both asymmetric fields below are unset (None).",
+    )
+    transition_days_to_defensive: int | None = Field(
+        default=1, ge=1,
+        description="Trading days to lerp toward a profile with LOWER equity weight (more cash). Default 1 — fast escape on confirmed risk. Direction is determined by comparing total non-Cash weight before vs after.",
+    )
+    transition_days_to_offensive: int | None = Field(
+        default=3, ge=1,
+        description="Trading days to lerp toward a profile with HIGHER equity weight (less cash). Default 3 — patient redeployment.",
     )
 
     backtest: BacktestParams = Field(default_factory=BacktestParams)
