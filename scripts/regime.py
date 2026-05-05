@@ -260,11 +260,30 @@ def evaluate_regime_series(start: str, end: str, regime_configs: list[dict],
     Returns:
         dict of {date: [active_regime_names]}
     """
+    # Existing callers want just {date: active_names}. Delegate to the
+    # stats-returning variant and drop the stats dict here.
+    series, _ = evaluate_regime_series_with_stats(start, end, regime_configs, conn=conn)
+    return series
+
+
+def evaluate_regime_series_with_stats(start: str, end: str, regime_configs: list[dict],
+                                      conn=None) -> tuple[dict, dict]:
+    """Same as evaluate_regime_series but also returns per-regime persistence stats.
+
+    Returns (regime_series, persistence_stats) where:
+      regime_series: {date: [active_regime_names]}
+      persistence_stats: {regime_name: {
+          entry_persistence_days, exit_persistence_days,
+          raw_entry_met_days, active_days, n_activations, n_deactivations,
+          filtered_short_entry_runs,
+      }}
+    """
+    # Inline duplicate of evaluate_regime_series so we can return both. Kept
+    # in sync via shared helpers (_evaluate_regime, _evaluate_regime_exit).
     own_conn = conn is None
     if own_conn:
         conn = get_connection()
 
-    # Get trading dates from prices table (AAPL as proxy for trading calendar)
     cur = conn.cursor()
     cur.execute(
         "SELECT DISTINCT date FROM prices WHERE symbol = 'AAPL' AND date >= ? AND date <= ? ORDER BY date",
@@ -275,9 +294,8 @@ def evaluate_regime_series(start: str, end: str, regime_configs: list[dict],
     if not dates:
         if own_conn:
             conn.close()
-        return {}
+        return {}, {}
 
-    # Collect all series keys needed
     all_keys = set()
     for rc in regime_configs:
         for cond in rc.get("entry_conditions", rc.get("conditions", [])):
@@ -285,34 +303,36 @@ def evaluate_regime_series(start: str, end: str, regime_configs: list[dict],
         for cond in rc.get("exit_conditions", []):
             all_keys.add(cond["series"])
 
-    # Bulk load
     all_values = _load_macro_values_bulk(dates, list(all_keys), conn)
-
     if own_conn:
         conn.close()
 
-    # State machine per regime: track activation date, state, and persistence
-    # counters. States: "inactive", "cooldown", "monitoring".
-    #
-    # Persistence semantics: while inactive we count consecutive raw-entry-met
-    # days; we activate only when the count reaches entry_persistence_days.
-    # While monitoring (post-cooldown active), we count consecutive raw-exit-met
-    # days; we deactivate only when the count reaches exit_persistence_days.
-    # A non-confirming day resets the relevant counter to zero.
     regime_states = {}
+    persistence_stats = {}
     for rc in regime_configs:
         name = rc["name"]
         regime_states[name] = {
             "state": "inactive",
-            "activated_day_idx": None,  # index into dates[] when activated
+            "activated_day_idx": None,
             "min_hold_days": rc.get("min_hold_days", 0),
+            # Engine-level safe baseline: 1/1. The portfolio_engine stamps
+            # version-aware defaults onto regime configs before calling here,
+            # so when no override is present we treat it as "no persistence".
             "entry_persistence_days": max(1, int(rc.get("entry_persistence_days", 1))),
             "exit_persistence_days": max(1, int(rc.get("exit_persistence_days", 1))),
             "consec_entry_true": 0,
             "consec_exit_true": 0,
         }
+        persistence_stats[name] = {
+            "entry_persistence_days": regime_states[name]["entry_persistence_days"],
+            "exit_persistence_days": regime_states[name]["exit_persistence_days"],
+            "raw_entry_met_days": 0,
+            "active_days": 0,
+            "n_activations": 0,
+            "n_deactivations": 0,
+            "filtered_short_entry_runs": 0,
+        }
 
-    # Evaluate each date with state tracking
     result = {}
     for day_idx, date in enumerate(dates):
         values = all_values.get(date, {})
@@ -321,31 +341,38 @@ def evaluate_regime_series(start: str, end: str, regime_configs: list[dict],
         for rc in regime_configs:
             name = rc["name"]
             st = regime_states[name]
+            stats = persistence_stats[name]
 
             if st["state"] == "inactive":
-                # Persistence counter: increment on consecutive entry-met days,
-                # reset to zero on any non-met day.
-                if _evaluate_regime(rc, values):
+                raw_entry = _evaluate_regime(rc, values)
+                if raw_entry:
+                    stats["raw_entry_met_days"] += 1
                     st["consec_entry_true"] += 1
                 else:
+                    if st["consec_entry_true"] > 0:
+                        stats["filtered_short_entry_runs"] += 1
                     st["consec_entry_true"] = 0
 
                 if st["consec_entry_true"] >= st["entry_persistence_days"]:
                     st["state"] = "cooldown" if st["min_hold_days"] > 0 else "monitoring"
                     st["activated_day_idx"] = day_idx
                     st["consec_exit_true"] = 0
+                    stats["n_activations"] += 1
+                    stats["active_days"] += 1
                     active.append(name)
 
             elif st["state"] == "cooldown":
-                # Active but in cooldown — don't check exit yet.
-                # Persistence does not apply during cooldown either.
+                if _evaluate_regime(rc, values):
+                    stats["raw_entry_met_days"] += 1
                 days_held = day_idx - st["activated_day_idx"]
                 active.append(name)
+                stats["active_days"] += 1
                 if days_held >= st["min_hold_days"]:
                     st["state"] = "monitoring"
 
             elif st["state"] == "monitoring":
-                # Active and past cooldown — check exit with persistence.
+                if _evaluate_regime(rc, values):
+                    stats["raw_entry_met_days"] += 1
                 if _evaluate_regime_exit(rc, values):
                     st["consec_exit_true"] += 1
                 else:
@@ -355,12 +382,14 @@ def evaluate_regime_series(start: str, end: str, regime_configs: list[dict],
                     st["state"] = "inactive"
                     st["activated_day_idx"] = None
                     st["consec_entry_true"] = 0
+                    stats["n_deactivations"] += 1
                 else:
                     active.append(name)
+                    stats["active_days"] += 1
 
         result[date] = active
 
-    return result
+    return result, persistence_stats
 
 
 def get_regime_details(date: str, regime_configs: list[dict], conn=None) -> dict:

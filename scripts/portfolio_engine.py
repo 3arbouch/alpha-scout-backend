@@ -41,7 +41,7 @@ from backtest_engine import (
     run_backtest, load_strategy, validate_strategy, compute_benchmark,
     stamp_strategy_id, get_connection, build_price_index, resolve_universe,
 )
-from regime import evaluate_regime_series
+from regime import evaluate_regime_series, evaluate_regime_series_with_stats
 
 # ---------------------------------------------------------------------------
 # Config
@@ -266,20 +266,29 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
     bt_start = bt_config["start"]
     bt_end = bt_config["end"]
     initial_capital = bt_config.get("initial_capital", 1000000)
-    # Allocation transition smoothing. Legacy `transition_days` is symmetric
-    # (same speed in both directions). New asymmetric form lets users derisk
-    # fast and redeploy slowly (or vice-versa) by setting one or both of
-    # transition_days_to_defensive / transition_days_to_offensive.
+    # Smoothing defaults are dispatched on the config's schema_version.
+    # v1 (or missing): legacy behavior — persistence=1, no asymmetric transitions.
+    #                  Existing pre-feature configs in the DB have no schema_version
+    #                  and inherit this set, preserving their historical behavior.
+    # v2: smoothing on — persistence=3/3, td_to_defensive=1, td_to_offensive=3.
+    # Explicit fields on the config always override the version's defaults.
+    schema_version = int(portfolio_config.get("schema_version", 1) or 1)
+    if schema_version >= 2:
+        _DEFAULT_ENTRY_PERSIST = 3
+        _DEFAULT_EXIT_PERSIST = 3
+        _DEFAULT_TD_DEF = 1
+        _DEFAULT_TD_OFF = 3
+    else:
+        _DEFAULT_ENTRY_PERSIST = 1
+        _DEFAULT_EXIT_PERSIST = 1
+        _DEFAULT_TD_DEF = None
+        _DEFAULT_TD_OFF = None
+
     transition_days = max(1, portfolio_config.get("transition_days", 1))
-    td_def_raw = portfolio_config.get("transition_days_to_defensive")
-    td_off_raw = portfolio_config.get("transition_days_to_offensive")
+    td_def_raw = portfolio_config.get("transition_days_to_defensive", _DEFAULT_TD_DEF)
+    td_off_raw = portfolio_config.get("transition_days_to_offensive", _DEFAULT_TD_OFF)
     transition_days_to_defensive = max(1, int(td_def_raw)) if td_def_raw is not None else None
     transition_days_to_offensive = max(1, int(td_off_raw)) if td_off_raw is not None else None
-    if (transition_days_to_defensive is not None or transition_days_to_offensive is not None) and \
-            portfolio_config.get("transition_days") not in (None, 1):
-        print("  WARN: both legacy `transition_days` and asymmetric "
-              "`transition_days_to_defensive`/`_to_offensive` set; the "
-              "asymmetric values take precedence.")
     asymmetric_active = (transition_days_to_defensive is not None or
                          transition_days_to_offensive is not None)
     transition_label = (
@@ -338,6 +347,7 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
     # Step 2: Pre-compute regime series (if regime gating is enabled)
     # -----------------------------------------------------------------------
     regime_series = {}  # {date: [active_regime_names]}
+    regime_persistence_stats = {}  # {regime_name: {entry_persistence_days, raw_entry_met_days, active_days, n_activations, ...}}
     regime_id_to_name = {}  # {regime_id: regime_name}
     all_regime_ids = set()
 
@@ -395,8 +405,17 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
                 regime_configs.extend(db_configs)
                 regime_id_to_name.update(db_id_to_name)
 
+            # Stamp version-aware persistence defaults onto each regime config
+            # before evaluation, so v2 strategies get persistence=3/3 even if
+            # the regime didn't explicitly declare it. Explicit values win.
+            for rc in regime_configs:
+                rc.setdefault("entry_persistence_days", _DEFAULT_ENTRY_PERSIST)
+                rc.setdefault("exit_persistence_days", _DEFAULT_EXIT_PERSIST)
+
             print(f"  Computing regime series {bt_start} to {bt_end}...")
-            regime_series = evaluate_regime_series(bt_start, bt_end, regime_configs)
+            regime_series, regime_persistence_stats = evaluate_regime_series_with_stats(
+                bt_start, bt_end, regime_configs
+            )
             
             # Count active days per regime
             from collections import Counter
@@ -1233,6 +1252,20 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
         if len(transitions) > 20:
             print(f"    ... and {len(transitions) - 20} more")
 
+    # Build a compact smoothing_summary block from raw counters + transition log.
+    # This is the diagnostic surface the auto-trader agent reads next iteration
+    # to decide whether the smoothing knobs (regime persistence + asymmetric
+    # transition_days) actually filtered events / shaped exposure.
+    smoothing_summary = _build_smoothing_summary(
+        regime_persistence_stats=regime_persistence_stats,
+        allocation_profile_history=allocation_profile_history,
+        sleeves=sleeves,
+        transition_days_legacy=transition_days,
+        transition_days_to_defensive=transition_days_to_defensive,
+        transition_days_to_offensive=transition_days_to_offensive,
+        n_trading_days=len(combined_nav_history),
+    )
+
     return {
         "portfolio": name,
         "portfolio_id": compute_portfolio_id(portfolio_config),
@@ -1244,10 +1277,101 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
         "combined_nav_history": combined_nav_history,
         "regime_history": regime_history,
         "allocation_profile_history": allocation_profile_history,
+        "smoothing_summary": smoothing_summary,
         # Benchmarks
         "benchmark": benchmark,                          # legacy: primary benchmark (sector if available, else market)
         "benchmark_market": market_benchmark,            # always SPY time series + metrics
         "benchmark_sector": sector_benchmark,            # sector ETF time series (None if multi-sector)
+    }
+
+
+def _build_smoothing_summary(*, regime_persistence_stats, allocation_profile_history,
+                             sleeves, transition_days_legacy,
+                             transition_days_to_defensive, transition_days_to_offensive,
+                             n_trading_days):
+    """Compose a small diagnostic block summarizing the smoothing knobs' effect.
+
+    Shape (always present; counts are zero / lists empty when smoothing is off):
+        {
+            "regime_persistence": {
+                <regime_name>: {entry_persistence_days, exit_persistence_days,
+                                raw_entry_met_days, active_days, n_activations,
+                                n_deactivations, filtered_short_entry_runs}
+            },
+            "transition_lerp": {
+                "asymmetric": bool, "transition_days_legacy": int,
+                "transition_days_to_defensive": int|None,
+                "transition_days_to_offensive": int|None,
+                "n_transitions_total": int,
+                "n_transitions_defensive": int,
+                "n_transitions_offensive": int,
+                "n_transitions_lateral": int,
+                "lerp_days_active": int,
+                "lerp_days_settled": int,
+            }
+        }
+    Direction is inferred from each transition event's profile target weights.
+    """
+    # ----- Regime persistence block -----
+    regime_block = {}
+    for name, st in (regime_persistence_stats or {}).items():
+        regime_block[name] = {
+            "entry_persistence_days": st.get("entry_persistence_days", 1),
+            "exit_persistence_days": st.get("exit_persistence_days", 1),
+            "raw_entry_met_days": st.get("raw_entry_met_days", 0),
+            "active_days": st.get("active_days", 0),
+            "n_activations": st.get("n_activations", 0),
+            "n_deactivations": st.get("n_deactivations", 0),
+            "filtered_short_entry_runs": st.get("filtered_short_entry_runs", 0),
+        }
+
+    # ----- Transition lerp block -----
+    n_def = n_off = n_lat = 0
+    lerp_days_active = 0
+    asymmetric = (transition_days_to_defensive is not None
+                  or transition_days_to_offensive is not None)
+
+    def _equity(weights):
+        return sum(w for k, w in (weights or {}).items() if k.lower() != "cash")
+
+    prev_target_weights = None
+    for ev in (allocation_profile_history or []):
+        target_weights = ev.get("weights") or {}
+        from_weights = ev.get("from_weights") or prev_target_weights
+        if from_weights is not None:
+            eq_from = _equity(from_weights)
+            eq_to = _equity(target_weights)
+            if eq_to < eq_from:
+                n_def += 1
+            elif eq_to > eq_from:
+                n_off += 1
+            else:
+                n_lat += 1
+        # Sum lerp days from "gradual over N days" markers.
+        tdesc = ev.get("transition") or ""
+        if "gradual over" in tdesc:
+            try:
+                lerp_days_active += int(tdesc.split()[2])
+            except (IndexError, ValueError):
+                pass
+        prev_target_weights = target_weights
+
+    transition_block = {
+        "asymmetric": asymmetric,
+        "transition_days_legacy": transition_days_legacy,
+        "transition_days_to_defensive": transition_days_to_defensive,
+        "transition_days_to_offensive": transition_days_to_offensive,
+        "n_transitions_total": len(allocation_profile_history or []),
+        "n_transitions_defensive": n_def,
+        "n_transitions_offensive": n_off,
+        "n_transitions_lateral": n_lat,
+        "lerp_days_active": min(lerp_days_active, n_trading_days),
+        "lerp_days_settled": max(0, n_trading_days - lerp_days_active),
+    }
+
+    return {
+        "regime_persistence": regime_block,
+        "transition_lerp": transition_block,
     }
 
 
