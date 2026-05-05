@@ -54,6 +54,7 @@ def log_experiment(
     error: str = None,
     portfolio_id: str = None,
     lessons: str = None,
+    smoothing_summary: dict = None,
 ) -> str:
     """Log a single experiment. Returns the experiment ID.
 
@@ -83,8 +84,9 @@ def log_experiment(
             profit_factor, win_rate_pct, total_trades,
             decision, best_value_so_far, improvement_pct,
             backtest_start, backtest_end, initial_capital,
-            model, session_id, tokens_used, duration_seconds, error, created_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            model, session_id, tokens_used, duration_seconds, error,
+            smoothing_summary, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (exp_id, run_id, iteration,
          thesis, json.dumps(assumptions), lessons, portfolio_id, json.dumps(portfolio_config),
          target_metric, target_value, json.dumps(conditions), 1 if conditions_met else 0,
@@ -103,7 +105,8 @@ def log_experiment(
          metrics.get("win_rate_pct"), metrics.get("total_trades"),
          decision, best_value_so_far, improvement,
          backtest_start, backtest_end, initial_capital,
-         model, session_id, tokens_used, duration_seconds, error, now),
+         model, session_id, tokens_used, duration_seconds, error,
+         json.dumps(smoothing_summary) if smoothing_summary else None, now),
     )
     conn.commit()
     conn.close()
@@ -118,7 +121,8 @@ def get_experiment_history(run_id: str, limit: int = 20) -> list[dict]:
                   target_metric, target_value, conditions_met,
                   sharpe_ratio, alpha_ann_pct, annualized_volatility_pct,
                   max_drawdown_pct, total_return_pct, annualized_return_pct,
-                  decision, best_value_so_far, improvement_pct, error
+                  decision, best_value_so_far, improvement_pct, error,
+                  smoothing_summary
            FROM experiments
            WHERE run_id = ?
            ORDER BY iteration DESC

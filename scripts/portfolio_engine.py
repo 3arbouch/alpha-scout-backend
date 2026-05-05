@@ -41,7 +41,7 @@ from backtest_engine import (
     run_backtest, load_strategy, validate_strategy, compute_benchmark,
     stamp_strategy_id, get_connection, build_price_index, resolve_universe,
 )
-from regime import evaluate_regime_series
+from regime import evaluate_regime_series, evaluate_regime_series_with_stats
 
 # ---------------------------------------------------------------------------
 # Config
@@ -266,12 +266,42 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
     bt_start = bt_config["start"]
     bt_end = bt_config["end"]
     initial_capital = bt_config.get("initial_capital", 1000000)
+    # Smoothing defaults are dispatched on the config's schema_version.
+    # v1 (or missing): legacy behavior — persistence=1, no asymmetric transitions.
+    #                  Existing pre-feature configs in the DB have no schema_version
+    #                  and inherit this set, preserving their historical behavior.
+    # v2: smoothing on — persistence=3/3, td_to_defensive=1, td_to_offensive=3.
+    # Explicit fields on the config always override the version's defaults.
+    schema_version = int(portfolio_config.get("schema_version", 1) or 1)
+    if schema_version >= 2:
+        _DEFAULT_ENTRY_PERSIST = 3
+        _DEFAULT_EXIT_PERSIST = 3
+        _DEFAULT_TD_DEF = 1
+        _DEFAULT_TD_OFF = 3
+    else:
+        _DEFAULT_ENTRY_PERSIST = 1
+        _DEFAULT_EXIT_PERSIST = 1
+        _DEFAULT_TD_DEF = None
+        _DEFAULT_TD_OFF = None
+
     transition_days = max(1, portfolio_config.get("transition_days", 1))
+    td_def_raw = portfolio_config.get("transition_days_to_defensive", _DEFAULT_TD_DEF)
+    td_off_raw = portfolio_config.get("transition_days_to_offensive", _DEFAULT_TD_OFF)
+    transition_days_to_defensive = max(1, int(td_def_raw)) if td_def_raw is not None else None
+    transition_days_to_offensive = max(1, int(td_off_raw)) if td_off_raw is not None else None
+    asymmetric_active = (transition_days_to_defensive is not None or
+                         transition_days_to_offensive is not None)
+    transition_label = (
+        f"to_defensive={transition_days_to_defensive or transition_days}d/"
+        f"to_offensive={transition_days_to_offensive or transition_days}d"
+        if asymmetric_active
+        else f"{transition_days}d"
+    )
 
     print(f"=" * 70)
     print(f"PORTFOLIO BACKTEST: {name}")
     print(f"Capital: ${initial_capital:,.0f} | Period: {bt_start} to {bt_end}")
-    print(f"Regime filter: {'ON' if regime_enabled else 'OFF'} | Capital flow: {capital_flow} | Transition: {transition_days}d")
+    print(f"Regime filter: {'ON' if regime_enabled else 'OFF'} | Capital flow: {capital_flow} | Transition: {transition_label}")
     print(f"=" * 70)
 
     # -----------------------------------------------------------------------
@@ -317,6 +347,7 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
     # Step 2: Pre-compute regime series (if regime gating is enabled)
     # -----------------------------------------------------------------------
     regime_series = {}  # {date: [active_regime_names]}
+    regime_persistence_stats = {}  # {regime_name: {entry_persistence_days, raw_entry_met_days, active_days, n_activations, ...}}
     regime_id_to_name = {}  # {regime_id: regime_name}
     all_regime_ids = set()
 
@@ -374,8 +405,17 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
                 regime_configs.extend(db_configs)
                 regime_id_to_name.update(db_id_to_name)
 
+            # Stamp version-aware persistence defaults onto each regime config
+            # before evaluation, so v2 strategies get persistence=3/3 even if
+            # the regime didn't explicitly declare it. Explicit values win.
+            for rc in regime_configs:
+                rc.setdefault("entry_persistence_days", _DEFAULT_ENTRY_PERSIST)
+                rc.setdefault("exit_persistence_days", _DEFAULT_EXIT_PERSIST)
+
             print(f"  Computing regime series {bt_start} to {bt_end}...")
-            regime_series = evaluate_regime_series(bt_start, bt_end, regime_configs)
+            regime_series, regime_persistence_stats = evaluate_regime_series_with_stats(
+                bt_start, bt_end, regime_configs
+            )
             
             # Count active days per regime
             from collections import Counter
@@ -517,15 +557,38 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
     all_dates_index = {d: idx for idx, d in enumerate(all_dates)}
 
     # --- Transition state for gradual profile switches ---
-    # When transition_days > 1, we lerp weights from old profile to new over N days.
+    # When transition_days > 1 (or asymmetric variants resolve >1), we lerp
+    # weights from old profile to new over N days. `effective_days` is the
+    # per-flip lerp duration: with the symmetric legacy field it's the same
+    # for every flip; with the asymmetric variant it's chosen at flip time
+    # based on direction (defensive vs. offensive).
     transition_state = {
-        "active": False,          # currently transitioning?
-        "from_weights": None,     # {label: weight} at transition start
-        "to_weights": None,       # {label: weight} target
-        "start_idx": 0,           # index in all_dates where transition began
-        "end_idx": 0,             # index where transition completes
-        "target_profile": None,   # name of target profile
+        "active": False,
+        "from_weights": None,
+        "to_weights": None,
+        "start_idx": 0,
+        "end_idx": 0,
+        "effective_days": transition_days,
+        "target_profile": None,
     }
+
+    def _equity_weight(weights: dict[str, float]) -> float:
+        """Sum of weights for non-Cash sleeves. The 'Cash' label is the
+        convention for unallocated capital in allocation_profiles."""
+        return sum(w for k, w in (weights or {}).items() if k.lower() != "cash")
+
+    def _resolve_transition_days(from_weights, to_weights):
+        """Pick the lerp duration for THIS flip based on direction."""
+        if not asymmetric_active:
+            return transition_days
+        eq_from = _equity_weight(from_weights)
+        eq_to = _equity_weight(to_weights)
+        if eq_to < eq_from:
+            return transition_days_to_defensive or transition_days
+        if eq_to > eq_from:
+            return transition_days_to_offensive or transition_days
+        # Equal equity weight — fall back to legacy.
+        return transition_days
 
     def _get_effective_weights(date_idx, target_profile_name, target_weights, sleeve_labels):
         """
@@ -534,31 +597,22 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
         """
         nonlocal prev_profile_name
 
-        if transition_days <= 1:
-            # Instant mode (legacy behavior)
-            if target_profile_name != prev_profile_name:
-                prev_profile_name = target_profile_name
-                allocation_profile_history.append({
-                    "date": all_dates[date_idx],
-                    "profile_name": target_profile_name,
-                    "weights": target_weights,
-                })
-            return target_weights
-
-        # Check if target profile changed (new transition needed)
+        # Has the target profile changed since we last set up a transition?
         if target_profile_name != transition_state.get("target_profile"):
-            # Determine starting weights: if mid-transition, use current interpolated weights
+            # Determine starting weights for the new transition.
             if transition_state["active"]:
-                progress = min(1.0, (date_idx - transition_state["start_idx"]) / max(transition_days, 1))
+                # Mid-transition retarget: snapshot the currently-interpolated
+                # weights as the new "from".
+                eff = max(1, transition_state["effective_days"])
+                progress = min(1.0, (date_idx - transition_state["start_idx"]) / eff)
                 from_w = transition_state["from_weights"]
                 to_w = transition_state["to_weights"]
-                current_weights = {}
-                for lbl in sleeve_labels:
-                    w0 = from_w.get(lbl, 0.0)
-                    w1 = to_w.get(lbl, 0.0)
-                    current_weights[lbl] = w0 + (w1 - w0) * progress
+                current_weights = {
+                    lbl: from_w.get(lbl, 0.0)
+                         + (to_w.get(lbl, 0.0) - from_w.get(lbl, 0.0)) * progress
+                    for lbl in sleeve_labels
+                }
             elif prev_profile_name and allocation_profiles:
-                # Use the previous settled profile's weights
                 prev_def = allocation_profiles.get(prev_profile_name, {})
                 if prev_profile_name == "default":
                     current_weights = {lbl: prev_def.get(lbl, 0.0) for lbl in sleeve_labels}
@@ -566,7 +620,7 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
                     pw = prev_def.get("weights", prev_def)
                     current_weights = {lbl: pw.get(lbl, 0.0) for lbl in sleeve_labels}
             else:
-                # First profile — no transition, apply directly
+                # First profile of the run — apply target directly, no lerp.
                 prev_profile_name = target_profile_name
                 allocation_profile_history.append({
                     "date": all_dates[date_idx],
@@ -576,41 +630,64 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
                 })
                 transition_state["target_profile"] = target_profile_name
                 transition_state["active"] = False
+                transition_state["to_weights"] = target_weights
                 return target_weights
 
+            # Pick this flip's lerp duration based on direction.
+            effective_days = _resolve_transition_days(current_weights, target_weights)
+
+            if effective_days <= 1:
+                # Instant snap (or asymmetric=fast in this direction).
+                allocation_profile_history.append({
+                    "date": all_dates[date_idx],
+                    "profile_name": target_profile_name,
+                    "weights": target_weights,
+                    "transition": "instant",
+                    "from_weights": current_weights,
+                })
+                prev_profile_name = target_profile_name
+                transition_state["target_profile"] = target_profile_name
+                transition_state["active"] = False
+                transition_state["to_weights"] = target_weights
+                return target_weights
+
+            # Begin gradual lerp over effective_days.
             transition_state["active"] = True
             transition_state["from_weights"] = current_weights
             transition_state["to_weights"] = target_weights
             transition_state["start_idx"] = date_idx
-            transition_state["end_idx"] = date_idx + transition_days
+            transition_state["end_idx"] = date_idx + effective_days
+            transition_state["effective_days"] = effective_days
             transition_state["target_profile"] = target_profile_name
-
             allocation_profile_history.append({
                 "date": all_dates[date_idx],
                 "profile_name": target_profile_name,
                 "weights": target_weights,
-                "transition": f"gradual over {transition_days} days",
+                "transition": f"gradual over {effective_days} days",
                 "from_weights": current_weights,
             })
             prev_profile_name = target_profile_name
 
-        # Compute interpolated weights
+        # Compute interpolated weights for today.
         if transition_state["active"]:
+            eff = max(1, transition_state["effective_days"])
             elapsed = date_idx - transition_state["start_idx"]
-            progress = min(1.0, elapsed / transition_days)
-
+            progress = min(1.0, elapsed / eff)
             if progress >= 1.0:
                 transition_state["active"] = False
                 return transition_state["to_weights"]
-
             from_w = transition_state["from_weights"]
             to_w = transition_state["to_weights"]
-            blended = {}
-            for lbl in sleeve_labels:
-                w0 = from_w.get(lbl, 0.0)
-                w1 = to_w.get(lbl, 0.0)
-                blended[lbl] = w0 + (w1 - w0) * progress
-            return blended
+            return {
+                lbl: from_w.get(lbl, 0.0)
+                     + (to_w.get(lbl, 0.0) - from_w.get(lbl, 0.0)) * progress
+                for lbl in sleeve_labels
+            }
+
+        # Settled at the current target — return its weights. (Previously the
+        # function fell off the end here and returned None, which silently
+        # reverted to static sleeve weights for any settled-non-default day.)
+        return transition_state.get("to_weights") or target_weights
 
         return target_weights
 
@@ -1175,6 +1252,20 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
         if len(transitions) > 20:
             print(f"    ... and {len(transitions) - 20} more")
 
+    # Build a compact smoothing_summary block from raw counters + transition log.
+    # This is the diagnostic surface the auto-trader agent reads next iteration
+    # to decide whether the smoothing knobs (regime persistence + asymmetric
+    # transition_days) actually filtered events / shaped exposure.
+    smoothing_summary = _build_smoothing_summary(
+        regime_persistence_stats=regime_persistence_stats,
+        allocation_profile_history=allocation_profile_history,
+        sleeves=sleeves,
+        transition_days_legacy=transition_days,
+        transition_days_to_defensive=transition_days_to_defensive,
+        transition_days_to_offensive=transition_days_to_offensive,
+        n_trading_days=len(combined_nav_history),
+    )
+
     return {
         "portfolio": name,
         "portfolio_id": compute_portfolio_id(portfolio_config),
@@ -1186,10 +1277,101 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
         "combined_nav_history": combined_nav_history,
         "regime_history": regime_history,
         "allocation_profile_history": allocation_profile_history,
+        "smoothing_summary": smoothing_summary,
         # Benchmarks
         "benchmark": benchmark,                          # legacy: primary benchmark (sector if available, else market)
         "benchmark_market": market_benchmark,            # always SPY time series + metrics
         "benchmark_sector": sector_benchmark,            # sector ETF time series (None if multi-sector)
+    }
+
+
+def _build_smoothing_summary(*, regime_persistence_stats, allocation_profile_history,
+                             sleeves, transition_days_legacy,
+                             transition_days_to_defensive, transition_days_to_offensive,
+                             n_trading_days):
+    """Compose a small diagnostic block summarizing the smoothing knobs' effect.
+
+    Shape (always present; counts are zero / lists empty when smoothing is off):
+        {
+            "regime_persistence": {
+                <regime_name>: {entry_persistence_days, exit_persistence_days,
+                                raw_entry_met_days, active_days, n_activations,
+                                n_deactivations, filtered_short_entry_runs}
+            },
+            "transition_lerp": {
+                "asymmetric": bool, "transition_days_legacy": int,
+                "transition_days_to_defensive": int|None,
+                "transition_days_to_offensive": int|None,
+                "n_transitions_total": int,
+                "n_transitions_defensive": int,
+                "n_transitions_offensive": int,
+                "n_transitions_lateral": int,
+                "lerp_days_active": int,
+                "lerp_days_settled": int,
+            }
+        }
+    Direction is inferred from each transition event's profile target weights.
+    """
+    # ----- Regime persistence block -----
+    regime_block = {}
+    for name, st in (regime_persistence_stats or {}).items():
+        regime_block[name] = {
+            "entry_persistence_days": st.get("entry_persistence_days", 1),
+            "exit_persistence_days": st.get("exit_persistence_days", 1),
+            "raw_entry_met_days": st.get("raw_entry_met_days", 0),
+            "active_days": st.get("active_days", 0),
+            "n_activations": st.get("n_activations", 0),
+            "n_deactivations": st.get("n_deactivations", 0),
+            "filtered_short_entry_runs": st.get("filtered_short_entry_runs", 0),
+        }
+
+    # ----- Transition lerp block -----
+    n_def = n_off = n_lat = 0
+    lerp_days_active = 0
+    asymmetric = (transition_days_to_defensive is not None
+                  or transition_days_to_offensive is not None)
+
+    def _equity(weights):
+        return sum(w for k, w in (weights or {}).items() if k.lower() != "cash")
+
+    prev_target_weights = None
+    for ev in (allocation_profile_history or []):
+        target_weights = ev.get("weights") or {}
+        from_weights = ev.get("from_weights") or prev_target_weights
+        if from_weights is not None:
+            eq_from = _equity(from_weights)
+            eq_to = _equity(target_weights)
+            if eq_to < eq_from:
+                n_def += 1
+            elif eq_to > eq_from:
+                n_off += 1
+            else:
+                n_lat += 1
+        # Sum lerp days from "gradual over N days" markers.
+        tdesc = ev.get("transition") or ""
+        if "gradual over" in tdesc:
+            try:
+                lerp_days_active += int(tdesc.split()[2])
+            except (IndexError, ValueError):
+                pass
+        prev_target_weights = target_weights
+
+    transition_block = {
+        "asymmetric": asymmetric,
+        "transition_days_legacy": transition_days_legacy,
+        "transition_days_to_defensive": transition_days_to_defensive,
+        "transition_days_to_offensive": transition_days_to_offensive,
+        "n_transitions_total": len(allocation_profile_history or []),
+        "n_transitions_defensive": n_def,
+        "n_transitions_offensive": n_off,
+        "n_transitions_lateral": n_lat,
+        "lerp_days_active": min(lerp_days_active, n_trading_days),
+        "lerp_days_settled": max(0, n_trading_days - lerp_days_active),
+    }
+
+    return {
+        "regime_persistence": regime_block,
+        "transition_lerp": transition_block,
     }
 
 

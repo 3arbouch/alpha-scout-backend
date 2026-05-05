@@ -229,7 +229,14 @@ async def query_market_data_tool(args: dict[str, Any]) -> dict[str, Any]:
     "validate_portfolio",
     "Validate a portfolio configuration against the backtest engine schema. "
     "Call this with your complete portfolio config JSON BEFORE outputting your final <thesis>. "
-    "Returns {valid: true} if correct, or {valid: false, error: '...'} with the exact issue to fix.",
+    "Returns {valid: true} if correct, or {valid: false, error: '...'} with the exact issue to fix. "
+    "Smoothing knobs (auto-applied at schema_version 2): each regime in "
+    "regime_definitions accepts entry_persistence_days / exit_persistence_days "
+    "(v2 default 3 each) — consecutive days of confirming evidence required before "
+    "activate/deactivate; filters short-lived spikes at the source. Portfolio-level "
+    "transition_days_to_defensive (v2 default 1, fast escape) / "
+    "transition_days_to_offensive (v2 default 3, patient redeployment) replace the "
+    "symmetric transition_days; direction is compared on non-Cash weight.",
     {"config": dict},
 )
 async def validate_portfolio_tool(args: dict[str, Any]) -> dict[str, Any]:
