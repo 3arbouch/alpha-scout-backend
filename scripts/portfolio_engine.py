@@ -307,9 +307,28 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
     # -----------------------------------------------------------------------
     # Step 1: Resolve all strategy configs and set their capital allocation
     # -----------------------------------------------------------------------
+    # When allocation_profiles are present, the sleeve's static `weight` is
+    # used at runtime only as a fallback (when no profile matches). The
+    # day-by-day exposure comes from the active profile, which can take any
+    # sleeve to 0% or 100% regardless of its static weight. So a sleeve with
+    # static weight=0 is a valid "dormant in default, activated in some
+    # profile" pattern. To support that, we run every sleeve's standalone
+    # backtest at FULL initial_capital when allocation_profiles is present —
+    # the math layer's daily-weight overlay handles the actual exposure,
+    # and rebalance trade emission remains numerically correct (the dollar
+    # delta is set by incremental_nav × day_weight, independent of the
+    # sleeve's standalone allocated_capital). Without allocation_profiles
+    # (fixed-weight mode), allocated_capital = initial_capital × weight as
+    # before, since the combined NAV is the sum of sleeve NAVs at their
+    # declared shares.
+    has_allocation_profiles = bool(portfolio_config.get("allocation_profiles"))
+
     sleeves = []
     total_weight = sum(s["weight"] for s in strategies_refs)
-    if abs(total_weight - 1.0) > 0.01:
+    if not has_allocation_profiles and abs(total_weight - 1.0) > 0.01:
+        # Only enforce-and-normalize sleeve weights when running in fixed-
+        # weight mode. With allocation_profiles, sleeve.weight is largely
+        # symbolic; profile weights are the truth.
         print(f"WARNING: Strategy weights sum to {total_weight:.2f}, not 1.0. Normalizing.")
         for s in strategies_refs:
             s["weight"] = s["weight"] / total_weight
@@ -319,7 +338,13 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
         label = ref.get("label", config.get("name", f"Strategy {i+1}"))
         weight = ref["weight"]
         regime_gate = ref.get("regime_gate", ["*"])
-        allocated_capital = initial_capital * weight
+        if has_allocation_profiles:
+            # Run every sleeve at full initial_capital so dormant (weight=0)
+            # sleeves still have a meaningful standalone simulation. Day-by-
+            # day exposure is governed by the active allocation profile.
+            allocated_capital = initial_capital
+        else:
+            allocated_capital = initial_capital * weight
 
         # Override the strategy's backtest range and capital
         config["backtest"] = {

@@ -2620,6 +2620,34 @@ def compute_metrics(portfolio: Portfolio, initial_cash: float,
     if not nav_series:
         return {}
 
+    # Defensive guard: zero-cash sleeve produces final_nav=0, initial_cash=0.
+    # Returns are undefined; emit a safe-zero metric block so the portfolio
+    # engine doesn't crash on multi-sleeve configs that include a dormant
+    # sleeve with weight=0 and no allocation_profile activating it.
+    if initial_cash <= 0:
+        return {
+            "total_return_pct": 0.0,
+            "annualized_return_pct": None,
+            "annualized_volatility_pct": None,
+            "sharpe_ratio": None,
+            "sharpe_ratio_annualized": None,
+            "sharpe_ratio_period": None,
+            "sharpe_basis": None,
+            "sortino_ratio": None,
+            "max_drawdown_pct": 0.0,
+            "max_drawdown_date": "",
+            "final_nav": 0.0,
+            "trading_days": len(nav_series),
+            "total_trades": 0,
+            "win_rate_pct": None,
+            "profit_factor": None,
+            "total_entries": 0,
+            "closed_trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "_note": "zero initial_cash — empty-portfolio safe metrics",
+        }
+
     final_nav = nav_series[-1]["nav"]
     total_return = ((final_nav - initial_cash) / initial_cash) * 100
 
