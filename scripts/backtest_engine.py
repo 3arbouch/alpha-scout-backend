@@ -125,10 +125,30 @@ VALID_TRIGGER_TYPES = [
     "feature_threshold", "feature_percentile", "days_to_earnings", "analyst_upgrades",
 ]
 
-# Features available in features_daily (same list as scripts/features.py FEATURE_COLUMNS)
+# Features available in features_daily.
+# Reads pre-computed point-in-time feature values from market.db.features_daily.
+# All features have ≥90% coverage from 2015-01-02 onward.
 FEATURE_COLUMNS = (
+    # Valuation (5)
     "pe", "ps", "p_b", "ev_ebitda", "ev_sales",
-    "fcf_yield", "div_yield", "eps_yoy", "rev_yoy",
+    # Yield (2)
+    "fcf_yield", "div_yield",
+    # Growth (2)
+    "eps_yoy", "rev_yoy",
+    # Quality — current margins (3)
+    "gross_margin", "op_margin", "net_margin",
+    # Quality — margin trajectory (op + net only; gross_margin_yoy_delta not ingested)
+    "op_margin_yoy_delta", "net_margin_yoy_delta",
+    # Growth acceleration (2)
+    "rev_yoy_accel", "eps_yoy_accel",
+    # Balance-sheet quality (3)
+    "roe", "roic", "debt_to_equity",
+    # Returns / momentum (5)
+    "ret_1m", "ret_3m", "ret_6m", "ret_12m", "ret_12_1m",
+    # Analyst flow (2)
+    "analyst_net_upgrades_30d", "analyst_net_upgrades_90d",
+    # Calendar / event (3)
+    "days_since_last_earnings", "days_to_next_earnings", "pre_earnings_window_5d",
 )
 VALID_STOP_TYPES = ["drawdown_from_entry", "fundamental"]
 VALID_TP_TYPES = ["gain_from_entry", "above_peak", "target_price"]

@@ -147,15 +147,45 @@ class AlwaysCondition(BaseModel):
 # queryable via `data-query` so agent research and engine execution agree.
 # ---------------------------------------------------------------------------
 FeatureName = Literal[
+    # --- Valuation ---
     "pe",          # market_cap / TTM net_income
     "ps",          # market_cap / TTM revenue
     "p_b",         # market_cap / total_equity
     "ev_ebitda",   # (market_cap + net_debt) / TTM ebitda
     "ev_sales",    # (market_cap + net_debt) / TTM revenue
+    # --- Yield ---
     "fcf_yield",   # TTM free_cash_flow / market_cap, percent
     "div_yield",   # TTM |dividends_paid| / market_cap, percent
+    # --- Growth ---
     "eps_yoy",     # latest Q eps_diluted vs same-Q prior year, percent
     "rev_yoy",     # latest Q revenue vs same-Q prior year, percent
+    # --- Quality (current margins, percent) ---
+    "gross_margin",  # TTM gross_profit / TTM revenue × 100
+    "op_margin",     # TTM operating_income / TTM revenue × 100
+    "net_margin",    # TTM net_income / TTM revenue × 100
+    # --- Quality (margin trajectory) ---
+    "op_margin_yoy_delta",   # current op_margin minus same-Q prior year, percentage points
+    "net_margin_yoy_delta",  # current net_margin minus same-Q prior year, percentage points
+    # --- Growth acceleration ---
+    "rev_yoy_accel",  # latest rev_yoy minus prior-quarter rev_yoy, percentage points
+    "eps_yoy_accel",  # latest eps_yoy minus prior-quarter eps_yoy, percentage points
+    # --- Balance-sheet quality ---
+    "roe",            # TTM net_income / total_equity × 100, percent
+    "roic",           # TTM operating_income / (total_equity + total_debt) × 100, percent — proxy (no tax adjustment)
+    "debt_to_equity", # total_debt / total_equity, ratio
+    # --- Returns / momentum (point-in-time, percent) ---
+    "ret_1m",         # 21-trading-day total return
+    "ret_3m",         # 63-trading-day total return
+    "ret_6m",         # 126-trading-day total return
+    "ret_12m",        # 252-trading-day total return
+    "ret_12_1m",      # 12-month return excluding the most recent month — "Asness momentum"
+    # --- Analyst flow ---
+    "analyst_net_upgrades_30d",  # net analyst upgrades minus downgrades over trailing 30 days
+    "analyst_net_upgrades_90d",  # same over trailing 90 days
+    # --- Calendar / event ---
+    "days_since_last_earnings",  # trading days since last reported earnings
+    "days_to_next_earnings",     # trading days until next expected earnings (None if unknown)
+    "pre_earnings_window_5d",    # 1 if days_to_next_earnings ≤ 5, else 0
 ]
 
 
