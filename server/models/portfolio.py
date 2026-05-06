@@ -105,18 +105,11 @@ class InlineRegimeDefinition(BaseModel):
 class PortfolioConfig(BaseModel):
     """Complete portfolio definition.
 
-    `schema_version` controls which DEFAULT-SET the engine applies for the
-    smoothing knobs (regime persistence + asymmetric transition_days). Existing
-    configs in the DB have no `schema_version` field and are treated as v1 —
-    legacy defaults: persistence=1, no asymmetric transitions. New configs are
-    constructed at v2 — defaults: persistence=3, td_def=1, td_off=3. Bumping the
-    version in the future re-applies the dispatch without touching stored data.
-    Explicit smoothing fields on a config always win over the version's defaults.
+    Smoothing + rebalance defaults (regime persistence, asymmetric transitions,
+    drift threshold) are applied uniformly to every config by the engine.
+    Explicit fields on the config always win over the defaults. There is no
+    versioning — the latest engine behavior applies to every backtest.
     """
-    schema_version: int = Field(
-        default=3, ge=1,
-        description="Versioned default-set: v1=legacy (no smoothing, no rebalance trades). v2=smoothing on + continuous daily rebalance. v3=smoothing on + threshold-based rebalance (default 5% drift tolerance — institutional standard). Existing pre-v3 configs without this field are treated as their original version.",
-    )
     portfolio_id: str | None = Field(default=None, description="Deterministic hash of core params.")
     name: str = Field(min_length=1)
     sleeves: list[SleeveConfig] = Field(min_length=1)

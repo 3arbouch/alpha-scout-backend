@@ -266,23 +266,13 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
     bt_start = bt_config["start"]
     bt_end = bt_config["end"]
     initial_capital = bt_config.get("initial_capital", 1000000)
-    # Smoothing defaults are dispatched on the config's schema_version.
-    # v1 (or missing): legacy behavior — persistence=1, no asymmetric transitions.
-    #                  Existing pre-feature configs in the DB have no schema_version
-    #                  and inherit this set, preserving their historical behavior.
-    # v2: smoothing on — persistence=3/3, td_to_defensive=1, td_to_offensive=3.
-    # Explicit fields on the config always override the version's defaults.
-    schema_version = int(portfolio_config.get("schema_version", 1) or 1)
-    if schema_version >= 2:
-        _DEFAULT_ENTRY_PERSIST = 3
-        _DEFAULT_EXIT_PERSIST = 3
-        _DEFAULT_TD_DEF = 1
-        _DEFAULT_TD_OFF = 3
-    else:
-        _DEFAULT_ENTRY_PERSIST = 1
-        _DEFAULT_EXIT_PERSIST = 1
-        _DEFAULT_TD_DEF = None
-        _DEFAULT_TD_OFF = None
+    # Universal smoothing + rebalance defaults. Applied to any config that
+    # doesn't explicitly override them. Explicit fields on the config always
+    # win over these defaults.
+    _DEFAULT_ENTRY_PERSIST = 3
+    _DEFAULT_EXIT_PERSIST = 3
+    _DEFAULT_TD_DEF = 1
+    _DEFAULT_TD_OFF = 3
 
     transition_days = max(1, portfolio_config.get("transition_days", 1))
     td_def_raw = portfolio_config.get("transition_days_to_defensive", _DEFAULT_TD_DEF)
@@ -731,7 +721,7 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
     # weighted average of sleeve daily returns according to the current profile.
     incremental_nav = initial_capital  # running portfolio NAV for dynamic mode
 
-    # --- Rebalance trade emission state (v2+ dispatch) ---
+    # --- Rebalance trade emission state ---
     # When allocation_profiles are active, the engine tracks each sleeve's
     # ACTUAL dollar exposure separately from its target exposure. Each day:
     #
@@ -739,30 +729,17 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
     #   target[i]  = realized_nav × day_weights[i]               (today's contract)
     #   drift[i]   = |actual_weight[i] - target_weight[i]|       (relative gap)
     #
+    # WHEN to rebalance:
+    #   - allocation_profiles absent: never (fixed-weight portfolio).
+    #   - allocation_profiles present: when max drift > rebalance_threshold,
+    #     OR the profile target just changed, OR mid-lerp.
+    #
     # On a rebalance day, trades are emitted to bring carried → target,
     # allocated proportionally across currently-held positions. Slippage on
     # the trade dollars is realized as NAV drag.
-    #
-    # WHEN to rebalance:
-    #   v1: never (no allocation_profiles or schema_version=1)
-    #   v2: every day (rebalance_threshold = 0; preserves earlier behavior)
-    #   v3: only when (a) max sleeve drift > rebalance_threshold, or
-    #                  (b) allocation profile target just changed, or
-    #                  (c) the lerp is mid-flight (per-day target moves).
-    #       Default rebalance_threshold for v3 = 0.05 (5% absolute weight drift).
-    #
-    # Rebalance also fires unconditionally during regime transitions and lerps
-    # because the contract itself is changing — that's not "drift correction",
-    # it's "executing the new policy".
     REBALANCE_DOLLAR_TOLERANCE = 1.0  # below this, no trade
-    emit_rebalance_trades = (schema_version >= 2)
-    if schema_version >= 3:
-        _DEFAULT_REBAL_THRESHOLD = 0.05
-    else:
-        _DEFAULT_REBAL_THRESHOLD = 0.0
-    rebalance_threshold = float(portfolio_config.get(
-        "rebalance_threshold", _DEFAULT_REBAL_THRESHOLD
-    ))
+    emit_rebalance_trades = bool(portfolio_config.get("allocation_profiles"))
+    rebalance_threshold = float(portfolio_config.get("rebalance_threshold", 0.05))
     prev_target_dollars = [0.0] * len(sleeves)
     rebalance_trades_by_sleeve = [[] for _ in sleeves]
     cumulative_rebalance_slippage = 0.0
@@ -774,7 +751,7 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
             f"threshold={rebalance_threshold*100:.1f}%"
             if rebalance_threshold > 0 else "continuous"
         )
-        print(f"  Rebalance policy: {threshold_label} (schema_version={schema_version})")
+        print(f"  Rebalance policy: {threshold_label}")
 
     # Helper: compute raw daily return for a sleeve
     def _sleeve_daily_return(i, date, prev_date):
@@ -1461,7 +1438,6 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
             n_rebalance_trades += len(rebalance_trades_by_sleeve[i])
 
     rebalance_summary = {
-        "schema_version": schema_version,
         "rebalance_active": emit_rebalance_trades,
         "rebalance_threshold": rebalance_threshold,
         "n_rebalance_events": rebalance_event_count,

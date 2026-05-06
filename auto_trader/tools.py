@@ -230,15 +230,15 @@ async def query_market_data_tool(args: dict[str, Any]) -> dict[str, Any]:
     "Validate a portfolio configuration against the backtest engine schema. "
     "Call this with your complete portfolio config JSON BEFORE outputting your final <thesis>. "
     "Returns {valid: true} if correct, or {valid: false, error: '...'} with the exact issue to fix. "
-    "Smoothing + rebalance knobs (auto-applied at schema_version 3): each regime "
-    "in regime_definitions accepts entry_persistence_days / exit_persistence_days "
+    "Smoothing + rebalance defaults applied uniformly: each regime in "
+    "regime_definitions accepts entry_persistence_days / exit_persistence_days "
     "(default 3 each) — consecutive days of confirming evidence required before "
     "activate/deactivate. Portfolio-level transition_days_to_defensive (default "
-    "1, fast escape) / transition_days_to_offensive (default 3, patient redeployment) "
-    "replace the symmetric transition_days. rebalance_threshold (default 0.05 = "
-    "5%) gates daily drift correction within an active profile — set to 0 for "
-    "continuous daily rebalance, leave at default for institutional 5% drift "
-    "tolerance. Regime-driven profile changes and lerp days bypass the threshold.",
+    "1, fast escape) / transition_days_to_offensive (default 3, patient redeployment). "
+    "rebalance_threshold (default 0.05 = 5%) gates daily drift correction within "
+    "an active profile — set to 0 for continuous daily rebalance, leave at default "
+    "for institutional 5% drift tolerance. Regime flips and lerp days always "
+    "rebalance regardless of threshold.",
     {"config": dict},
 )
 async def validate_portfolio_tool(args: dict[str, Any]) -> dict[str, Any]:

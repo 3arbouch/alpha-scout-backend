@@ -485,14 +485,6 @@ def normalize_config(portfolio_config: dict) -> dict:
     """Fix common config issues from LLM output before passing to engine."""
     config = dict(portfolio_config)
 
-    # Stamp the latest schema_version on agent-created configs so they pick up
-    # the current default-set: smoothing on + threshold rebalancing (5% drift).
-    # Pre-existing deployments loaded from app.db do NOT go through this path
-    # — they keep their absent schema_version (treated as v1 = legacy defaults,
-    # or whatever their stamped version is) and thus their historical behavior
-    # is preserved.
-    config.setdefault("schema_version", 3)
-
     for sleeve in config.get("sleeves", []):
         sc = sleeve.get("strategy_config", {})
 

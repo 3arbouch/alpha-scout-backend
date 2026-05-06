@@ -26,15 +26,15 @@ Before choosing thresholds for any feature-based signal, query `features_daily` 
 
 ## Regime & Allocation Smoothing
 
-Your portfolio config is automatically stamped at `schema_version: 2`, which applies the smoothing defaults below. Override individual fields when you have a specific reason; leave them alone otherwise.
+The engine applies institutional smoothing defaults to every portfolio config. Override individual fields only when you have a specific reason; leave them alone otherwise.
 
 **Regime persistence** — each entry in `regime_definitions` accepts:
-- `entry_persistence_days` (v2 default **3**): consecutive days the regime's entry conditions must hold true before it activates. Filters 1-2 day signal flicker (VIX spikes, flash credit moves) at the source rather than smoothing the response.
-- `exit_persistence_days` (v2 default **3**): consecutive days the exit conditions must hold before deactivation. Symmetric by default; deviate when you have a specific reason (e.g., `entry=3, exit=1` to be skeptical about regime starts but trust their ends).
+- `entry_persistence_days` (default **3**): consecutive days the regime's entry conditions must hold true before it activates. Filters 1-2 day signal flicker (VIX spikes, flash credit moves) at the source rather than smoothing the response.
+- `exit_persistence_days` (default **3**): consecutive days the exit conditions must hold before deactivation. Symmetric by default; deviate when you have a specific reason (e.g., `entry=3, exit=1` to be skeptical about regime starts but trust their ends).
 
 **Asymmetric allocation transitions** — at the portfolio level:
-- `transition_days_to_defensive` (v2 default **1**): lerp duration when capital moves toward more cash. Fast escape on confirmed risk.
-- `transition_days_to_offensive` (v2 default **3**): lerp duration when capital moves toward more equity. Patient redeployment.
+- `transition_days_to_defensive` (default **1**): lerp duration when capital moves toward more cash. Fast escape on confirmed risk.
+- `transition_days_to_offensive` (default **3**): lerp duration when capital moves toward more equity. Patient redeployment.
 
 Direction is decided by comparing total non-Cash weight before vs. after each profile flip.
 
@@ -44,10 +44,10 @@ Direction is decided by comparing total non-Cash weight before vs. after each pr
 
 ## Trade Volume Discipline
 
-Your portfolio config is automatically stamped at `schema_version: 3`, which applies a `rebalance_threshold` of **0.05** (5% drift tolerance) by default. This means: while an allocation_profile is active, the engine only emits drift-correction rebalance trades when an actual sleeve weight has drifted more than 5% from its target. Within the threshold, sleeves drift naturally — no daily rebalancing chaff.
+The engine applies a `rebalance_threshold` of **0.05** (5% drift tolerance) by default to every portfolio with allocation_profiles. This means: while an allocation_profile is active, the engine only emits drift-correction rebalance trades when an actual sleeve weight has drifted more than 5% from its target. Within the threshold, sleeves drift naturally — no daily rebalancing chaff.
 
 You can override `rebalance_threshold`:
-- `0.0` — continuous daily rebalance (the v2 behavior, useful for leveraged-ETF-style strategies that genuinely need daily exact-target maintenance).
+- `0.0` — continuous daily rebalance (useful for leveraged-ETF-style strategies that genuinely need daily exact-target maintenance).
 - `0.02-0.03` — tight tactical bands (frequent rebalancing, low drift).
 - `0.05` — institutional balanced-portfolio default.
 - `0.10` — loose strategic bands (rare rebalancing).
