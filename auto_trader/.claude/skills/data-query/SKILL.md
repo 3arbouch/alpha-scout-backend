@@ -227,7 +227,7 @@ WHERE m.series='brent' AND m.date >= '2023-01-01' GROUP BY month ORDER BY month;
 
 ## Table: features_daily (~1.4M rows)
 
-Point-in-time derived factors per `(symbol, date)`. One row per trading day per symbol. 24 factor columns covering valuation, yield, growth, quality, earnings calendar, and analyst sentiment.
+Point-in-time derived factors per `(symbol, date)`. One row per trading day per symbol. 29 factor columns covering valuation, yield, growth, quality, returns/momentum, earnings calendar, and analyst sentiment.
 
 **This is the same table the backtest engine reads** for `feature_threshold` / `feature_percentile` conditions — values you see here are byte-identical to what the engine evaluates against. Use it to screen the universe before choosing thresholds in your portfolio config.
 
@@ -263,6 +263,13 @@ roe REAL,                      -- TTM net_income / total_equity, percent
 roic REAL,                     -- TTM operating_income / (equity + total_debt), percent (proxy)
 debt_to_equity REAL,           -- total_debt / total_equity, ratio
 
+-- Returns / momentum (5) — point-in-time price returns
+ret_1m REAL,                   -- 21-trading-day total return, percent
+ret_3m REAL,                   -- 63-trading-day total return, percent
+ret_6m REAL,                   -- 126-trading-day total return, percent
+ret_12m REAL,                  -- 252-trading-day total return, percent
+ret_12_1m REAL,                -- 12m return excluding most recent month — Asness momentum, percent
+
 -- Earnings calendar (3)
 days_to_next_earnings INT,     -- calendar days to next scheduled earnings event
 days_since_last_earnings INT,  -- calendar days since most recent earnings event
@@ -273,7 +280,7 @@ analyst_net_upgrades_30d INT,  -- (upgrades - downgrades) in trailing 30 calenda
 analyst_net_upgrades_90d INT   -- (upgrades - downgrades) in trailing 90 calendar days
 ```
 
-**On-the-fly factors NOT in this table** (computed during backtests, not queryable here): `rsi_14`, `ret_1m`, `ret_3m`, `ret_6m`, `ret_12m`, `ret_12_1m`, `drawdown_60d`, `drawdown_252d`, `drawdown_alltime`, `vol_z_20`, `dollar_vol_20`. The agent uses these in portfolio configs via `feature_threshold(feature="rsi_14", ...)` etc. — they get computed on demand when the backtest runs.
+**On-the-fly factors NOT in this table** (computed during backtests, not queryable here): `rsi_14`, `drawdown_60d`, `drawdown_252d`, `drawdown_alltime`, `vol_z_20`, `dollar_vol_20`. The agent uses these in portfolio configs via `feature_threshold(feature="rsi_14", ...)` etc. — they get computed on demand when the backtest runs.
 
 ```sql
 -- What's cheap today on EV/EBITDA with positive accelerating growth?
