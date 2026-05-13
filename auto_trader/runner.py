@@ -332,19 +332,48 @@ def _get_trade_summary(exp_id: str) -> dict | None:
 def build_history_context(run_id: str, target_metric: str, limit: int = 20) -> str:
     """Build full history of past experiments for the agent to learn from.
 
-    Deliberately excludes the `lessons` field. Lessons are the agent's own
-    interpretation of prior experiments and are persisted for UI display only;
-    surfacing them here would bias subsequent iterations by anchoring the
-    agent on its own past self-interpretation. `get_experiment_history()`
-    intentionally does not SELECT the column so the data isn't available
-    at this layer. Do not change either without reading the design rationale.
+    Lessons convention: the `lessons` field stored on experiment row N is the
+    agent's reflection at the START of iteration N, i.e. a post-mortem of
+    experiments 1..N-1 (most directly about N-1). When rendering, we therefore
+    attach lessons[N] under the display block for experiment N-1 — that is the
+    experiment the lesson is actually about.
+
+    To avoid anchoring the agent on stale self-interpretation, only the 3 most
+    recently written lessons are surfaced. Older lessons stay in the DB for UI
+    display but are stripped from the prompt.
     """
     history = get_experiment_history(run_id, limit=limit)
     if not history:
         return "No previous experiments. This is your first experiment."
 
+    history_asc = list(reversed(history))  # oldest first
+
+    # Pair each experiment with the lesson the AGENT wrote about it on the
+    # next iteration. lessons_for_exp[exp_iter] = (writing_iter, text).
+    lessons_for_exp: dict[int, tuple[int, str]] = {}
+    for i in range(len(history_asc) - 1):
+        next_exp = history_asc[i + 1]
+        lesson_text = next_exp.get("lessons")
+        if not lesson_text or not isinstance(lesson_text, str):
+            continue
+        lesson_text = lesson_text.strip()
+        if not lesson_text:
+            continue
+        lessons_for_exp[history_asc[i]["iteration"]] = (
+            next_exp["iteration"], lesson_text,
+        )
+
+    # Keep only the 3 most-recently-written lessons (by writing_iter).
+    recent_lessons = dict(
+        sorted(
+            lessons_for_exp.items(),
+            key=lambda kv: kv[1][0],
+            reverse=True,
+        )[:3]
+    )
+
     lines = [f"## Past Experiments ({len(history)} most recent)\n"]
-    for exp in reversed(history):  # oldest first
+    for exp in history_asc:
         status = "KEEP" if exp["decision"] == "keep" else "DISCARD"
         lines.append(f"### Experiment {exp['iteration']} [id: {exp['id']}] — {status}")
 
@@ -423,6 +452,19 @@ def build_history_context(run_id: str, target_metric: str, limit: int = 20) -> s
             if summary["worst_losers"]:
                 bot_str = ", ".join(f"{s} {p:+.1f}%/{d}d" for s, p, d in summary["worst_losers"])
                 lines.append(f"**Worst losers:** {bot_str}")
+
+        # Lesson reflecting on THIS experiment (written at the start of the
+        # NEXT iteration). Only surfaced for the 3 most-recently-written
+        # lessons; earlier ones are dropped to avoid anchoring on stale
+        # self-interpretation.
+        lesson_pair = recent_lessons.get(exp["iteration"])
+        if lesson_pair is not None:
+            writing_iter, lesson_text = lesson_pair
+            lines.append(
+                f"**Lessons about Experiment {exp['iteration']} "
+                f"(written at start of iter {writing_iter}):**"
+            )
+            lines.append(lesson_text)
 
         lines.append("")
 
