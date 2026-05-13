@@ -36,37 +36,53 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 from db_config import MARKET_DB_PATH  # noqa: E402
+from server.factors import materialized_features  # noqa: E402
+from server.factors.context import build_context  # noqa: E402
 
 
-FEATURE_COLUMNS = (
-    "pe", "ps", "p_b", "ev_ebitda", "ev_sales",
-    "fcf_yield", "div_yield", "eps_yoy", "rev_yoy",
-)
+def _materialized_columns() -> tuple[str, ...]:
+    """Column names of every precomputed feature, in registry-stable order."""
+    return tuple(f.name for f in materialized_features())
 
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS features_daily (
-    symbol      TEXT NOT NULL,
-    date        TEXT NOT NULL,
-    pe          REAL,
-    ps          REAL,
-    p_b         REAL,
-    ev_ebitda   REAL,
-    ev_sales    REAL,
-    fcf_yield   REAL,
-    div_yield   REAL,
-    eps_yoy     REAL,
-    rev_yoy     REAL,
-    PRIMARY KEY (symbol, date)
-);
-CREATE INDEX IF NOT EXISTS idx_features_date ON features_daily(date);
-CREATE INDEX IF NOT EXISTS idx_features_symbol ON features_daily(symbol);
-"""
+# Backwards-compat alias for callers that still import this constant.
+# Sourced from the registry, not hand-typed.
+FEATURE_COLUMNS = _materialized_columns()
+
+
+def _build_schema_sql() -> str:
+    """Generate CREATE TABLE + INDEXes from the registry."""
+    cols = ",\n    ".join(f"{name:11s} REAL" for name in _materialized_columns())
+    return (
+        f"CREATE TABLE IF NOT EXISTS features_daily (\n"
+        f"    symbol      TEXT NOT NULL,\n"
+        f"    date        TEXT NOT NULL,\n"
+        f"    {cols},\n"
+        f"    PRIMARY KEY (symbol, date)\n"
+        f");\n"
+        f"CREATE INDEX IF NOT EXISTS idx_features_date ON features_daily(date);\n"
+        f"CREATE INDEX IF NOT EXISTS idx_features_symbol ON features_daily(symbol);"
+    )
+
+
+# Generated lazily at module import — captured as a string for visibility / debug.
+SCHEMA = _build_schema_sql()
+
+
+def _existing_columns(conn: sqlite3.Connection) -> set[str]:
+    return {r[1] for r in conn.execute("PRAGMA table_info(features_daily)").fetchall()}
 
 
 def ensure_schema(conn: sqlite3.Connection) -> None:
+    """Create features_daily if missing, then ALTER TABLE for any registered
+    feature column not yet present (additive only — never drops a column)."""
     conn.executescript(SCHEMA)
+    existing = _existing_columns(conn)
+    for col in _materialized_columns():
+        if col not in existing:
+            conn.execute(f"ALTER TABLE features_daily ADD COLUMN {col} REAL")
     conn.commit()
 
 
@@ -105,30 +121,104 @@ def yoy_pct(latest_q: tuple, year_ago_q: tuple | None, col_idx: int) -> float | 
 # ---------------------------------------------------------------------------
 # Per-symbol data load
 # ---------------------------------------------------------------------------
+# Fallback when a fundamentals row has no matching earnings announcement.
+# 45 calendar days approximates the regulatory deadline for 10-Q filings.
+_FILING_LAG_FALLBACK_DAYS = 45
+
+
+def _annotate_with_availability(rows: list[tuple], earnings_dates: list[str]) -> list[tuple]:
+    """Append an `available_from` field to each fundamentals row.
+
+    available_from = earliest earnings.date with date >= row.period_end (within
+    a 60-day window), else period_end + 45 calendar days. This is the moment
+    the row's data was actually public. Rows are then re-sorted by
+    available_from so as-of bisection on the last column is correct.
+
+    Drops rows where available_from would precede period_end (malformed data).
+    """
+    from bisect import bisect_left
+    from datetime import datetime, timedelta
+
+    out: list[tuple] = []
+    for r in rows:
+        period_end = r[0]
+        idx = bisect_left(earnings_dates, period_end)
+        # Only accept an earnings event that's within 60d of period_end —
+        # matches scripts/signals.py:_load_quarterly_income semantics.
+        cutoff = (datetime.strptime(period_end, "%Y-%m-%d") + timedelta(days=60)).strftime("%Y-%m-%d")
+        if idx < len(earnings_dates) and earnings_dates[idx] <= cutoff:
+            available_from = earnings_dates[idx]
+        else:
+            d = datetime.strptime(period_end, "%Y-%m-%d") + timedelta(days=_FILING_LAG_FALLBACK_DAYS)
+            available_from = d.strftime("%Y-%m-%d")
+        if available_from < period_end:
+            continue  # negative-lag is malformed; drop
+        out.append(r + (available_from,))
+    out.sort(key=lambda x: x[-1])
+    return out
+
+
 def _load_symbol_bundles(conn: sqlite3.Connection, symbol: str):
-    """Return sorted-ascending lists of (date, ...) tuples for each fundamentals table."""
+    """Return sorted-by-available_from lists of (period_end, ..., available_from) tuples.
+
+    Income columns (positional, 9 fields):
+      date, revenue, net_income, ebitda, eps_diluted, shares_diluted,
+      gross_profit, operating_income, available_from
+    Balance (5):
+      date, total_equity, net_debt, total_debt, available_from
+    Cashflow (4):
+      date, free_cash_flow, dividends_paid, available_from
+    Prices (2):
+      date, close
+
+    Lists are sorted by available_from (the announcement date). Bisect on
+    the last column for point-in-time as-of semantics. The first column
+    (period_end) is kept for legacy positional callers and for fiscal-period
+    matching (YoY logic compares quarters by position in the announcement-
+    ordered slice, which matches fiscal order in normal cases).
+    """
     cur = conn.cursor()
-    # income: date, revenue, net_income, ebitda, eps_diluted, shares_diluted
     income = cur.execute(
-        "SELECT date, revenue, net_income, ebitda, eps_diluted, shares_diluted "
+        "SELECT date, revenue, net_income, ebitda, eps_diluted, shares_diluted, "
+        "gross_profit, operating_income "
         "FROM income WHERE symbol=? ORDER BY date ASC", (symbol,)
     ).fetchall()
-    # balance: date, total_equity, net_debt
     balance = cur.execute(
-        "SELECT date, total_equity, net_debt "
+        "SELECT date, total_equity, net_debt, total_debt "
         "FROM balance WHERE symbol=? ORDER BY date ASC", (symbol,)
     ).fetchall()
-    # cashflow: date, free_cash_flow, dividends_paid
     cashflow = cur.execute(
         "SELECT date, free_cash_flow, dividends_paid "
         "FROM cashflow WHERE symbol=? ORDER BY date ASC", (symbol,)
     ).fetchall()
-    # prices: date, close
     prices = cur.execute(
         "SELECT date, close FROM prices WHERE symbol=? AND close IS NOT NULL "
         "ORDER BY date ASC", (symbol,)
     ).fetchall()
+
+    earnings_dates = [r[0] for r in cur.execute(
+        "SELECT date FROM earnings WHERE symbol=? ORDER BY date ASC", (symbol,)
+    ).fetchall()]
+
+    income = _annotate_with_availability(income, earnings_dates)
+    balance = _annotate_with_availability(balance, earnings_dates)
+    cashflow = _annotate_with_availability(cashflow, earnings_dates)
     return income, balance, cashflow, prices
+
+
+def _load_earnings_dates(conn: sqlite3.Connection, symbol: str) -> list[str]:
+    """Ascending list of earnings event dates (past actuals + scheduled future)."""
+    return [r[0] for r in conn.execute(
+        "SELECT date FROM earnings WHERE symbol=? ORDER BY date ASC", (symbol,)
+    ).fetchall()]
+
+
+def _load_grades(conn: sqlite3.Connection, symbol: str) -> list[tuple]:
+    """Ascending (date, action) where action ∈ {'upgrade','downgrade','maintain'}."""
+    return [(d, a) for d, a in conn.execute(
+        "SELECT date, action FROM analyst_grades WHERE symbol=? ORDER BY date ASC",
+        (symbol,),
+    ).fetchall()]
 
 
 # Column indices inside the income tuple (date is idx 0)
@@ -240,35 +330,45 @@ def compute_features_for_day(
 # ---------------------------------------------------------------------------
 # Build per symbol
 # ---------------------------------------------------------------------------
-UPSERT_SQL = (
-    "INSERT OR REPLACE INTO features_daily "
-    "(symbol,date,pe,ps,p_b,ev_ebitda,ev_sales,fcf_yield,div_yield,eps_yoy,rev_yoy) "
-    "VALUES (?,?,?,?,?,?,?,?,?,?,?)"
-)
+def _build_upsert_sql() -> str:
+    cols = _materialized_columns()
+    col_list = ",".join(("symbol", "date", *cols))
+    placeholders = ",".join("?" * (2 + len(cols)))
+    return f"INSERT OR REPLACE INTO features_daily ({col_list}) VALUES ({placeholders})"
+
+
+UPSERT_SQL = _build_upsert_sql()
 
 
 def build_symbol(conn: sqlite3.Connection, symbol: str, start_date: str | None = None) -> int:
-    """Compute and upsert features for every trading day we have prices for. Returns row count."""
+    """Compute and upsert features for every trading day we have prices for.
+
+    Registry-driven: iterates materialized_features() and calls each compute()
+    against a shared per-(symbol, date) ComputeContext. Returns row count.
+    """
     income, balance, cashflow, prices = _load_symbol_bundles(conn, symbol)
     if not income or not prices:
         return 0
+    earnings_dates = _load_earnings_dates(conn, symbol)
+    grades = _load_grades(conn, symbol)
 
+    cols = _materialized_columns()
+    feats = materialized_features()
     rows = []
     for date, close in prices:
         if start_date and date < start_date:
             continue
         if close is None or close <= 0:
             continue
-        feats = compute_features_for_day(date, close, income, balance, cashflow)
-        if feats is None:
+        ctx = build_context(
+            symbol, date, close, income, balance, cashflow,
+            earnings_dates=earnings_dates, grades=grades,
+            prices=prices,
+        )
+        if ctx is None:
             continue
-        rows.append((
-            symbol, date,
-            feats["pe"], feats["ps"], feats["p_b"],
-            feats["ev_ebitda"], feats["ev_sales"],
-            feats["fcf_yield"], feats["div_yield"],
-            feats["eps_yoy"], feats["rev_yoy"],
-        ))
+        values = tuple(f.compute(ctx) for f in feats)
+        rows.append((symbol, date, *values))
 
     if rows:
         cur = conn.cursor()

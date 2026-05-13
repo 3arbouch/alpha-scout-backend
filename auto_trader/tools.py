@@ -230,15 +230,15 @@ async def query_market_data_tool(args: dict[str, Any]) -> dict[str, Any]:
     "Validate a portfolio configuration against the backtest engine schema. "
     "Call this with your complete portfolio config JSON BEFORE outputting your final <thesis>. "
     "Returns {valid: true} if correct, or {valid: false, error: '...'} with the exact issue to fix. "
-    "Smoothing + rebalance knobs (auto-applied at schema_version 3): each regime "
-    "in regime_definitions accepts entry_persistence_days / exit_persistence_days "
+    "Smoothing + rebalance defaults applied uniformly: each regime in "
+    "regime_definitions accepts entry_persistence_days / exit_persistence_days "
     "(default 3 each) — consecutive days of confirming evidence required before "
     "activate/deactivate. Portfolio-level transition_days_to_defensive (default "
-    "1, fast escape) / transition_days_to_offensive (default 3, patient redeployment) "
-    "replace the symmetric transition_days. rebalance_threshold (default 0.05 = "
-    "5%) gates daily drift correction within an active profile — set to 0 for "
-    "continuous daily rebalance, leave at default for institutional 5% drift "
-    "tolerance. Regime-driven profile changes and lerp days bypass the threshold.",
+    "1, fast escape) / transition_days_to_offensive (default 3, patient redeployment). "
+    "rebalance_threshold (default 0.05 = 5%) gates daily drift correction within "
+    "an active profile — set to 0 for continuous daily rebalance, leave at default "
+    "for institutional 5% drift tolerance. Regime flips and lerp days always "
+    "rebalance regardless of threshold.",
     {"config": dict},
 )
 async def validate_portfolio_tool(args: dict[str, Any]) -> dict[str, Any]:
@@ -248,61 +248,28 @@ async def validate_portfolio_tool(args: dict[str, Any]) -> dict[str, Any]:
 
 @tool(
     "evaluate_signal",
-    "Score a single entry signal as a long-only equal-weight factor portfolio "
-    "using the SAME metrics the backtest engine reports. Each signal-fire opens "
-    "a unit-weight position held for target_horizon trading days; the daily NAV "
-    "is the basket of currently-open positions. No costs, no capacity caps — "
-    "this is an UPPER BOUND on what a real portfolio can achieve.\n\n"
-    "Returns:\n"
-    "  portfolio_metrics: sharpe_ratio (basis-aware, same definition as run_backtest), "
-    "sharpe_ratio_annualized, sharpe_ratio_period, sharpe_basis, sortino_ratio, "
-    "annualized_return_pct, annualized_volatility_pct, max_drawdown_pct, "
-    "alpha_vs_market_pct (vs SPY), alpha_vs_sector_pct (vs the sector ETF when "
-    "sector is set; null otherwise), trading_days, risk_free_rate_pct.\n"
-    "  ic: cross-sectional Information Coefficient — Spearman rank correlation "
-    "between factor value and forward return, daily, then aggregated to "
-    "ic_mean / ic_stdev / ir / ic_t_stat / n_observations / ic_basis. "
-    "ic_basis='continuous' when the signal is feature_threshold/feature_percentile "
-    "(IC computed on the raw factor, threshold-independent); 'binary' otherwise "
-    "(currently returned with reason='binary_ic_not_yet_supported').\n"
-    "  ic.ic_rolling.windows: rolling regime diagnostics at 3 windows "
-    "(63d ~3m / 252d ~1y / 504d ~2y). Per window:\n"
-    "    summary: ir_first/last/current/min/max + n_snapshots.\n"
-    "    ir_distribution: percentiles (p10/p25/p50/p75/p90) of the rolling-IR "
-    "series + current_percentile (where ir_current sits in its own history).\n"
-    "    largest_shifts: top-5 rolling 60d shifts ranked by z-score normalized "
-    "to the shift distribution's own stdev — distribution-driven, no "
-    "hardcoded magnitude thresholds.\n"
-    "    change_points_cusum: recursive CUSUM break-points with p-values "
-    "from the Brownian-bridge supremum distribution. Agent reads p-values "
-    "and decides what counts as a regime break — no fixed alpha is forced.\n"
-    "    series (evaluate_signal only): daily-step rolling snapshots so "
-    "the agent can inspect the full curve. Omitted from rank_signals to "
-    "keep cross-candidate comparisons compact.\n"
-    "  Reading the rolling block: compare ir_current vs ir_distribution.p50 "
-    "to gauge if the factor is currently above/below its own historical "
-    "median; check change_points_cusum for statistically significant "
-    "regime shifts; cross-reference with largest_shifts dates to see "
-    "where the shift was driven by a discrete event.\n"
-    "  benchmark_used: 'XLK' / 'XLF' / 'XLE' / 'XLV' for matched sectors, else 'SPY'.\n"
-    "  trigger_count, unique_stocks, yearly_breakdown, top_stocks, bottom_stocks: "
-    "coverage diagnostics.\n\n"
-    "How to read: check IC FIRST. ir < 0.1 or |ic_t_stat| < 2 → factor is noise "
-    "regardless of Sharpe (the headline number was likely market beta). Only then "
-    "look at portfolio_metrics. The Sharpe and alpha_vs_sector here are directly "
-    "comparable to what run_backtest will report — but expect the backtest to be "
-    "lower because it has costs, capacity caps, and exit rules.\n\n"
-    "signal_config: An entry condition config dict. Same format as portfolio entry conditions. "
-    "Examples:\n"
-    '  {"type": "feature_percentile", "feature": "ev_ebitda", "max_percentile": 20, "scope": "sector", "min_value": 0, "max_value": 25}\n'
-    '  {"type": "feature_threshold", "feature": "fcf_yield", "operator": ">=", "value": 5}\n'
-    '  {"type": "feature_threshold", "feature": "eps_yoy", "operator": ">=", "value": 20}\n'
-    '  {"type": "days_to_earnings", "min_days": 0, "max_days": 5}\n'
-    '  {"type": "analyst_upgrades", "window_days": 90, "min_net_upgrades": 2}\n'
-    '  {"type": "momentum_rank", "lookback": 63, "operator": ">=", "value": 80}\n'
-    '  {"type": "current_drop", "threshold": -15, "window_days": 90}\n'
-    '  {"type": "rsi", "period": 14, "operator": "<=", "value": 30}\n\n'
-    "target_horizon: Hold period and IC horizon. e.g. '3m', '6m', '12m'.",
+    "Scores a single entry signal as a long-only equal-weight factor "
+    "portfolio (each signal-fire opens a unit-weight position held for "
+    "target_horizon trading days; no costs, no capacity caps).\n\n"
+    "UPPER BOUND: these are factor-portfolio metrics. The basket holds "
+    "ALL firing names equal-weight with no ranking, no max_positions, "
+    "no slippage, no exit rules beyond the time stop. A real backtest "
+    "with ranking.by + max_positions + rebalance + costs typically "
+    "realizes meaningfully less alpha (often 30-50% lower) at "
+    "similar-or-lower Sharpe. Treat as the ceiling, not the forecast.\n\n"
+    "Returns portfolio_metrics (Sharpe, alpha vs market & sector, "
+    "drawdown, volatility, sortino), rolling IC at 63/252/504-day "
+    "windows with CUSUM regime change-points and daily-step series, "
+    "and coverage diagnostics (trigger_count, unique_stocks, "
+    "yearly_breakdown, top/bottom_stocks).\n\n"
+    "What it tells you: the upper-bound return profile of one specific "
+    "signal in isolation; whether its predictive power is stable or "
+    "broke at some point in history; which names contribute the alpha "
+    "vs which are drags; how often it actually fires.\n\n"
+    "Args: signal_config (entry condition config dict; same format as "
+    "portfolio entry conditions, e.g. feature_threshold, "
+    "feature_percentile, days_to_earnings, analyst_upgrades, "
+    "momentum_rank, current_drop, rsi), target_horizon ('3m'/'6m'/'12m').",
     {"signal_config": dict, "target_horizon": str},
 )
 async def evaluate_signal_tool(args: dict[str, Any]) -> dict[str, Any]:
@@ -333,32 +300,32 @@ async def evaluate_signal_tool(args: dict[str, Any]) -> dict[str, Any]:
 
 @tool(
     "rank_signals",
-    "Score multiple entry signals on the same metric set as evaluate_signal "
-    "(portfolio_metrics + IC) and find an independent combination via forward "
-    "selection. Combination = AND-intersection: an entry counts only when ALL "
-    "selected signals fire on the same (symbol, date). Forward selection ranks "
-    "on portfolio.sharpe_ratio (NAV-based, same definition as the backtest).\n\n"
-    "Returns:\n"
-    "  individual_signals: per-candidate full block (portfolio_metrics, ic "
-    "incl. ic_rolling.windows summary/distribution/largest_shifts/"
-    "change_points_cusum but no daily series, benchmark_used, trigger_count, "
-    "unique_stocks). Use the rolling block to spot per-candidate regime "
-    "shifts before deciding which candidates are still 'live' factors.\n"
-    "  correlation_matrix: pairwise Pearson correlation of candidates' daily "
-    "factor-portfolio returns. Pairs > 0.7 are essentially the same factor — "
-    "AND-ing them adds no information. Look at this BEFORE the forward_selection.\n"
-    "  forward_selection: per step, {sharpe, sharpe_delta, "
-    "correlation_with_running_combo, trigger_count, alpha_vs_sector_pct, "
-    "max_drawdown_pct, verdict, reason}. Stops when Sharpe doesn't improve OR "
-    "correlation with the running combo > 0.8 (configurable).\n"
-    "  recommended_signals: the kept set.\n\n"
-    "How to read: 1) screen individual candidates by IC (ir < 0.1 or |t| < 2 → "
-    "drop). 2) inspect correlation_matrix — pairs > 0.7 are redundant. "
-    "3) read forward_selection only after the above two filters.\n\n"
-    "candidate_signals: List of entry condition config dicts (same format as "
-    "evaluate_signal). Provide 3-6 IC-screened, low-correlation candidates for "
-    "meaningful results.\n\n"
-    "target_horizon: Hold period and IC horizon. e.g. '3m', '6m', '12m'.",
+    "Scores 3-6 candidate entry signals as threshold-specific factor "
+    "portfolios.\n\n"
+    "UPPER BOUND: all metrics (per-candidate portfolio stats, "
+    "correlation matrix, forward-selection Sharpes) are factor-"
+    "portfolio metrics — ALL firing names equal-weight, no ranking, "
+    "no max_positions, no slippage. A real backtest with ranking.by + "
+    "max_positions typically realizes meaningfully less alpha (often "
+    "30-50% lower) at similar-or-lower Sharpe. Treat as the ceiling, "
+    "not the forecast.\n\n"
+    "Returns per-candidate portfolio metrics (Sharpe, alpha vs "
+    "sector/market, drawdown, volatility, trigger_count, unique_stocks), "
+    "rolling IC at 63/252/504-day windows with CUSUM regime "
+    "change-points, a pairwise Pearson correlation matrix of "
+    "candidates' daily factor-portfolio returns, and a greedy AND-"
+    "intersection forward-selection trace (per step: sharpe, "
+    "sharpe_delta, correlation_with_running_combo, trigger_count, "
+    "alpha_vs_sector_pct, max_drawdown_pct, verdict).\n\n"
+    "What it tells you: the upper-bound return profile of these "
+    "specific thresholds; whether each signal's edge is stable over "
+    "time or has regime breaks; whether your candidates are saying "
+    "the same thing once ANDed; which subset of them combines into "
+    "the strongest joint signal before redundancy or trade-count "
+    "starvation kicks in.\n\n"
+    "Args: candidate_signals (list of entry condition config dicts, "
+    "same format as evaluate_signal), target_horizon (hold period & "
+    "IC horizon, e.g. '3m', '6m', '12m').",
     {"candidate_signals": list, "target_horizon": str},
 )
 async def rank_signals_tool(args: dict[str, Any]) -> dict[str, Any]:
@@ -387,6 +354,45 @@ async def rank_signals_tool(args: dict[str, Any]) -> dict[str, Any]:
         result["truncated"] = True
         text = json.dumps(result, default=str)
     return {"content": [{"type": "text", "text": text}]}
+
+
+@tool(
+    "analyze_factor_library",
+    "Profiles all 35 registered features across a (universe, window). "
+    "Returns per-factor statistics (IC at 4 horizons, sector + ln(mcap) "
+    "neutralized IC, quintile spreads with monotonicity, top-bucket "
+    "turnover) plus a cross-feature orthogonality block (35x35 rank "
+    "correlation matrix, 35x35 factor-return correlation at 63d, "
+    "hierarchical clusters, economic categories, top-K neighbors per "
+    "feature).\n\n"
+    "What it tells you: which factors carry statistically real "
+    "predictive power in this universe/window; whether each factor's "
+    "edge is genuine stock-picking or a hidden sector/size tilt; the "
+    "natural horizon where each factor is strongest; which factors are "
+    "redundant (same names, same timing) and which add diversification.\n\n"
+    "Args (all optional, default to session context): sector, start, "
+    "end, universe (symbol list overrides sector), features (subset of "
+    "35). Cached on the arg tuple.",
+    {},
+)
+async def analyze_factor_library_tool(args: dict[str, Any]) -> dict[str, Any]:
+    from auto_trader.factor_library import analyze_factor_library as _afl
+
+    sector = args.get("sector") or _SECTOR
+    start = args.get("start") or _START_DATE or "2015-01-01"
+    end = args.get("end") or _STOP_DATE or "2025-12-31"
+    universe = args.get("universe")
+    features = args.get("features")
+
+    result = _afl(
+        sector=sector,
+        universe=universe if isinstance(universe, list) else None,
+        start=start,
+        end=end,
+        features=features if isinstance(features, list) else None,
+        use_cache=True,
+    )
+    return {"content": [{"type": "text", "text": json.dumps(result, default=str)}]}
 
 
 @tool(

@@ -832,6 +832,7 @@ def get_deployment(deploy_id: str) -> dict | None:
             result["benchmark_market"] = full.get("benchmark_market")    # SPY time series
             result["benchmark_sector"] = full.get("benchmark_sector")    # sector ETF (or None)
             result["regime_history"] = full.get("regime_history", [])
+            result["allocation_profile_history"] = full.get("allocation_profile_history", [])
 
             # Per-sleeve detail
             sleeve_results = full.get("sleeve_results", [])

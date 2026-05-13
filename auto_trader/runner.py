@@ -42,13 +42,21 @@ def generate_run_id() -> str:
 
 
 def _load_schemas() -> str:
-    """Load strategy and portfolio schemas from the engines."""
+    """Load strategy and portfolio schemas from the engines.
+
+    Schemas are dumped compactly (separators=',:') because the SDK launches
+    the bundled Claude binary as a subprocess and passes the system prompt
+    as a CLI argument. Linux's MAX_ARG_STRLEN is 128 KiB per single argument;
+    the verbose pretty-printed schemas alone exceed that on configs with
+    discriminated unions of ~10+ types. Compact JSON cuts the schema bytes
+    roughly in half without changing the agent's ability to parse it.
+    """
     import json as _json
     try:
         from backtest_engine import get_config_schema as strategy_schema
         from portfolio_engine import get_config_schema as portfolio_schema
-        strat = _json.dumps(strategy_schema(), indent=2)
-        port = _json.dumps(portfolio_schema(), indent=2)
+        strat = _json.dumps(strategy_schema(), separators=(",", ":"))
+        port = _json.dumps(portfolio_schema(), separators=(",", ":"))
 
         thesis_schema = _json.dumps({
             "thesis": {
@@ -56,7 +64,7 @@ def _load_schemas() -> str:
                 "assumptions": {"type": "array", "items": "string", "description": "List of assumptions that must hold for this thesis to work"},
             },
             "portfolio": "(see Portfolio Config Schema below)",
-        }, indent=2)
+        })
 
         return (
             "### Thesis Output Schema\n\n"
@@ -68,6 +76,90 @@ def _load_schemas() -> str:
         )
     except Exception as e:
         return f"## Schema Error\nFailed to load schemas: {e}"
+
+
+def _load_factor_catalog() -> str:
+    """Build the factor catalog block from server.factors registry + a recent
+    cross-section from features_daily.
+
+    For each registered feature: name, category, unit, definition. For
+    materialized features, also p10/p50/p90 across all symbols on the most
+    recent trading date with broad coverage — gives the agent a 'what's a
+    normal value today' anchor before it picks a threshold.
+    """
+    try:
+        import sqlite3
+        import statistics
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+        from server.factors import all_features
+        from db_config import MARKET_DB_PATH  # type: ignore
+
+        feats = all_features()
+        if not feats:
+            return ""
+
+        # Pull a recent cross-section per feature. We use the most recent date
+        # in features_daily with > 100 non-null values for that feature.
+        rows: list[str] = []
+        rows.append(
+            "| name | category | unit | definition | "
+            "p10 | p50 | p90 | n |"
+        )
+        rows.append(
+            "|---|---|---|---|---|---|---|---|"
+        )
+        with sqlite3.connect(str(MARKET_DB_PATH)) as conn:
+            existing_cols = {
+                r[1] for r in conn.execute("PRAGMA table_info(features_daily)").fetchall()
+            }
+            for f in feats:
+                p10 = p50 = p90 = ""
+                n_str = ""
+                if f.materialization == "precomputed":
+                    if f.name not in existing_cols:
+                        # Registered but not yet backfilled into features_daily.
+                        p10 = p50 = p90 = "_pending backfill_"
+                        n_str = "0"
+                    else:
+                        cur = conn.cursor()
+                        latest = cur.execute(
+                            f"SELECT date FROM features_daily "
+                            f"WHERE {f.name} IS NOT NULL "
+                            f"GROUP BY date HAVING COUNT(*) > 100 "
+                            f"ORDER BY date DESC LIMIT 1"
+                        ).fetchone()
+                        if latest:
+                            vals = [r[0] for r in cur.execute(
+                                f"SELECT {f.name} FROM features_daily "
+                                f"WHERE date = ? AND {f.name} IS NOT NULL",
+                                (latest[0],),
+                            ).fetchall()]
+                            if vals:
+                                vs = sorted(vals)
+                                n = len(vs)
+                                p10 = f"{vs[int(n*0.1)]:.2f}"
+                                p50 = f"{statistics.median(vs):.2f}"
+                                p90 = f"{vs[int(n*0.9)]:.2f}"
+                                n_str = str(n)
+                else:
+                    p10 = p50 = p90 = "_on-the-fly_"
+                    n_str = "—"
+                rows.append(
+                    f"| `{f.name}` | {f.category} | {f.unit} | "
+                    f"{f.description} | {p10} | {p50} | {p90} | {n_str} |"
+                )
+
+        return (
+            "### Factor Catalog (server/factors registry)\n\n"
+            "Every named factor that `feature_threshold` and `feature_percentile` "
+            "can reference. Materialized factors are stored in the `features_daily` "
+            "table and queryable via `data-query`. Cross-section stats (p10/p50/p90, "
+            "n) are from the most recent trading date with broad coverage — use "
+            "them to pick reasonable thresholds.\n\n"
+            + "\n".join(rows)
+        )
+    except Exception as e:
+        return f"### Factor Catalog\n_(load failed: {e})_"
 
 
 _custom_prompt = None
@@ -137,8 +229,10 @@ def load_program(agent_prompt: str | None = None) -> str:
         agent_prompt = _custom_prompt or (Path(__file__).parent / "program.md").read_text()
 
     schemas = _load_schemas()
+    catalog = _load_factor_catalog()
 
-    return agent_prompt + "\n\n---\n\n" + system_instructions + "\n\n---\n\n" + schemas
+    parts = [agent_prompt, system_instructions, catalog, schemas]
+    return "\n\n---\n\n".join(p for p in parts if p)
 
 
 def parse_thesis(agent_output: str) -> dict | None:
@@ -176,14 +270,9 @@ def _get_trade_summary(exp_id: str) -> dict | None:
     """
     from auto_trader.schema import get_db
     conn = get_db()
-    # Strategy aggregate stats — exclude portfolio rebalance trades. Rebalance
-    # trades have `reason` starting with "rebalance_to_" and do not carry pnl
-    # (they're zero-NAV-change executions that just shift exposure between
-    # the sleeve and cash). Win-rate / avg-win / avg-loss / days-held describe
-    # strategy decisions, not rebalance plumbing.
-    STRATEGY_FILTER = "(reason IS NULL OR reason NOT LIKE 'rebalance_to_%')"
+    # Aggregate stats — only SELL rows carry pnl
     agg = conn.execute(
-        f"""SELECT
+        """SELECT
                COUNT(*) AS total_events,
                SUM(CASE WHEN action='BUY' THEN 1 ELSE 0 END) AS buys,
                SUM(CASE WHEN action='SELL' THEN 1 ELSE 0 END) AS sells,
@@ -192,47 +281,31 @@ def _get_trade_summary(exp_id: str) -> dict | None:
                AVG(CASE WHEN action='SELL' AND pnl > 0 THEN pnl_pct END) AS avg_win_pct,
                AVG(CASE WHEN action='SELL' AND pnl <= 0 THEN pnl_pct END) AS avg_loss_pct,
                AVG(CASE WHEN action='SELL' THEN days_held END) AS avg_days_held
-           FROM trades WHERE source_type='experiment' AND source_id = ?
-                       AND {STRATEGY_FILTER}""",
+           FROM trades WHERE source_type='experiment' AND source_id = ?""",
         (exp_id,),
     ).fetchone()
-
-    # Rebalance trade counts (separate bucket — pure plumbing, no win/loss).
-    rebal = conn.execute(
-        """SELECT COUNT(*) AS n_records,
-                  COUNT(DISTINCT date) AS n_dates,
-                  SUM(amount) AS total_dollars
-           FROM trades WHERE source_type='experiment' AND source_id=?
-                       AND reason LIKE 'rebalance_to_%'""",
-        (exp_id,),
-    ).fetchone()
-
     if not agg or (agg["total_events"] or 0) == 0:
-        if rebal and (rebal["n_records"] or 0) == 0:
-            conn.close()
-            return None
+        conn.close()
+        return None
 
-    # Exit-reason histogram (strategy-only).
+    # Exit-reason histogram
     reasons = conn.execute(
-        f"""SELECT reason, COUNT(*) AS n FROM trades
-           WHERE source_type='experiment' AND source_id=? AND action='SELL'
-                 AND reason IS NOT NULL AND {STRATEGY_FILTER}
+        """SELECT reason, COUNT(*) AS n FROM trades
+           WHERE source_type='experiment' AND source_id=? AND action='SELL' AND reason IS NOT NULL
            GROUP BY reason ORDER BY n DESC""",
         (exp_id,),
     ).fetchall()
 
-    # Top 3 winners and worst 3 losers by pnl_pct (strategy-only).
+    # Top 3 winners and worst 3 losers by pnl_pct
     winners_rows = conn.execute(
-        f"""SELECT symbol, pnl_pct, days_held FROM trades
+        """SELECT symbol, pnl_pct, days_held FROM trades
            WHERE source_type='experiment' AND source_id=? AND action='SELL' AND pnl > 0
-                 AND {STRATEGY_FILTER}
            ORDER BY pnl_pct DESC LIMIT 3""",
         (exp_id,),
     ).fetchall()
     losers_rows = conn.execute(
-        f"""SELECT symbol, pnl_pct, days_held FROM trades
+        """SELECT symbol, pnl_pct, days_held FROM trades
            WHERE source_type='experiment' AND source_id=? AND action='SELL' AND pnl <= 0
-                 AND {STRATEGY_FILTER}
            ORDER BY pnl_pct ASC LIMIT 3""",
         (exp_id,),
     ).fetchall()
@@ -253,29 +326,54 @@ def _get_trade_summary(exp_id: str) -> dict | None:
         "exit_reasons": [(r["reason"], r["n"]) for r in reasons],
         "top_winners": [(r["symbol"], r["pnl_pct"], r["days_held"]) for r in winners_rows],
         "worst_losers": [(r["symbol"], r["pnl_pct"], r["days_held"]) for r in losers_rows],
-        # Portfolio rebalance bucket (separate from strategy).
-        "rebalance_records": (rebal["n_records"] or 0) if rebal else 0,
-        "rebalance_dates": (rebal["n_dates"] or 0) if rebal else 0,
-        "rebalance_total_dollars": round(rebal["total_dollars"] or 0, 2) if rebal else 0,
     }
 
 
 def build_history_context(run_id: str, target_metric: str, limit: int = 20) -> str:
     """Build full history of past experiments for the agent to learn from.
 
-    Deliberately excludes the `lessons` field. Lessons are the agent's own
-    interpretation of prior experiments and are persisted for UI display only;
-    surfacing them here would bias subsequent iterations by anchoring the
-    agent on its own past self-interpretation. `get_experiment_history()`
-    intentionally does not SELECT the column so the data isn't available
-    at this layer. Do not change either without reading the design rationale.
+    Lessons convention: the `lessons` field stored on experiment row N is the
+    agent's reflection at the START of iteration N, i.e. a post-mortem of
+    experiments 1..N-1 (most directly about N-1). When rendering, we therefore
+    attach lessons[N] under the display block for experiment N-1 — that is the
+    experiment the lesson is actually about.
+
+    To avoid anchoring the agent on stale self-interpretation, only the 3 most
+    recently written lessons are surfaced. Older lessons stay in the DB for UI
+    display but are stripped from the prompt.
     """
     history = get_experiment_history(run_id, limit=limit)
     if not history:
         return "No previous experiments. This is your first experiment."
 
+    history_asc = list(reversed(history))  # oldest first
+
+    # Pair each experiment with the lesson the AGENT wrote about it on the
+    # next iteration. lessons_for_exp[exp_iter] = (writing_iter, text).
+    lessons_for_exp: dict[int, tuple[int, str]] = {}
+    for i in range(len(history_asc) - 1):
+        next_exp = history_asc[i + 1]
+        lesson_text = next_exp.get("lessons")
+        if not lesson_text or not isinstance(lesson_text, str):
+            continue
+        lesson_text = lesson_text.strip()
+        if not lesson_text:
+            continue
+        lessons_for_exp[history_asc[i]["iteration"]] = (
+            next_exp["iteration"], lesson_text,
+        )
+
+    # Keep only the 3 most-recently-written lessons (by writing_iter).
+    recent_lessons = dict(
+        sorted(
+            lessons_for_exp.items(),
+            key=lambda kv: kv[1][0],
+            reverse=True,
+        )[:3]
+    )
+
     lines = [f"## Past Experiments ({len(history)} most recent)\n"]
-    for exp in reversed(history):  # oldest first
+    for exp in history_asc:
         status = "KEEP" if exp["decision"] == "keep" else "DISCARD"
         lines.append(f"### Experiment {exp['iteration']} [id: {exp['id']}] — {status}")
 
@@ -355,57 +453,18 @@ def build_history_context(run_id: str, target_metric: str, limit: int = 20) -> s
                 bot_str = ", ".join(f"{s} {p:+.1f}%/{d}d" for s, p, d in summary["worst_losers"])
                 lines.append(f"**Worst losers:** {bot_str}")
 
-            # Portfolio rebalance bucket — only render when rebalances actually
-            # happened (v2 strategies with allocation_profiles + transitions).
-            # These are PURE PLUMBING, not strategy decisions: they shift sleeve
-            # exposure to match the active allocation profile and don't carry pnl.
-            if summary.get("rebalance_records", 0) > 0:
-                lines.append(
-                    f"**Rebalances:** {summary['rebalance_records']} trade records "
-                    f"across {summary['rebalance_dates']} dates "
-                    f"(${summary['rebalance_total_dollars']:,.0f} gross volume — "
-                    f"slippage cost is the only NAV drag from rebalancing)"
-                )
-
-        # Smoothing diagnostic — only render when something non-default was set,
-        # so unmodified strategies don't get noise lines in their history block.
-        ss_raw = exp.get("smoothing_summary")
-        if ss_raw:
-            try:
-                ss = json.loads(ss_raw) if isinstance(ss_raw, str) else ss_raw
-            except json.JSONDecodeError:
-                ss = None
-            if isinstance(ss, dict):
-                rp = ss.get("regime_persistence", {}) or {}
-                tl = ss.get("transition_lerp", {}) or {}
-                # Only render persistence info for regimes that actually opted
-                # in (entry or exit > 1), and transition info if asymmetric or
-                # legacy td > 1.
-                rp_lines = []
-                for rname, st in rp.items():
-                    e_p = st.get("entry_persistence_days", 1)
-                    x_p = st.get("exit_persistence_days", 1)
-                    if e_p > 1 or x_p > 1:
-                        rp_lines.append(
-                            f"{rname} (entry={e_p}d, exit={x_p}d): "
-                            f"raw_met={st.get('raw_entry_met_days', 0)} → "
-                            f"active={st.get('active_days', 0)} "
-                            f"({st.get('n_activations', 0)} activations, "
-                            f"{st.get('filtered_short_entry_runs', 0)} short runs filtered)"
-                        )
-                if rp_lines:
-                    lines.append("**Regime persistence:** " + "; ".join(rp_lines))
-                if tl.get("asymmetric") or (tl.get("transition_days_legacy", 1) or 1) > 1:
-                    lines.append(
-                        f"**Transition lerp:** "
-                        f"{'asymmetric' if tl.get('asymmetric') else 'symmetric'} "
-                        f"(to_def={tl.get('transition_days_to_defensive') or tl.get('transition_days_legacy')}d, "
-                        f"to_off={tl.get('transition_days_to_offensive') or tl.get('transition_days_legacy')}d) — "
-                        f"{tl.get('n_transitions_total', 0)} flips "
-                        f"({tl.get('n_transitions_defensive', 0)} defensive / "
-                        f"{tl.get('n_transitions_offensive', 0)} offensive), "
-                        f"{tl.get('lerp_days_active', 0)} days mid-lerp"
-                    )
+        # Lesson reflecting on THIS experiment (written at the start of the
+        # NEXT iteration). Only surfaced for the 3 most-recently-written
+        # lessons; earlier ones are dropped to avoid anchoring on stale
+        # self-interpretation.
+        lesson_pair = recent_lessons.get(exp["iteration"])
+        if lesson_pair is not None:
+            writing_iter, lesson_text = lesson_pair
+            lines.append(
+                f"**Lessons about Experiment {exp['iteration']} "
+                f"(written at start of iter {writing_iter}):**"
+            )
+            lines.append(lesson_text)
 
         lines.append("")
 
@@ -484,14 +543,6 @@ def check_conditions(metrics: dict, conditions: list[dict]) -> tuple[bool, list[
 def normalize_config(portfolio_config: dict) -> dict:
     """Fix common config issues from LLM output before passing to engine."""
     config = dict(portfolio_config)
-
-    # Stamp the latest schema_version on agent-created configs so they pick up
-    # the current default-set: smoothing on + threshold rebalancing (5% drift).
-    # Pre-existing deployments loaded from app.db do NOT go through this path
-    # — they keep their absent schema_version (treated as v1 = legacy defaults,
-    # or whatever their stamped version is) and thus their historical behavior
-    # is preserved.
-    config.setdefault("schema_version", 3)
 
     for sleeve in config.get("sleeves", []):
         sc = sleeve.get("strategy_config", {})
@@ -601,28 +652,7 @@ def run_backtest(portfolio_config: dict, start: str, end: str, capital: float,
             for i, sr in enumerate(sleeve_results)
         ]
 
-        # Smoothing diagnostic block — visible to the agent across iterations.
-        # Tells it whether regime persistence filtered any events and how the
-        # transition_days lerp shaped exposure. Always present (zeros / empty
-        # when smoothing knobs aren't set) so downstream consumers can rely on it.
-        smoothing_summary = result.get("smoothing_summary") or {
-            "regime_persistence": {},
-            "transition_lerp": {},
-        }
-        rebalance_summary = result.get("rebalance_summary") or {
-            "rebalance_active": False,
-            "n_rebalance_events": 0,
-            "n_rebalance_trades": 0,
-            "cumulative_slippage_dollars": 0,
-            "cumulative_slippage_pct_of_initial": 0,
-        }
-
-        return {
-            "metrics": metrics,
-            "sleeve_trades": sleeve_trades,
-            "smoothing_summary": smoothing_summary,
-            "rebalance_summary": rebalance_summary,
-        }
+        return {"metrics": metrics, "sleeve_trades": sleeve_trades}
     except Exception as e:
         print(f"  Backtest failed: {e}")
         import traceback
@@ -645,6 +675,20 @@ async def run_agent_iteration(
 ) -> dict:
     """Run a single agent iteration. Returns experiment result."""
     from claude_agent_sdk import query, ClaudeAgentOptions
+    from backtest_engine import clear_precompute_cache
+
+    # Reset the per-iteration precompute_condition memoization cache. The
+    # cache speeds up repeated rank_signals/evaluate_signal calls within a
+    # single iteration but must be flushed at iteration boundaries to bound
+    # memory and prevent any cross-iteration drift if market data updates.
+    prior_cache_stats = clear_precompute_cache()
+    if prior_cache_stats.get("entries", 0) > 0:
+        h = prior_cache_stats["hits"]
+        m = prior_cache_stats["misses"]
+        total = h + m
+        hit_rate = (h / total * 100) if total > 0 else 0
+        print(f"  [precompute cache] prior iter: {h} hits / {m} misses "
+              f"({hit_rate:.0f}% hit rate, {prior_cache_stats['entries']} entries)")
 
     t0 = time.time()
 
@@ -837,11 +881,9 @@ Use the `query_market_data` tool for all data queries. Use `validate_portfolio` 
 
     if bt_result is None:
         metrics = None
-        smoothing_summary = None
     else:
         metrics = bt_result["metrics"]
         sleeve_trades = bt_result["sleeve_trades"]
-        smoothing_summary = bt_result.get("smoothing_summary")
 
     if metrics is None:
         exp_id = log_experiment(
@@ -890,7 +932,6 @@ Use the `query_market_data` tool for all data queries. Use `validate_portfolio` 
         session_id=session_id, duration_seconds=duration_total,
         portfolio_id=portfolio_id,
         lessons=lessons,
-        smoothing_summary=smoothing_summary,
     )
 
     # Persist trades per sleeve under source_type='experiment'.

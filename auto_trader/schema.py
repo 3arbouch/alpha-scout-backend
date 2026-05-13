@@ -122,7 +122,7 @@ def get_experiment_history(run_id: str, limit: int = 20) -> list[dict]:
                   sharpe_ratio, alpha_ann_pct, annualized_volatility_pct,
                   max_drawdown_pct, total_return_pct, annualized_return_pct,
                   decision, best_value_so_far, improvement_pct, error,
-                  smoothing_summary
+                  smoothing_summary, lessons
            FROM experiments
            WHERE run_id = ?
            ORDER BY iteration DESC
