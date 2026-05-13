@@ -877,9 +877,153 @@ DEFAULT_RANKING_METRIC = "pe_percentile"
 DEFAULT_RANKING_ORDER = "asc"
 
 
+def _compute_composite_score(
+    symbols: list[str],
+    conn,
+    date: str,
+    price_index: dict,
+    composite_config: dict,
+) -> dict:
+    """Multi-factor continuous composite score.
+
+    score(s) = Σ_b (weight_b / Σ_w) · mean_{f ∈ b}( sign_f · z(f, s, t) )
+
+    where z is computed cross-sectionally across the given `symbols` (the
+    post-entry-filter candidate set) at date `t`. Default standardization is
+    rank-normalized; alternative is plain z (mean/stdev).
+
+    NaN handling:
+      - A stock missing a single factor in a bucket: bucket z is averaged
+        over the factor(s) it does have.
+      - A stock missing EVERY factor in a bucket: that bucket contributes 0.
+      - A stock missing every factor in every bucket: returned with NaN
+        score (sorted to the end by the caller).
+
+    Returns {symbol: score}. Higher = better when the agent's intended
+    direction has been encoded in factor signs.
+    """
+    import numpy as np
+    from bisect import bisect_right
+
+    buckets = composite_config.get("buckets") or {}
+    if not buckets:
+        return {}
+    standardization = composite_config.get("standardization", "rank")
+    # Normalize bucket weights to sum to 1.
+    raw_w = {name: float(b.get("weight", 1.0)) for name, b in buckets.items()}
+    total_w = sum(raw_w.values()) or 1.0
+    weights = {name: raw_w[name] / total_w for name in raw_w}
+
+    # Collect the set of distinct factors so we load each only once.
+    factor_set: set[str] = set()
+    for b in buckets.values():
+        for f in b.get("factors", []):
+            factor_set.add(f["name"] if isinstance(f, dict) else f.name)
+    if not factor_set:
+        return {}
+
+    # Load feature values for each factor, as-of bisect at `date`.
+    # Result: {factor_name: {symbol: value}}
+    values_by_factor: dict[str, dict[str, float]] = {}
+    for fname in factor_set:
+        try:
+            series = _load_feature_series(fname, symbols, date, date, conn,
+                                          price_index=price_index)
+        except Exception:
+            values_by_factor[fname] = {}
+            continue
+        per_sym: dict[str, float] = {}
+        for sym, pts in series.items():
+            if not pts:
+                continue
+            dates_only = [p[0] for p in pts]
+            idx = bisect_right(dates_only, date) - 1
+            if idx >= 0:
+                v = pts[idx][1]
+                if v is not None and np.isfinite(v):
+                    per_sym[sym] = float(v)
+        values_by_factor[fname] = per_sym
+
+    # Cross-sectional standardization per factor (rank or z), over the
+    # candidate set passed in. Stocks missing the factor are not in z_by_factor[f].
+    z_by_factor: dict[str, dict[str, float]] = {}
+    for fname, per_sym in values_by_factor.items():
+        if len(per_sym) < 2:
+            z_by_factor[fname] = {}
+            continue
+        syms = list(per_sym.keys())
+        vals = np.array([per_sym[s] for s in syms], dtype=np.float64)
+        if standardization == "rank":
+            # Average-rank → percentile → z-equivalent (approximately N(0,1))
+            order = np.argsort(vals, kind="mergesort")
+            ranks = np.empty_like(order, dtype=np.float64)
+            # Use average ranks for ties (same as scipy.stats.rankdata 'average')
+            n = len(vals)
+            i = 0
+            sorted_vals = vals[order]
+            while i < n:
+                j = i + 1
+                while j < n and sorted_vals[j] == sorted_vals[i]:
+                    j += 1
+                avg_rank = (i + j - 1) / 2.0 + 1.0  # 1-based
+                ranks[order[i:j]] = avg_rank
+                i = j
+            # Percentile in (0, 1), then map to z ~ N(0, 1) via inverse normal.
+            # Use simple (rank - 0.5) / n to avoid 0 or 1.
+            pct = (ranks - 0.5) / n
+            # Equivalent z via inverse normal — but we don't need scipy here.
+            # Use sqrt(2) * erfinv(2*pct - 1). For audit purposes use a direct
+            # rank-based standardization that's bit-exact reproducible: scale
+            # ranks to [-1, +1] then to unit std. Skip the inv-normal mapping
+            # since the relative ordering is what ultimately drives ranking.
+            centered = ranks - (n + 1) / 2.0   # mean 0
+            scale = np.std(centered, ddof=0)
+            if scale == 0:
+                z_vals = np.zeros_like(centered)
+            else:
+                z_vals = centered / scale
+        else:  # 'z': plain mean/stdev
+            mu = float(vals.mean())
+            sd = float(vals.std(ddof=0))
+            if sd == 0:
+                z_vals = np.zeros_like(vals)
+            else:
+                z_vals = (vals - mu) / sd
+        z_by_factor[fname] = {syms[k]: float(z_vals[k]) for k in range(len(syms))}
+
+    # Compose: per-bucket mean over (sign · z); cross-bucket weighted sum.
+    scores: dict[str, float] = {}
+    for sym in symbols:
+        composite = 0.0
+        any_factor_seen = False
+        for b_name, b in buckets.items():
+            bucket_factors = b.get("factors", [])
+            bucket_zs: list[float] = []
+            for f in bucket_factors:
+                if isinstance(f, dict):
+                    fname = f["name"]
+                    sign = f.get("sign", "+")
+                else:
+                    fname = f.name
+                    sign = f.sign
+                z = z_by_factor.get(fname, {}).get(sym)
+                if z is None:
+                    continue
+                bucket_zs.append(-z if sign == "-" else z)
+            if not bucket_zs:
+                continue  # entire bucket missing → contributes 0
+            any_factor_seen = True
+            bucket_z = sum(bucket_zs) / len(bucket_zs)
+            composite += weights[b_name] * bucket_z
+        if any_factor_seen:
+            scores[sym] = composite
+    return scores
+
+
 def _compute_ranking_scores(metric: str, symbols: list[str], conn, date: str,
                             price_index: dict, pe_series: dict = None,
-                            rsi_cache: dict = None) -> dict:
+                            rsi_cache: dict = None,
+                            composite_config: dict | None = None) -> dict:
     """
     Compute a single ranking score per symbol for a given date.
     
@@ -889,7 +1033,12 @@ def _compute_ranking_scores(metric: str, symbols: list[str], conn, date: str,
     from bisect import bisect_right
     
     scores = {}
-    
+
+    if metric == "composite_score":
+        if composite_config is None:
+            return {}
+        return _compute_composite_score(symbols, conn, date, price_index, composite_config)
+
     if metric == "pe_percentile":
         if pe_series is None:
             pe_series = _load_pe_timeseries(symbols)
@@ -1019,8 +1168,10 @@ def rank_candidates(candidates: list[tuple], config: dict, conn, date: str,
         metric = ranking_config.get("by", DEFAULT_RANKING_METRIC)
         order = ranking_config.get("order", DEFAULT_RANKING_ORDER)
     
+    composite_config = config.get("composite_score") if metric == "composite_score" else None
     scores = _compute_ranking_scores(metric, symbols_in_play, conn, date,
-                                      price_index, pe_series, rsi_cache)
+                                      price_index, pe_series, rsi_cache,
+                                      composite_config=composite_config)
     
     if not scores:
         # Fallback to original ordering if ranking data unavailable
@@ -2104,6 +2255,37 @@ def run_backtest(config: dict, force_close_at_end: bool = True,
         # --- Execute pending entries from previous day (only if gated on) ---
         if not _gate_on:
             pending_entries = []
+
+        # Pre-compute risk_parity weights once per execution day so position
+        # sizes within this batch are properly inverse-vol weighted. Without
+        # this, sizing each position independently would just produce equal-
+        # weight (which is exactly the silent fallthrough we had before).
+        sizing_type = config["sizing"]["type"]
+        risk_parity_weights: dict[str, float] = {}
+        if sizing_type == "risk_parity" and pending_entries:
+            from stop_pricing import compute_realized_vol
+            vol_window = int(config["sizing"].get("vol_window_days", 20))
+            vol_source = config["sizing"].get("vol_source", "historical")
+            sigmas: dict[str, float] = {}
+            for sym, _, _ in pending_entries:
+                # Reuse the price_index: closes up to (but not including) `date`.
+                pm = price_index.get(sym, {})
+                if not pm:
+                    continue
+                closes_dates = sorted(d for d in pm if d < date)
+                tail = closes_dates[-(vol_window + 1):] if len(closes_dates) >= vol_window + 1 else []
+                if not tail:
+                    continue
+                closes = [pm[d] for d in tail]
+                sigma = compute_realized_vol(closes, vol_window, vol_source)
+                if sigma is not None and sigma > 0:
+                    sigmas[sym] = sigma
+            if sigmas:
+                # Inverse-vol weights normalized to sum to 1 across the batch.
+                inv = {s: 1.0 / sigmas[s] for s in sigmas}
+                total = sum(inv.values())
+                risk_parity_weights = {s: v / total for s, v in inv.items()}
+
         for symbol, peak_price, sig_detail in pending_entries:
             if symbol in portfolio.positions:
                 continue  # Already in portfolio
@@ -2119,13 +2301,25 @@ def run_backtest(config: dict, force_close_at_end: bool = True,
             if current_nav <= 0:
                 continue
 
-            sizing_type = config["sizing"]["type"]
             if sizing_type == "equal_weight":
                 target_weight = 1.0 / max_positions
                 amount = current_nav * target_weight
             elif sizing_type == "fixed_amount":
                 amount = config["sizing"].get("amount_per_position", initial_cash / max_positions)
+            elif sizing_type == "risk_parity":
+                # Aggregate target for this batch matches equal_weight's:
+                #   n_batch × (current_nav / max_positions).
+                # Distribute that pool by inverse-vol weights computed above.
+                n_batch = len(pending_entries)
+                pool = (n_batch / max_positions) * current_nav
+                w = risk_parity_weights.get(symbol)
+                if w is not None:
+                    amount = pool * w
+                else:
+                    # Insufficient vol history for this name → fall back to equal_weight slot.
+                    amount = current_nav / max_positions
             else:
+                # Unknown sizing type: safe fallback.
                 amount = current_nav / max_positions
 
             # Don't exceed available cash

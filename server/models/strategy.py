@@ -420,16 +420,67 @@ class TimeStopConfig(BaseModel):
 
 class RankingConfig(BaseModel):
     """Rank qualified candidates by a metric before applying max_positions."""
-    by: Literal[
+    by: FeatureName | Literal[
+        # Composite multi-factor score (requires StrategyConfig.composite_score block).
+        "composite_score",
         # Legacy metrics (kept for backward compatibility with saved configs)
         "pe_percentile", "current_drop", "rsi",
         "momentum_rank", "revenue_growth_yoy", "margin_expanding",
-        # features_daily columns — any feature is rankable
-        "pe", "ps", "p_b", "ev_ebitda", "ev_sales",
-        "fcf_yield", "div_yield", "eps_yoy", "rev_yoy",
     ] = Field(default="pe_percentile")
     order: Literal["asc", "desc"] = Field(default="asc", description="'asc' = lowest first.")
     top_n: int | None = Field(default=None, description="How many candidates to select. Defaults to max_positions.")
+
+
+# ---------------------------------------------------------------------------
+# Composite score (multi-factor continuous ranking)
+# ---------------------------------------------------------------------------
+
+class CompositeFactor(BaseModel):
+    """One factor within a composite-score bucket.
+
+    `name` is any registered feature (string, validated by the engine against
+    the factor registry — covers all materialized + on-the-fly features).
+    `sign` flips direction so 'higher = better' for the bucket after sign
+    application: e.g. for low-PE-is-good, pass {name: "pe", sign: "-"}.
+    """
+    name: str = Field(min_length=1, description="Feature name from the registry.")
+    sign: Literal["+", "-"] = Field(default="+", description="'-' inverts the factor (low = good).")
+
+
+class CompositeBucket(BaseModel):
+    """One bucket (economic family) inside the composite score.
+
+    Bucket z-score at date t = average of rank-normalized z-scores of its
+    member factors (after sign flips), computed cross-sectionally across the
+    candidates remaining after entry filters.
+    """
+    factors: list[CompositeFactor] = Field(min_length=1, description="One or more factors in this bucket.")
+    weight: float = Field(default=1.0, description="Raw weight; engine auto-normalizes so all bucket weights sum to 1.")
+
+
+class CompositeScoreConfig(BaseModel):
+    """Multi-factor continuous score for ranking candidates.
+
+    score(stock, t) = Σ_b (weight_b / Σ_w) × mean_{f∈b}( sign_f · z(f, stock, t) )
+
+    where z is computed cross-sectionally over the candidate set remaining
+    after entry filters at date t. Engages when ranking.by == 'composite_score'.
+    """
+    buckets: dict[str, CompositeBucket] = Field(
+        min_length=1,
+        description="Bucket name → composition. Bucket names are display labels (momentum, quality, value, ...).",
+    )
+    standardization: Literal["rank", "z"] = Field(
+        default="rank",
+        description="'rank' = rank-then-normalize (robust to outliers; recommended). 'z' = (x-mean)/stdev.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_weights(self):
+        total = sum(b.weight for b in self.buckets.values())
+        if total <= 0:
+            raise ValueError("composite_score: bucket weights must sum to a positive number")
+        return self
 
 
 class RebalancingRules(BaseModel):
@@ -449,10 +500,21 @@ class RebalancingConfig(BaseModel):
 
 
 class SizingConfig(BaseModel):
-    """Position sizing."""
+    """Position sizing.
+
+    risk_parity sizes each NEW position inversely proportional to its daily
+    realized volatility over `vol_window_days`. Weights are normalized so the
+    new positions still consume the same aggregate capital as equal_weight
+    (i.e. n_new × current_nav / max_positions). Falls back to equal_weight
+    for any candidate whose vol cannot be estimated (insufficient history).
+    """
     type: Literal["equal_weight", "risk_parity", "fixed_amount"] = Field(default="equal_weight")
     max_positions: int = Field(ge=1, le=100, default=10)
     initial_allocation: float = Field(ge=0, default=1_000_000, description="Starting capital in USD.")
+    vol_window_days: int = Field(default=20, ge=10, le=252,
+                                  description="Window for risk_parity vol estimate. Ignored otherwise.")
+    vol_source: Literal["historical", "ewma"] = Field(default="historical",
+                                                      description="risk_parity vol source.")
 
 
 class BacktestParams(BaseModel):
@@ -480,6 +542,10 @@ class StrategyConfig(BaseModel):
     time_stop: TimeStopConfig | None = None
     exit_conditions: list[ExitCondition] | None = None
     ranking: RankingConfig | None = None
+    composite_score: CompositeScoreConfig | None = Field(
+        default=None,
+        description="Multi-factor continuous score. Engages when ranking.by == 'composite_score'.",
+    )
     rebalancing: RebalancingConfig = Field(default_factory=RebalancingConfig)
     sizing: SizingConfig = Field(default_factory=SizingConfig)
     backtest: BacktestParams = Field(default_factory=BacktestParams)
