@@ -1808,6 +1808,8 @@ async def get_deployment_unified(deploy_id: str, _: str = Depends(verify_api_key
         result["benchmark_sector"] = _sanitize_floats(d["benchmark_sector"])
     if d.get("regime_history"):
         result["regime_history"] = d["regime_history"]
+    if d.get("allocation_profile_history"):
+        result["allocation_profile_history"] = d["allocation_profile_history"]
 
     return result
 
@@ -2213,6 +2215,8 @@ async def get_deployment(deploy_id: str, _: str = Depends(verify_api_key)):
         result["benchmark_sector"] = _sanitize_floats(d["benchmark_sector"])
     if d.get("regime_history"):
         result["regime_history"] = d["regime_history"]
+    if d.get("allocation_profile_history"):
+        result["allocation_profile_history"] = d["allocation_profile_history"]
 
     return result
 
