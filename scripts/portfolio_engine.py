@@ -480,9 +480,10 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
     all_sleeve_symbols.add("SPY")
 
     print(f"\n  Building shared price index for {len(all_sleeve_symbols)} tickers...")
-    shared_price_index, shared_trading_dates = build_price_index(list(all_sleeve_symbols), conn)
+    shared_price_index, shared_open_index, shared_trading_dates = build_price_index(
+        list(all_sleeve_symbols), conn)
     conn.close()
-    shared_pi = (shared_price_index, shared_trading_dates)
+    shared_pi = (shared_price_index, shared_open_index, shared_trading_dates)
 
     # -----------------------------------------------------------------------
     # Step 3: Run each strategy backtest independently
