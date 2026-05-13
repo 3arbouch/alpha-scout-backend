@@ -216,8 +216,6 @@ test("Has 4 individual_signals", len(rank_result.get("individual_signals", [])) 
      f"count={len(rank_result.get('individual_signals', []))}")
 test("Has forward_selection", len(rank_result.get("forward_selection", [])) > 0,
      f"count={len(rank_result.get('forward_selection', []))}")
-test("Has recommended_signals", len(rank_result.get("recommended_signals", [])) > 0,
-     f"count={len(rank_result.get('recommended_signals', []))}")
 
 # Check forward selection math
 steps = rank_result.get("forward_selection", [])
@@ -257,9 +255,6 @@ for step in steps:
           f"delta={step.get('delta')}, "
           f"verdict={step.get('verdict')}")
 
-print(f"\n  Recommended signals: {[s.get('type') for s in rank_result.get('recommended_signals', [])]}")
-
-
 # =========================================================================
 # Test 7: rank_signals — single signal (should still work)
 # =========================================================================
@@ -280,7 +275,6 @@ rank_single = rank_signals(
 
 test("No error", "error" not in rank_single, rank_single.get("error", ""))
 test("1 individual signal", len(rank_single.get("individual_signals", [])) == 1)
-test("1 recommended signal", len(rank_single.get("recommended_signals", [])) == 1)
 test("1 forward selection step", len(rank_single.get("forward_selection", [])) == 1)
 
 
