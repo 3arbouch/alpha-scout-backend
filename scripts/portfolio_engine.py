@@ -635,11 +635,10 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
                 }
             elif prev_profile_name and allocation_profiles:
                 prev_def = allocation_profiles.get(prev_profile_name, {})
-                if prev_profile_name == "default":
-                    current_weights = {lbl: prev_def.get(lbl, 0.0) for lbl in sleeve_labels}
-                else:
-                    pw = prev_def.get("weights", prev_def)
-                    current_weights = {lbl: pw.get(lbl, 0.0) for lbl in sleeve_labels}
+                # Accept both shapes: wrapped {trigger, weights} (production)
+                # and bare {sleeve_label: weight} (legacy test fixtures).
+                pw = prev_def.get("weights", prev_def)
+                current_weights = {lbl: pw.get(lbl, 0.0) for lbl in sleeve_labels}
             else:
                 # First profile of the run — apply target directly, no lerp.
                 prev_profile_name = target_profile_name
