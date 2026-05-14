@@ -883,6 +883,7 @@ def _compute_composite_score(
     date: str,
     price_index: dict,
     composite_config: dict,
+    preloaded_series: dict | None = None,
 ) -> dict:
     """Multi-factor continuous composite score.
 
@@ -898,6 +899,11 @@ def _compute_composite_score(
       - A stock missing EVERY factor in a bucket: that bucket contributes 0.
       - A stock missing every factor in every bucket: returned with NaN
         score (sorted to the end by the caller).
+
+    `preloaded_series` (optional): {factor_name: {symbol: [(date, value)...]}}
+    pre-loaded ONCE at run_backtest startup. When provided, the per-day DB
+    query per factor is skipped. The bisect-as-of lookup is unchanged, so
+    the result is byte-identical to the un-cached path.
 
     Returns {symbol: score}. Higher = better when the agent's intended
     direction has been encoded in factor signs.
@@ -925,21 +931,54 @@ def _compute_composite_score(
     # Load feature values for each factor, as-of bisect at `date`.
     # Result: {factor_name: {symbol: value}}
     values_by_factor: dict[str, dict[str, float]] = {}
+    # 365-day staleness cap: matches the per-day _load_feature_series window
+    # so the preload path produces byte-identical results. Without this, a
+    # full-range preload would let stale (>365d-old) factor values bleed in
+    # for query dates near bt_start, while the per-day fallback would reject
+    # them. Enforcing the cap here keeps the two code paths in lockstep.
+    from datetime import datetime as _dt, timedelta as _td
+    _staleness_cutoff = (_dt.strptime(date, "%Y-%m-%d") - _td(days=365)).strftime("%Y-%m-%d")
+
+    # Convert candidate `symbols` to a set for O(1) membership checks below.
+    # The preloaded series is keyed by the FULL UNIVERSE; the per-day SQL
+    # path is keyed by the candidate subset passed in. Restricting the
+    # preload iteration to `symbols` keeps the cross-sectional
+    # standardization base identical between paths.
+    _symbols_set = set(symbols)
+
     for fname in factor_set:
-        try:
-            series = _load_feature_series(fname, symbols, date, date, conn,
-                                          price_index=price_index)
-        except Exception:
-            values_by_factor[fname] = {}
-            continue
+        # Prefer the preloaded full-range series when available. Falls back
+        # to a per-call _load_feature_series for direct callers (unit tests,
+        # ad-hoc usage) that don't preload.
+        if preloaded_series is not None and fname in preloaded_series:
+            series = preloaded_series[fname]
+            _use_staleness_cap = True
+        else:
+            try:
+                series = _load_feature_series(fname, symbols, date, date, conn,
+                                              price_index=price_index)
+            except Exception:
+                values_by_factor[fname] = {}
+                continue
+            # Per-call path already has the 365d window baked into its SQL.
+            _use_staleness_cap = False
+
         per_sym: dict[str, float] = {}
         for sym, pts in series.items():
+            # When iterating the preloaded series, skip symbols that
+            # aren't in the candidate subset for this ranking call.
+            if _use_staleness_cap and sym not in _symbols_set:
+                continue
             if not pts:
                 continue
             dates_only = [p[0] for p in pts]
             idx = bisect_right(dates_only, date) - 1
             if idx >= 0:
                 v = pts[idx][1]
+                # Drop values older than the 365d cap when using the preload
+                # series, so it matches what per-day SQL would return.
+                if _use_staleness_cap and dates_only[idx] < _staleness_cutoff:
+                    continue
                 if v is not None and np.isfinite(v):
                     per_sym[sym] = float(v)
         values_by_factor[fname] = per_sym
@@ -1023,21 +1062,23 @@ def _compute_composite_score(
 def _compute_ranking_scores(metric: str, symbols: list[str], conn, date: str,
                             price_index: dict, pe_series: dict = None,
                             rsi_cache: dict = None,
-                            composite_config: dict | None = None) -> dict:
+                            composite_config: dict | None = None,
+                            composite_series: dict | None = None) -> dict:
     """
     Compute a single ranking score per symbol for a given date.
-    
+
     Returns:
         {symbol: score} — lower score = better for asc, higher = better for desc.
     """
     from bisect import bisect_right
-    
+
     scores = {}
 
     if metric == "composite_score":
         if composite_config is None:
             return {}
-        return _compute_composite_score(symbols, conn, date, price_index, composite_config)
+        return _compute_composite_score(symbols, conn, date, price_index, composite_config,
+                                         preloaded_series=composite_series)
 
     if metric == "pe_percentile":
         if pe_series is None:
@@ -1141,10 +1182,11 @@ def _compute_ranking_scores(metric: str, symbols: list[str], conn, date: str,
 
 def rank_candidates(candidates: list[tuple], config: dict, conn, date: str,
                     price_index: dict, pe_series: dict = None,
-                    rsi_cache: dict = None) -> list[tuple]:
+                    rsi_cache: dict = None,
+                    composite_series: dict | None = None) -> list[tuple]:
     """
     Rank entry candidates by the configured ranking metric.
-    
+
     Args:
         candidates: [(symbol, drawdown)] from signal matching
         config: Strategy config dict
@@ -1153,13 +1195,15 @@ def rank_candidates(candidates: list[tuple], config: dict, conn, date: str,
         price_index: {symbol: {date: price}}
         pe_series: Pre-loaded PE timeseries (optional, for pe_percentile)
         rsi_cache: Pre-loaded RSI cache (optional)
-    
+        composite_series: Pre-loaded composite-factor timeseries (optional,
+            for composite_score). Skips a per-day DB query per factor.
+
     Returns:
         Sorted candidates list.
     """
     ranking_config = config.get("ranking")
     symbols_in_play = [c[0] for c in candidates]
-    
+
     if not ranking_config:
         # Default: pe_percentile asc when more candidates than slots
         metric = DEFAULT_RANKING_METRIC
@@ -1167,11 +1211,12 @@ def rank_candidates(candidates: list[tuple], config: dict, conn, date: str,
     else:
         metric = ranking_config.get("by", DEFAULT_RANKING_METRIC)
         order = ranking_config.get("order", DEFAULT_RANKING_ORDER)
-    
+
     composite_config = config.get("composite_score") if metric == "composite_score" else None
     scores = _compute_ranking_scores(metric, symbols_in_play, conn, date,
                                       price_index, pe_series, rsi_cache,
-                                      composite_config=composite_config)
+                                      composite_config=composite_config,
+                                      composite_series=composite_series)
     
     if not scores:
         # Fallback to original ordering if ranking data unavailable
@@ -2223,6 +2268,31 @@ def run_backtest(config: dict, force_close_at_end: bool = True,
     # Pre-load PE series for ranking (avoids reloading every day)
     _ranking_pe_series = _load_pe_timeseries(symbols)
 
+    # Pre-load composite_score factor series for the full backtest window
+    # so the daily ranker doesn't re-issue an N-symbol SELECT (with 365-day
+    # padding) on every rank call. Mirrors the pe_series precedent above.
+    # Same behavior — _compute_composite_score still bisects as-of per day —
+    # but the heavy DB query happens ONCE per factor, not once per call.
+    _composite_series_by_factor: dict | None = None
+    _ranking_cfg = config.get("ranking") or {}
+    if _ranking_cfg.get("by") == "composite_score":
+        _composite_cfg = config.get("composite_score") or {}
+        _factor_names: set[str] = set()
+        for _b in (_composite_cfg.get("buckets") or {}).values():
+            for _f in _b.get("factors", []):
+                if isinstance(_f, dict):
+                    _factor_names.add(_f["name"])
+                else:
+                    _factor_names.add(_f.name)
+        if _factor_names:
+            print(f"Pre-loading {len(_factor_names)} composite_score factor(s)...")
+            _composite_series_by_factor = {}
+            for _fname in _factor_names:
+                _composite_series_by_factor[_fname] = _load_feature_series(
+                    _fname, symbols, config["backtest"]["start"],
+                    config["backtest"]["end"], conn, price_index=price_index,
+                )
+
     conn.close()
     # Re-open connection for ranking queries during simulation
     conn = get_connection()
@@ -2410,7 +2480,8 @@ def run_backtest(config: dict, force_close_at_end: bool = True,
             if rebal_mode == "equal_weight":
                 _do_equal_weight_rebalance(portfolio, price_index, date, config,
                                             slippage, symbols, signals, signal_metadata,
-                                            conn, _ranking_pe_series)
+                                            conn, _ranking_pe_series,
+                                            composite_series=_composite_series_by_factor)
             else:
                 _do_rebalance(portfolio, price_index, date, config, slippage, earnings_data)
             last_rebal_date = date
@@ -2448,12 +2519,14 @@ def run_backtest(config: dict, force_close_at_end: bool = True,
                 # Use ranking to select best candidates
                 candidates = rank_candidates(candidates, config, conn, date,
                                               price_index, pe_series=_ranking_pe_series,
-                                              rsi_cache=None)
+                                              rsi_cache=None,
+                                              composite_series=_composite_series_by_factor)
             elif len(candidates) > available_slots:
                 # More candidates than slots, no explicit ranking → default pe_percentile
                 candidates = rank_candidates(candidates, config, conn, date,
                                               price_index, pe_series=_ranking_pe_series,
-                                              rsi_cache=None)
+                                              rsi_cache=None,
+                                              composite_series=_composite_series_by_factor)
             elif entry_priority == "worst_drawdown":
                 candidates.sort(key=lambda x: x[1])  # most negative first
             elif entry_priority == "random":
@@ -2688,7 +2761,8 @@ def _do_rebalance(portfolio: Portfolio, price_index: dict, date: str,
 def _do_equal_weight_rebalance(portfolio: Portfolio, price_index: dict, date: str,
                                 config: dict, slippage: float, symbols: list[str],
                                 signals: dict, signal_metadata: dict,
-                                conn, pe_series: dict = None):
+                                conn, pe_series: dict = None,
+                                composite_series: dict | None = None):
     """
     Equal-weight rebalance: reset all positions to 1/N weight.
     
@@ -2720,7 +2794,8 @@ def _do_equal_weight_rebalance(portfolio: Portfolio, price_index: dict, date: st
         
         if candidates:
             ranked = rank_candidates(candidates, config, conn, date,
-                                      price_index, pe_series=pe_series)
+                                      price_index, pe_series=pe_series,
+                                      composite_series=composite_series)
             target_symbols = set(sym for sym, _ in ranked[:top_n])
         else:
             target_symbols = set(portfolio.positions.keys())
