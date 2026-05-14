@@ -103,12 +103,23 @@ class _SleeveContext:
         # Bookkeeping
         self.entry_mode: str = self.config["backtest"].get("entry_price", "next_close")
         self.slippage_bps: float = self.config["backtest"].get("slippage_bps", 10)
-        # Gate dates: None means always-on (regime_gate=["*"] or [] or regime
-        # disabled). A set means the sleeve is on ONLY on those dates.
+        # ---- Gate state ----
+        # Combined gate (intersection of layer 1 + layer 2). None means
+        # always-on; a set means the sleeve is on ONLY on those dates.
         self.gate_dates_on: set[str] | None = None
+        # Allocation-profile layer ONLY (None when no allocation_profile is
+        # configured for this sleeve). Used to detect "liquidate this sleeve
+        # today" events — regime_gate transitions just pause, they don't
+        # liquidate. Allocation_profile is what actually moves capital.
+        self.alloc_dates_on: set[str] | None = None
 
     def is_gated_on(self, date: str) -> bool:
         return self.gate_dates_on is None or date in self.gate_dates_on
+
+    def alloc_active_today(self, date: str) -> bool:
+        """Whether the allocation_profile gives this sleeve weight > 0 today.
+        True when no allocation_profile is configured (alloc layer not in play)."""
+        return self.alloc_dates_on is None or date in self.alloc_dates_on
 
 
 # ---------------------------------------------------------------------------
@@ -315,16 +326,57 @@ def _run_daily_loop(
     earnings_data: dict,
     force_close_at_end: bool,
     initial_capital: float,
+    profile_name_by_date: dict[str, str] | None = None,
 ) -> dict:
     """Daily loop: iterate trading days, apply per-sleeve directives,
     execute trades against the unified PositionBook, emit unified ledger.
 
-    Step 3a: single sleeve, no regime. All sleeves are always gated on.
+    On any day a sleeve transitions from gated-on to gated-off (typically a
+    regime/allocation_profile flip), all sleeve-tagged positions are
+    liquidated cleanly with reason=`rebalance_to_<profile>`. This is the
+    actual broker action when the portfolio reallocates a sleeve to 0%.
     """
     all_trades: list[dict] = []
     last_date = trading_dates[-1] if trading_dates else None
+    profile_name_by_date = profile_name_by_date or {}
+
+    # Track each sleeve's ALLOCATION-PROFILE gate state from the prior day so
+    # we can detect the day allocation_profile drops it to 0% and emit clean
+    # liquidation trades. regime_gate transitions only PAUSE the sleeve;
+    # positions stay intact (matches v1 behavior). Only allocation_profile
+    # is the "actual capital is moving" signal.
+    prev_alloc_active: dict[str, bool] = {ctx.label: False for ctx in sleeves}
+    if trading_dates:
+        d0 = trading_dates[0]
+        for sleeve in sleeves:
+            prev_alloc_active[sleeve.label] = sleeve.alloc_active_today(d0)
 
     for date in trading_dates:
+        # -------------------------------------------------------------------
+        # 0. Allocation-profile transition: sleeve had weight > 0 yesterday,
+        #    weight == 0 today → liquidate all sleeve-tagged positions cleanly.
+        # -------------------------------------------------------------------
+        for sleeve in sleeves:
+            alloc_today = sleeve.alloc_active_today(date)
+            if prev_alloc_active[sleeve.label] and not alloc_today:
+                # Emit clean liquidation trades for this sleeve's holdings.
+                # reason carries the target profile name so trade-ledger
+                # readers can attribute the move.
+                profile_name = profile_name_by_date.get(date) or "gated_off"
+                reason = f"rebalance_to_{profile_name}"
+                for symbol in list(book.symbols_held_by_sleeve(sleeve.label)):
+                    price = price_index.get(symbol, {}).get(date)
+                    if price is None:
+                        continue
+                    t = book.sell(
+                        sleeve_label=sleeve.label, symbol=symbol, date=date,
+                        exec_price=price, reason=reason, shares=None,
+                        slippage_bps=sleeve.slippage_bps,
+                    )
+                    if t is not None:
+                        all_trades.append(t)
+            prev_alloc_active[sleeve.label] = alloc_today
+
         # -------------------------------------------------------------------
         # 1. Execute pending entries from yesterday (next_close / next_open)
         # -------------------------------------------------------------------
@@ -493,15 +545,9 @@ def run_portfolio_backtest(
     print(f"Capital: ${initial_capital:,.0f} | Period: {bt_start} to {bt_end}")
     print(f"{'=' * 70}")
 
-    # --- Phase 2 Step 3c+ guardrail: allocation_profiles not yet supported.
-    # Step 3c handles regime_gate (sleeve gates off on regime-off days).
-    # Step 3d/3e will add allocation_profile-driven weight transitions.
     sleeves_def = portfolio_config["sleeves"]
-    if portfolio_config.get("allocation_profiles"):
-        raise NotImplementedError(
-            "engine_version=v2 does not yet support allocation_profiles. "
-            "In progress (Phase 2 Step 3d-3e). Use engine_version=v1 for now."
-        )
+    allocation_profiles = portfolio_config.get("allocation_profiles") or None
+    profile_priority = portfolio_config.get("profile_priority") or []
 
     # --- Resolve universe (union across sleeves) + load shared price index ---
     conn = get_connection()
@@ -572,6 +618,14 @@ def run_portfolio_backtest(
             for rid in sd.get("regime_gate", []):
                 if rid != "*":
                     all_regime_ids.add(rid)
+        # Also collect regime IDs referenced by allocation_profile triggers
+        if allocation_profiles:
+            for pname, pdef in allocation_profiles.items():
+                if pname == "default":
+                    continue
+                if isinstance(pdef, dict):
+                    for rid in pdef.get("trigger", []):
+                        all_regime_ids.add(rid)
         if all_regime_ids:
             print(f"\n  Loading {len(all_regime_ids)} regime definitions...")
             inline_defs = portfolio_config.get("regime_definitions") or {}
@@ -612,23 +666,83 @@ def run_portfolio_backtest(
                 pct = cnt / max(len(regime_series), 1) * 100
                 print(f"    {rname}: {cnt} days ({pct:.1f}%)")
 
-    # --- Per-sleeve gate dates (regime_gate layer only — Step 3c) -----------
+    # --- Allocation_profile resolution (Step 3d) -----------------------------
+    # For each trading day, compute the target weight per sleeve from the
+    # active profile. profile_priority is walked top-to-bottom; the first
+    # profile whose triggers are all in today's active regime set wins.
+    # "default" matches unconditionally. Result: profile_weights_by_date.
+    profile_weights_by_date: dict[str, dict[str, float]] = {}
+    profile_name_by_date: dict[str, str] = {}
+
+    def _resolve_today_profile(active_regime_names: set[str]):
+        if not allocation_profiles or not profile_priority:
+            return None, None
+        for pname in profile_priority:
+            if pname == "default":
+                w = allocation_profiles.get("default", {}).get("weights", {})
+                return "default", w
+            pdef = allocation_profiles.get(pname, {})
+            triggers = pdef.get("trigger", [])
+            if not triggers:
+                continue
+            trigger_names = {regime_id_to_name.get(rid, rid) for rid in triggers}
+            if trigger_names and trigger_names.issubset(active_regime_names):
+                return pname, pdef.get("weights", {})
+        if "default" in allocation_profiles:
+            return "default", allocation_profiles["default"].get("weights", {})
+        return None, None
+
+    if regime_enabled and allocation_profiles:
+        for d in trading_dates:
+            active = set(regime_series.get(d, []))
+            pname, weights = _resolve_today_profile(active)
+            if pname is not None:
+                profile_name_by_date[d] = pname
+                profile_weights_by_date[d] = weights or {}
+
+    # --- Per-sleeve gate dates: intersection of regime_gate AND profile>0 ---
     for ctx in sleeve_ctxs:
+        # Layer 1: regime_gate dates
         gate = ctx.regime_gate
-        # ["*"], empty, or regime disabled → always on
         if not regime_enabled or gate == ["*"] or not gate:
+            regime_dates_on = None
+        else:
+            gated_names = {regime_id_to_name.get(rid, rid) for rid in gate}
+            regime_dates_on = {
+                d for d, active in regime_series.items()
+                if gated_names & set(active)
+            }
+
+        # Layer 2: allocation_profile non-zero-weight dates
+        if profile_weights_by_date:
+            alloc_dates_on = {
+                d for d, w in profile_weights_by_date.items()
+                if float(w.get(ctx.label, 0) or 0) > 0
+            }
+        else:
+            alloc_dates_on = None
+        ctx.alloc_dates_on = alloc_dates_on   # stored separately for liquidation detection
+
+        # Intersect — sleeve is on iff BOTH layers allow it.
+        if regime_dates_on is None and alloc_dates_on is None:
             ctx.gate_dates_on = None
-            continue
-        gated_names = {regime_id_to_name.get(rid, rid) for rid in gate}
-        dates_on = {
-            d for d, active in regime_series.items()
-            if gated_names & set(active)
-        }
-        ctx.gate_dates_on = dates_on
-        total = len(regime_series) if regime_series else len(trading_dates)
-        on = len(dates_on)
-        pct = on / max(total, 1) * 100
-        print(f"  Sleeve '{ctx.label}' gate {gate}: {on}/{total} days active ({pct:.1f}%)")
+        elif regime_dates_on is None:
+            ctx.gate_dates_on = alloc_dates_on
+        elif alloc_dates_on is None:
+            ctx.gate_dates_on = regime_dates_on
+        else:
+            ctx.gate_dates_on = regime_dates_on & alloc_dates_on
+
+        if ctx.gate_dates_on is not None and regime_series:
+            total = len(regime_series)
+            on = len(ctx.gate_dates_on)
+            layers = []
+            if regime_dates_on is not None:
+                layers.append("regime_gate")
+            if alloc_dates_on is not None:
+                layers.append("allocation_profiles")
+            src = "+".join(layers) if layers else "none"
+            print(f"  Sleeve '{ctx.label}' gate ({src}): {on}/{total} days active ({on/total*100:.1f}%)")
 
     # --- Initialize PositionBook with per-sleeve cash pools ---
     initial_cash_by_sleeve = {ctx.label: ctx.allocated_capital for ctx in sleeve_ctxs}
@@ -646,6 +760,7 @@ def run_portfolio_backtest(
         earnings_data=earnings_data,
         force_close_at_end=force_close_at_end,
         initial_capital=initial_capital,
+        profile_name_by_date=profile_name_by_date,
     )
     conn.close()
 
