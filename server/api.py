@@ -24,6 +24,21 @@ from typing import Optional
 from contextlib import contextmanager
 from functools import partial
 
+# Load .env BEFORE any os.environ.get() reads below. The .env file lives at
+# the repo root (one level above this file). load_dotenv() is idempotent —
+# vars already set in the environment (e.g., `env VAR=… python …` overrides
+# or systemd unit Environment= lines) win, so this only fills in what the
+# launching shell didn't already set. Prevents the "dashboard auth not
+# configured" failure mode when api.py is restarted from a fresh shell.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+except ImportError:
+    # python-dotenv not installed — fall back to inherited environment.
+    # Dashboard auth / JWT signing / API keys will fail loudly downstream
+    # if the launching shell didn't source .env.
+    pass
+
 from fastapi import FastAPI, HTTPException, Query, Depends, Security, Header
 from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
