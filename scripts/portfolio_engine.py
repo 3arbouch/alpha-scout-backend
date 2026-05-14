@@ -447,26 +447,104 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
     # Step 2.5: Pre-compute per-sleeve gate dates for execution-level gating
     # -----------------------------------------------------------------------
     # Each sleeve gets a set of dates where new entries are allowed.
-    # When regime_gate is ["*"], [], or regime is disabled, gate_dates is None
-    # (always on). Empty list is treated identically to ["*"] — matches the
-    # PortfolioSleeve schema contract and the natural reading of "no constraints
-    # specified". Without this, an agent emitting regime_gate=[] silently
-    # produced a portfolio that never traded (cash for the entire backtest).
+    #
+    # Two independent sources can gate a sleeve off on a given day:
+    #
+    #   1. regime_gate on the sleeve — when set to a list of regime IDs, the
+    #      sleeve is active only on days when at least one of those regimes
+    #      is firing. ["*"], [], or regime disabled = always-on at this layer.
+    #
+    #   2. allocation_profiles at the portfolio — when an allocation profile
+    #      assigns the sleeve weight 0 for a given day's active regimes, the
+    #      sleeve should be sidelined: the portfolio-level lerp will pull its
+    #      capital to 0%, and the sleeve's own simulation must stop emitting
+    #      entry / rebalance trades on those days, or it produces phantom
+    #      trades that don't move portfolio NAV but pollute the trade log.
+    #
+    # Effective gate = intersection of the two. A sleeve is "on" only when
+    # both layers allow it.
+    #
+    # Without this, regime_gate=[] silently meant "always active" even when
+    # allocation_profiles zero'd the sleeve out — producing the v44-style bug
+    # where the trade ledger shows entries during gated-off regimes.
+    def _profile_weights_for_regimes(active_regime_names):
+        """Resolve the active allocation profile for a given day's regimes.
+
+        Mirrors the in-loop _resolve_profile semantics but doesn't depend on
+        transition state. Used to derive gate dates from allocation profiles
+        before the main NAV loop runs. Returns the inner `.weights` dict, or
+        None if allocation_profiles aren't configured.
+        """
+        if not allocation_profiles or not profile_priority:
+            return None
+        for pname in profile_priority:
+            if pname == "default":
+                return allocation_profiles.get("default", {}).get("weights", {})
+            pdef = allocation_profiles.get(pname, {})
+            triggers = pdef.get("trigger", [])
+            if not triggers:
+                continue
+            trigger_names = {regime_id_to_name.get(rid, rid) for rid in triggers}
+            if trigger_names and trigger_names.issubset(active_regime_names):
+                return pdef.get("weights", {})
+        return allocation_profiles.get("default", {}).get("weights", {}) if "default" in allocation_profiles else None
+
+    # Build per-day allocation-profile weights once, reuse per sleeve below.
+    profile_weights_by_date = {}
+    if regime_enabled and allocation_profiles and profile_priority:
+        for date, active in regime_series.items():
+            w = _profile_weights_for_regimes(set(active))
+            if w is not None:
+                profile_weights_by_date[date] = w
+
     sleeve_gate_dates = []
     for sleeve in sleeves:
+        label = sleeve["label"]
         gate = sleeve["regime_gate"]
+
+        # Layer 1: regime_gate dates ("always-on" when ["*"], [], or disabled).
         if not regime_enabled or gate == ["*"] or not gate:
-            sleeve_gate_dates.append(None)  # no gating — always active
+            regime_dates_on = None  # sentinel: all dates allowed
         else:
             gated_names = {regime_id_to_name.get(rid, rid) for rid in gate}
-            dates_on = set()
-            for date, active in regime_series.items():
-                if gated_names & set(active):
-                    dates_on.add(date)
-            sleeve_gate_dates.append(dates_on)
+            regime_dates_on = {
+                date for date, active in regime_series.items()
+                if gated_names & set(active)
+            }
+
+        # Layer 2: allocation-profile non-zero-weight dates. None when no
+        # allocation_profiles are configured.
+        if profile_weights_by_date:
+            alloc_dates_on = {
+                d for d, w in profile_weights_by_date.items()
+                if float(w.get(label, 0) or 0) > 0
+            }
+        else:
+            alloc_dates_on = None
+
+        # Intersect — sleeve is on iff BOTH layers allow it.
+        if regime_dates_on is None and alloc_dates_on is None:
+            dates_on = None  # always-on (no gating at all)
+        elif regime_dates_on is None:
+            dates_on = alloc_dates_on
+        elif alloc_dates_on is None:
+            dates_on = regime_dates_on
+        else:
+            dates_on = regime_dates_on & alloc_dates_on
+
+        sleeve_gate_dates.append(dates_on)
+
+        if dates_on is not None and regime_series:
             total = len(regime_series)
             on = len(dates_on)
-            print(f"  Sleeve '{sleeve['label']}' gate: {on}/{total} days active ({on/total*100:.1f}%)")
+            # Indicate which layers contributed when both are present.
+            layers = []
+            if regime_dates_on is not None:
+                layers.append("regime_gate")
+            if alloc_dates_on is not None:
+                layers.append("allocation_profiles")
+            src = "+".join(layers)
+            print(f"  Sleeve '{label}' gate ({src}): {on}/{total} days active ({on/total*100:.1f}%)")
 
     # -----------------------------------------------------------------------
     # Step 2.6: Build shared price index for all sleeve universes
