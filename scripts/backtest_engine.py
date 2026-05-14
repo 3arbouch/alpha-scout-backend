@@ -1807,29 +1807,39 @@ def precompute_signals(config: dict, symbols: list[str], conn, price_index: dict
 # ---------------------------------------------------------------------------
 # Price Lookup
 # ---------------------------------------------------------------------------
-def build_price_index(symbols: list[str], conn) -> dict:
+def build_price_index(symbols: list[str], conn) -> tuple[dict, dict, list]:
     """
-    Build a fast price lookup: {symbol: {date: close}}.
+    Build fast price lookups for both close and open:
+      close_index = {symbol: {date: close}}
+      open_index  = {symbol: {date: open}}
     Also returns sorted list of all trading dates.
 
-    Uses a single bulk SQL query instead of per-symbol queries.
+    Uses a single bulk SQL query. open_index only includes (symbol, date)
+    pairs where open is non-null in the source table; callers that fall back
+    to close on missing-open dates should handle that themselves.
+
+    open_index is consumed by entry_mode="next_open" to fill a signal from
+    date D at open[D+1], avoiding the same-bar lookahead that would result
+    from using close[D].
     """
-    price_index = {s: {} for s in symbols}
+    close_index = {s: {} for s in symbols}
+    open_index = {s: {} for s in symbols}
     all_dates = set()
 
     cur = conn.cursor()
-    # Bulk load all prices in one query
     placeholders = ",".join("?" * len(symbols))
     cur.execute(
-        f"SELECT symbol, date, close FROM prices WHERE symbol IN ({placeholders}) ORDER BY symbol, date ASC",
+        f"SELECT symbol, date, close, open FROM prices WHERE symbol IN ({placeholders}) ORDER BY symbol, date ASC",
         symbols,
     )
-    for symbol, date, close in cur.fetchall():
-        price_index[symbol][date] = close
+    for symbol, date, close, open_ in cur.fetchall():
+        close_index[symbol][date] = close
+        if open_ is not None:
+            open_index[symbol][date] = open_
         all_dates.add(date)
 
     trading_dates = sorted(all_dates)
-    return price_index, trading_dates
+    return close_index, open_index, trading_dates
 
 
 # ---------------------------------------------------------------------------
@@ -2166,11 +2176,13 @@ def run_backtest(config: dict, force_close_at_end: bool = True,
     symbols = resolve_universe(config, conn)
     print(f"Universe: {len(symbols)} tickers — {', '.join(symbols)}")
 
-    # Use shared price index if provided, otherwise build one
+    # Use shared price index if provided, otherwise build one.
+    # shared_price_index is a 3-tuple: (close_index, open_index, trading_dates).
     if shared_price_index is not None:
-        shared_pi, shared_td = shared_price_index
+        shared_pi, shared_oi, shared_td = shared_price_index
         # Filter to this sleeve's symbols (shared index may have more tickers)
         price_index = {s: shared_pi[s] for s in symbols if s in shared_pi}
+        open_index = {s: shared_oi.get(s, {}) for s in symbols}
         all_dates_from_shared = set()
         for s in symbols:
             if s in shared_pi:
@@ -2179,6 +2191,7 @@ def run_backtest(config: dict, force_close_at_end: bool = True,
         print(f"Using shared price index ({len(price_index)} tickers from shared)")
     else:
         price_index = None
+        open_index = None
         trading_dates = None
 
     # Pre-compute signals (pass price_index to avoid re-querying)
@@ -2203,7 +2216,7 @@ def run_backtest(config: dict, force_close_at_end: bool = True,
     # Build price index if not shared
     if price_index is None:
         print("Building price index...")
-        price_index, trading_dates = build_price_index(symbols, conn)
+        price_index, open_index, trading_dates = build_price_index(symbols, conn)
     else:
         print("Price index ready (shared)")
 
@@ -2286,13 +2299,17 @@ def run_backtest(config: dict, force_close_at_end: bool = True,
                 total = sum(inv.values())
                 risk_parity_weights = {s: v / total for s, v in inv.items()}
 
+        # Select the fill-price index for this batch of pending entries.
+        # next_close → close[D+1] (price_index). next_open → open[D+1] (open_index).
+        fill_index = open_index if entry_mode == "next_open" else price_index
+
         for symbol, peak_price, sig_detail in pending_entries:
             if symbol in portfolio.positions:
                 continue  # Already in portfolio
             if len(portfolio.positions) >= max_positions:
                 break  # Full
 
-            price = price_index.get(symbol, {}).get(date)
+            price = fill_index.get(symbol, {}).get(date)
             if not price:
                 continue
 
@@ -2342,38 +2359,49 @@ def run_backtest(config: dict, force_close_at_end: bool = True,
         pending_entries = []
 
         # --- Check exits for open positions ---
+        # Gated-off days suppress exits too. Rationale: when an allocation
+        # profile sets the sleeve to 0%, the portfolio-level lerp has already
+        # liquidated the sleeve's allocated capital. In a live deployment the
+        # underlying broker positions are gone; only the sleeve's internal
+        # bookkeeping still tracks them. Firing stop_loss / take_profit /
+        # time_stop / fundamental_exit on those phantom positions would emit
+        # SELL trades the broker can't execute, and create a dual-bookkeeping
+        # mismatch where cumulative shares per symbol go negative in the
+        # combined trade ledger (sleeve-internal SELL after a portfolio-level
+        # rebalance SELL of the same lot).
         closed_today = []
-        for symbol, pos in list(portfolio.positions.items()):
-            price = price_index.get(symbol, {}).get(date)
-            if not price:
-                continue
+        if _gate_on:
+            for symbol, pos in list(portfolio.positions.items()):
+                price = price_index.get(symbol, {}).get(date)
+                if not price:
+                    continue
 
-            # Check stop loss
-            if check_stop_loss(pos, price, config):
-                portfolio.close_position(symbol, date, price, "stop_loss", slippage)
-                closed_today.append(symbol)
-                if cooldown_days > 0:
-                    stop_loss_cooldowns[symbol] = date
-                continue
+                # Check stop loss
+                if check_stop_loss(pos, price, config):
+                    portfolio.close_position(symbol, date, price, "stop_loss", slippage)
+                    closed_today.append(symbol)
+                    if cooldown_days > 0:
+                        stop_loss_cooldowns[symbol] = date
+                    continue
 
-            # Check take profit
-            if check_take_profit(pos, price, config):
-                portfolio.close_position(symbol, date, price, "take_profit", slippage)
-                closed_today.append(symbol)
-                continue
+                # Check take profit
+                if check_take_profit(pos, price, config):
+                    portfolio.close_position(symbol, date, price, "take_profit", slippage)
+                    closed_today.append(symbol)
+                    continue
 
-            # Check time stop
-            if check_time_stop(pos, date, config):
-                portfolio.close_position(symbol, date, price, "time_stop", slippage)
-                closed_today.append(symbol)
-                continue
+                # Check time stop
+                if check_time_stop(pos, date, config):
+                    portfolio.close_position(symbol, date, price, "time_stop", slippage)
+                    closed_today.append(symbol)
+                    continue
 
-            # Check fundamental exit conditions
-            if exit_signals.get(symbol, {}).get(date):
-                reason = exit_signals[symbol][date].get("reason", "fundamental_exit")
-                portfolio.close_position(symbol, date, price, reason, slippage)
-                closed_today.append(symbol)
-                continue
+                # Check fundamental exit conditions
+                if exit_signals.get(symbol, {}).get(date):
+                    reason = exit_signals[symbol][date].get("reason", "fundamental_exit")
+                    portfolio.close_position(symbol, date, price, reason, slippage)
+                    closed_today.append(symbol)
+                    continue
 
         # --- Check rebalancing (only if regime gate is on) ---
         rebal_freq = config.get("rebalancing", {}).get("frequency", "none")
@@ -2436,25 +2464,13 @@ def run_backtest(config: dict, force_close_at_end: bool = True,
             if ranking_top_n and len(candidates) > ranking_top_n:
                 candidates = candidates[:ranking_top_n]
 
-            # Fill available slots
+            # Fill available slots — queue for next-day execution.
+            # Both next_close and next_open queue here; the difference is the
+            # fill-price index used on the next iteration (close vs open).
             for symbol, drawdown in candidates[:available_slots]:
                 peak_price = _find_recent_peak(symbol, date, price_index, config)
                 sig_detail = signal_metadata.get(symbol, {}).get(date)
-
-                if entry_mode == "next_close":
-                    pending_entries.append((symbol, peak_price, sig_detail))
-                else:
-                    price = price_index.get(symbol, {}).get(date)
-                    if price:
-                        current_nav = portfolio.nav(price_index, date)
-                        amount = min(current_nav / max_positions, portfolio.cash * 0.99)
-                        if amount >= 1000:
-                            portfolio.open_position(
-                                symbol=symbol, date=date, price=price,
-                                amount=amount, slippage_bps=slippage,
-                                peak_price=peak_price,
-                                signal_detail=sig_detail,
-                            )
+                pending_entries.append((symbol, peak_price, sig_detail))
 
         # --- Record NAV ---
         portfolio.record_nav(price_index, date)

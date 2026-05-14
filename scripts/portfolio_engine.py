@@ -447,26 +447,104 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
     # Step 2.5: Pre-compute per-sleeve gate dates for execution-level gating
     # -----------------------------------------------------------------------
     # Each sleeve gets a set of dates where new entries are allowed.
-    # When regime_gate is ["*"], [], or regime is disabled, gate_dates is None
-    # (always on). Empty list is treated identically to ["*"] — matches the
-    # PortfolioSleeve schema contract and the natural reading of "no constraints
-    # specified". Without this, an agent emitting regime_gate=[] silently
-    # produced a portfolio that never traded (cash for the entire backtest).
+    #
+    # Two independent sources can gate a sleeve off on a given day:
+    #
+    #   1. regime_gate on the sleeve — when set to a list of regime IDs, the
+    #      sleeve is active only on days when at least one of those regimes
+    #      is firing. ["*"], [], or regime disabled = always-on at this layer.
+    #
+    #   2. allocation_profiles at the portfolio — when an allocation profile
+    #      assigns the sleeve weight 0 for a given day's active regimes, the
+    #      sleeve should be sidelined: the portfolio-level lerp will pull its
+    #      capital to 0%, and the sleeve's own simulation must stop emitting
+    #      entry / rebalance trades on those days, or it produces phantom
+    #      trades that don't move portfolio NAV but pollute the trade log.
+    #
+    # Effective gate = intersection of the two. A sleeve is "on" only when
+    # both layers allow it.
+    #
+    # Without this, regime_gate=[] silently meant "always active" even when
+    # allocation_profiles zero'd the sleeve out — producing the v44-style bug
+    # where the trade ledger shows entries during gated-off regimes.
+    def _profile_weights_for_regimes(active_regime_names):
+        """Resolve the active allocation profile for a given day's regimes.
+
+        Mirrors the in-loop _resolve_profile semantics but doesn't depend on
+        transition state. Used to derive gate dates from allocation profiles
+        before the main NAV loop runs. Returns the inner `.weights` dict, or
+        None if allocation_profiles aren't configured.
+        """
+        if not allocation_profiles or not profile_priority:
+            return None
+        for pname in profile_priority:
+            if pname == "default":
+                return allocation_profiles.get("default", {}).get("weights", {})
+            pdef = allocation_profiles.get(pname, {})
+            triggers = pdef.get("trigger", [])
+            if not triggers:
+                continue
+            trigger_names = {regime_id_to_name.get(rid, rid) for rid in triggers}
+            if trigger_names and trigger_names.issubset(active_regime_names):
+                return pdef.get("weights", {})
+        return allocation_profiles.get("default", {}).get("weights", {}) if "default" in allocation_profiles else None
+
+    # Build per-day allocation-profile weights once, reuse per sleeve below.
+    profile_weights_by_date = {}
+    if regime_enabled and allocation_profiles and profile_priority:
+        for date, active in regime_series.items():
+            w = _profile_weights_for_regimes(set(active))
+            if w is not None:
+                profile_weights_by_date[date] = w
+
     sleeve_gate_dates = []
     for sleeve in sleeves:
+        label = sleeve["label"]
         gate = sleeve["regime_gate"]
+
+        # Layer 1: regime_gate dates ("always-on" when ["*"], [], or disabled).
         if not regime_enabled or gate == ["*"] or not gate:
-            sleeve_gate_dates.append(None)  # no gating — always active
+            regime_dates_on = None  # sentinel: all dates allowed
         else:
             gated_names = {regime_id_to_name.get(rid, rid) for rid in gate}
-            dates_on = set()
-            for date, active in regime_series.items():
-                if gated_names & set(active):
-                    dates_on.add(date)
-            sleeve_gate_dates.append(dates_on)
+            regime_dates_on = {
+                date for date, active in regime_series.items()
+                if gated_names & set(active)
+            }
+
+        # Layer 2: allocation-profile non-zero-weight dates. None when no
+        # allocation_profiles are configured.
+        if profile_weights_by_date:
+            alloc_dates_on = {
+                d for d, w in profile_weights_by_date.items()
+                if float(w.get(label, 0) or 0) > 0
+            }
+        else:
+            alloc_dates_on = None
+
+        # Intersect — sleeve is on iff BOTH layers allow it.
+        if regime_dates_on is None and alloc_dates_on is None:
+            dates_on = None  # always-on (no gating at all)
+        elif regime_dates_on is None:
+            dates_on = alloc_dates_on
+        elif alloc_dates_on is None:
+            dates_on = regime_dates_on
+        else:
+            dates_on = regime_dates_on & alloc_dates_on
+
+        sleeve_gate_dates.append(dates_on)
+
+        if dates_on is not None and regime_series:
             total = len(regime_series)
             on = len(dates_on)
-            print(f"  Sleeve '{sleeve['label']}' gate: {on}/{total} days active ({on/total*100:.1f}%)")
+            # Indicate which layers contributed when both are present.
+            layers = []
+            if regime_dates_on is not None:
+                layers.append("regime_gate")
+            if alloc_dates_on is not None:
+                layers.append("allocation_profiles")
+            src = "+".join(layers)
+            print(f"  Sleeve '{label}' gate ({src}): {on}/{total} days active ({on/total*100:.1f}%)")
 
     # -----------------------------------------------------------------------
     # Step 2.6: Build shared price index for all sleeve universes
@@ -480,9 +558,10 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
     all_sleeve_symbols.add("SPY")
 
     print(f"\n  Building shared price index for {len(all_sleeve_symbols)} tickers...")
-    shared_price_index, shared_trading_dates = build_price_index(list(all_sleeve_symbols), conn)
+    shared_price_index, shared_open_index, shared_trading_dates = build_price_index(
+        list(all_sleeve_symbols), conn)
     conn.close()
-    shared_pi = (shared_price_index, shared_trading_dates)
+    shared_pi = (shared_price_index, shared_open_index, shared_trading_dates)
 
     # -----------------------------------------------------------------------
     # Step 3: Run each strategy backtest independently
@@ -635,11 +714,10 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
                 }
             elif prev_profile_name and allocation_profiles:
                 prev_def = allocation_profiles.get(prev_profile_name, {})
-                if prev_profile_name == "default":
-                    current_weights = {lbl: prev_def.get(lbl, 0.0) for lbl in sleeve_labels}
-                else:
-                    pw = prev_def.get("weights", prev_def)
-                    current_weights = {lbl: pw.get(lbl, 0.0) for lbl in sleeve_labels}
+                # Accept both shapes: wrapped {trigger, weights} (production)
+                # and bare {sleeve_label: weight} (legacy test fixtures).
+                pw = prev_def.get("weights", prev_def)
+                current_weights = {lbl: pw.get(lbl, 0.0) for lbl in sleeve_labels}
             else:
                 # First profile of the run — apply target directly, no lerp.
                 prev_profile_name = target_profile_name
@@ -1436,6 +1514,71 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
         if rebalance_trades_by_sleeve[i]:
             sleeve_result.setdefault("trades", []).extend(rebalance_trades_by_sleeve[i])
             n_rebalance_trades += len(rebalance_trades_by_sleeve[i])
+
+    # ---- Reconcile the merged trade ledger against actual holdings ----------
+    # The sleeve's standalone simulation and the portfolio-level rebalance lerp
+    # are independent traces. When merged, sleeve-level SELLs (stop_loss,
+    # take_profit, time_stop, fundamental_exit, backtest_end) can refer to
+    # share counts that exceed what the broker actually holds after a prior
+    # rebalance liquidation. Left unfixed, cumulative shares per symbol go
+    # negative — fine for sleeve-internal NAV (it's tracked separately) but
+    # misleading for the user-facing trade ledger and for live execution.
+    #
+    # Reconciliation rule: walk trades chronologically per (sleeve, symbol).
+    # When a SELL would exceed currently-held shares, cap its `shares` at the
+    # remaining holding and recompute `amount` / `pnl`. If holdings are zero,
+    # drop the trade entirely — it represents a phantom exit on positions the
+    # broker has already liquidated. BUY trades and rebalance trades are
+    # unchanged. Sleeve NAV / Sharpe / metrics are unaffected (computed
+    # upstream from nav_history, not from the reconciled trade list).
+    from collections import defaultdict as _dd
+    for sleeve_result in sleeve_results:
+        all_trades = sleeve_result.get("trades", [])
+        if not all_trades:
+            continue
+        # Sort by (date, action-order). On the same date, rebalance trades
+        # represent the start-of-day portfolio reallocation and should be
+        # applied before sleeve-internal exits / entries.
+        def _trade_sort_key(t):
+            reason = t.get("reason", "") or ""
+            # Portfolio-level rebalance first, then BUYs, then SELLs.
+            phase = 0 if reason.startswith("rebalance_to_") else (1 if t["action"] == "BUY" else 2)
+            return (t["date"], phase)
+
+        ordered = sorted(all_trades, key=_trade_sort_key)
+        cum_shares: dict = _dd(float)
+        reconciled: list = []
+        for t in ordered:
+            sym = t["symbol"]
+            shares = float(t.get("shares", 0))
+            if t["action"] == "BUY":
+                cum_shares[sym] += shares
+                reconciled.append(t)
+                continue
+            # SELL
+            held = cum_shares[sym]
+            if held <= 1e-6:
+                # Phantom SELL on already-liquidated position — drop it.
+                continue
+            if shares > held + 1e-6:
+                # Scale this SELL down to the remaining holding.
+                scaled = dict(t)
+                scaled["shares"] = round(held, 6)
+                price = float(scaled.get("price", 0) or 0)
+                if price > 0:
+                    scaled["amount"] = round(held * price, 2)
+                entry_price = float(scaled.get("entry_price", 0) or 0)
+                if entry_price > 0 and price > 0:
+                    scaled["pnl"] = round((price - entry_price) * held, 2)
+                    # pnl_pct is per-share return; unchanged when shares scale
+                scaled["_reconciled_shares"] = round(shares, 6)
+                scaled["_reconciled_reason"] = "scaled_to_remaining_holding"
+                cum_shares[sym] = 0.0
+                reconciled.append(scaled)
+            else:
+                cum_shares[sym] -= shares
+                reconciled.append(t)
+        sleeve_result["trades"] = reconciled
 
     rebalance_summary = {
         "rebalance_active": emit_rebalance_trades,

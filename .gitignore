@@ -20,3 +20,54 @@ strategies/
 auto_trader/.prompt_*
 auto_trader/.stop_*
 auto_trader/.starting_*
+
+# Ad-hoc audit / debug scratch — dotfile-prefixed, underscore-prefixed,
+# and obvious-scratch-name scripts/outputs kept out of version control to
+# avoid noise. If something here turns out to be load-bearing, rename it
+# to a normal name and commit deliberately.
+auto_trader/.*.py
+auto_trader/.*.mjs
+auto_trader/.*.log
+auto_trader/.*.json
+auto_trader/.*.tsv
+auto_trader/.*.csv
+auto_trader/.*_test.py
+auto_trader/.smoothing_validation/
+auto_trader/_*.py
+auto_trader/_*.json
+auto_trader/_*.csv
+auto_trader/_*.tsv
+auto_trader/analyze*.py
+auto_trader/analyze*.mjs
+auto_trader/extract*.py
+auto_trader/parse_*.py
+auto_trader/rank_factors.py
+auto_trader/research_queries.py
+auto_trader/run_queries.py
+auto_trader/validate_*.py
+auto_trader/factor_summary.py
+auto_trader/inspect_factors.py
+auto_trader/factor_lib*.json
+auto_trader/factor_lib*.txt
+auto_trader/factors*.json
+auto_trader/fact.json
+auto_trader/fl*.json
+auto_trader/fl_analyze.py
+auto_trader/growth_losers.json
+auto_trader/losers_*.csv
+auto_trader/losers_*.txt
+auto_trader/eval_*.json
+auto_trader/exp*.json
+auto_trader/exp*.tsv
+auto_trader/rev_yoy_eval.json
+auto_trader/sig_result.json
+auto_trader/tmp_*.json
+scripts/.*.py
+scripts/.*.log
+
+# API logs at repo root (legacy location)
+api.log
+api_dev.log
+
+# Server PID file
+server/.api.pid
