@@ -288,12 +288,20 @@ ExitCondition = Annotated[
 
 class UniverseConfig(BaseModel):
     """Defines which stocks the strategy can trade."""
-    type: Literal["sector", "symbols", "all"] = Field(
+    type: Literal["sector", "symbols", "all", "index"] = Field(
         default="symbols",
-        description="'sector' selects all tickers in a GICS sector; 'symbols' uses an explicit list; 'all' trades the full universe.",
+        description="'sector' selects all tickers in a GICS sector (NOT point-in-time — uses current classifications); "
+                    "'symbols' uses an explicit list; "
+                    "'all' trades every ticker in the prices table; "
+                    "'index' is point-in-time membership of a major index (set 'index' field to sp500|nasdaq|dowjones). "
+                    "'index' is the only PIT-aware option and is the recommended type for survivorship-correct backtests.",
     )
     sector: str | None = Field(default=None, description="GICS sector name. Required when type='sector'.")
     symbols: list[str] | None = Field(default=None, description="Explicit ticker list. Required when type='symbols'.")
+    index: Literal["sp500", "nasdaq", "dowjones"] | None = Field(
+        default=None,
+        description="Index name. Required when type='index'. Membership is computed as-of each trading day from the historical-constituent change log.",
+    )
     exclude: list[str] = Field(default_factory=list, description="Tickers to exclude.")
 
     @model_validator(mode="before")

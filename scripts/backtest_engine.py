@@ -209,7 +209,20 @@ def validate_strategy(config: dict) -> dict:
 # Universe Resolution
 # ---------------------------------------------------------------------------
 def resolve_universe(config: dict, conn) -> list[str]:
-    """Resolve the universe of tickers from config."""
+    """Resolve the universe of tickers from config.
+
+    Types:
+      symbols  — explicit list from `universe.symbols`. No PIT semantics.
+      sector   — symbols whose CURRENT sector profile matches. NOT PIT-aware;
+                 historical sector classifications are not tracked.
+      index    — PIT-aware membership of a major index (sp500 / nasdaq /
+                 dowjones). Returns the UNION of every symbol that was a
+                 member at any point during the backtest window, so the engine
+                 can precompute signals for all of them. The per-day entry
+                 scan then filters by as-of membership (engines use
+                 `pit_members_by_date()` for this).
+      all      — every symbol in the prices table.
+    """
     universe_cfg = config["universe"]
     utype = universe_cfg.get("type", "symbols")
     exclude = set(universe_cfg.get("exclude", []))
@@ -219,6 +232,15 @@ def resolve_universe(config: dict, conn) -> list[str]:
     elif utype == "sector":
         sector = universe_cfg["sector"]
         symbols = _get_sector_symbols(sector)
+    elif utype == "index":
+        from universe_history import ever_members
+        idx = universe_cfg.get("index", "sp500")
+        # Window: prefer explicit override on universe block, else fall back
+        # to the strategy's backtest window.
+        bt = config.get("backtest", {})
+        start = universe_cfg.get("start") or bt.get("start") or "2015-01-01"
+        end = universe_cfg.get("end") or bt.get("end") or "2099-12-31"
+        symbols = sorted(ever_members(conn, idx, start, end))
     elif utype == "all":
         cur = conn.cursor()
         cur.execute("SELECT DISTINCT symbol FROM prices ORDER BY symbol")
@@ -227,6 +249,35 @@ def resolve_universe(config: dict, conn) -> list[str]:
         raise ValueError(f"Unknown universe type: {utype}")
 
     return sorted([s for s in symbols if s not in exclude])
+
+
+def pit_members_by_date(config: dict, conn, dates: list[str]) -> dict[str, frozenset[str]] | None:
+    """Precompute as-of membership for each trading date in `dates`.
+
+    Returns a dict {date: frozenset(members)}, or None when the config's
+    universe doesn't have PIT semantics (symbols / sector / all). The engine
+    daily loop should:
+       members_on = pit_members_by_date(config, conn, trading_dates)
+       if members_on and symbol not in members_on[date]: skip entry candidate
+
+    PIT is currently only available for type='index'. Sector universes don't
+    have historical classification data, so they stay survivor-biased; mention
+    this limitation in any user-facing summary.
+    """
+    universe_cfg = config.get("universe", {})
+    if universe_cfg.get("type") != "index":
+        return None
+    from universe_history import members_as_of
+    idx = universe_cfg.get("index", "sp500")
+    # Build {date: frozenset} by replaying once per unique date. Cheap: dates
+    # are O(years × 252) and members_as_of is O(events_after_date).
+    out: dict[str, frozenset[str]] = {}
+    # Optimization: dates are in ascending order. Compute change-event points
+    # and bucket dates by which member-set applies. For simplicity (and given
+    # 3000-day backtests run in milliseconds here), just call per date.
+    for d in dates:
+        out[d] = frozenset(members_as_of(conn, idx, d))
+    return out
 
 
 def _get_sector_symbols(sector: str) -> list[str]:
@@ -2301,6 +2352,14 @@ def run_backtest(config: dict, force_close_at_end: bool = True,
     bt_start = config["backtest"]["start"]
     bt_end = config["backtest"]["end"]
     trading_dates = [d for d in trading_dates if bt_start <= d <= bt_end]
+
+    # PIT membership precompute. For universe.type='index', this returns a
+    # {date: frozenset(symbols-that-were-members-on-date)} map, which the
+    # per-day entry scan uses to filter survivors-only candidates. None for
+    # non-PIT universe types — engine behavior is unchanged in that case.
+    _pit_members_on = pit_members_by_date(config, conn, trading_dates)
+    if _pit_members_on is not None:
+        print(f"PIT membership precomputed for {len(_pit_members_on)} trading dates.")
     print(f"Backtest period: {trading_dates[0]} to {trading_dates[-1]} ({len(trading_dates)} trading days)")
 
     # Initialize portfolio
@@ -2496,8 +2555,17 @@ def run_backtest(config: dict, force_close_at_end: bool = True,
             # Build trading day index for cooldown check
             date_idx = trading_dates.index(date) if date in trading_dates else -1
 
+            # PIT filter: when an index-typed universe is in play, only
+            # consider symbols that WERE members of the index on `date`. A
+            # non-member can't be bought (out of mandate), but existing
+            # positions stay open if they're later removed from the index —
+            # matching how a real index-tracking PM would handle it.
+            _pit_today = _pit_members_on[date] if _pit_members_on is not None else None
+
             for symbol in symbols:
                 if symbol in portfolio.positions:
+                    continue
+                if _pit_today is not None and symbol not in _pit_today:
                     continue
 
                 signal_data = signals.get(symbol, {})

@@ -118,6 +118,7 @@ def get_entry_candidates(
     price_index: dict,
     pe_series: dict | None = None,
     composite_series: dict | None = None,
+    pit_members_today: frozenset[str] | None = None,
 ) -> list[EntryDirective]:
     """Pure directive generator: which symbols should this sleeve open today.
 
@@ -157,6 +158,11 @@ def get_entry_candidates(
     candidates: list[tuple[str, float]] = []
     for symbol in universe:
         if symbol in held_symbols_in_sleeve:
+            continue
+        # PIT membership gate: only as-of members of the configured index
+        # can be NEW entries. Existing holdings carry through index removals.
+        # None => no PIT filter (universe.type != 'index').
+        if pit_members_today is not None and symbol not in pit_members_today:
             continue
         sig_data = signals.get(symbol, {})
         if date not in sig_data:

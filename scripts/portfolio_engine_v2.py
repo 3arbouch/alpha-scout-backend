@@ -28,6 +28,7 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).parent))
 
 from backtest_engine import (
+    pit_members_by_date,
     rank_candidates,
     _calendar_to_trading_days,
     _find_recent_peak as _v1_find_recent_peak,
@@ -97,6 +98,9 @@ class _SleeveContext:
         self.pe_series = pe_series
         self.composite_series = composite_series
         self.state = SleeveRuntimeState(sleeve_label=self.label)
+        # PIT membership: {date: frozenset(members)} when universe.type='index',
+        # None otherwise. Precomputed in the sleeve setup loop.
+        self.pit_members_on: dict[str, frozenset[str]] | None = None
         # pending entries from yesterday's signals (next_close/next_open mode)
         self.pending_entries: list = []  # list of EntryDirective
         # Allocated capital (in fixed-weight mode = weight × initial_capital)
@@ -657,6 +661,8 @@ def _run_daily_loop(
             if available_slots <= 0:
                 sleeve.pending_entries = []
                 continue
+            _pit_today = (sleeve.pit_members_on[date]
+                          if sleeve.pit_members_on is not None else None)
             cands = get_entry_candidates(
                 sleeve_label=sleeve.label, sleeve_config=sleeve.config, date=date,
                 trading_dates=trading_dates,
@@ -664,6 +670,7 @@ def _run_daily_loop(
                 held_symbols_in_sleeve=held_now, available_slots=available_slots,
                 state=sleeve.state, conn=conn, price_index=price_index,
                 pe_series=sleeve.pe_series, composite_series=sleeve.composite_series,
+                pit_members_today=_pit_today,
             )
             sleeve.pending_entries = cands
 
@@ -791,6 +798,10 @@ def run_portfolio_backtest(
             symbols=syms,
         )
         ctx.allocated_capital = initial_capital * ctx.weight
+        # Precompute PIT membership for the sleeve (None when not index-typed).
+        ctx.pit_members_on = pit_members_by_date(scfg, conn, trading_dates)
+        if ctx.pit_members_on is not None:
+            print(f"  Sleeve '{ctx.label}' PIT membership precomputed.")
         sleeve_ctxs.append(ctx)
         print(f"  Sleeve '{ctx.label}' (weight {ctx.weight:.0%}): "
               f"{len(syms)} tickers, "
