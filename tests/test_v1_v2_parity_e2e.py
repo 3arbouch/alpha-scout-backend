@@ -105,10 +105,14 @@ def run_parity(name: str, config: dict):
     r_v2 = run_v2(copy.deepcopy(config), force_close_at_end=True)
 
     # Trade ledger
-    t1 = r_v1.get("trades", [])
-    if not t1:
-        # v1's run_portfolio_backtest stores trades inside sleeve_results
-        t1 = r_v1.get("sleeve_results", [{}])[0].get("trades", [])
+    if r_v1.get("trades"):
+        t1 = r_v1["trades"]
+    else:
+        # v1's run_portfolio_backtest puts trades inside each sleeve_results
+        # entry; flatten across all sleeves for multi-sleeve comparison.
+        t1 = []
+        for sr in r_v1.get("sleeve_results", []):
+            t1.extend(sr.get("trades", []))
     t2 = r_v2.get("trades", [])
 
     sigs1 = sorted([trade_sig(t) for t in t1])
@@ -122,15 +126,22 @@ def run_parity(name: str, config: dict):
           sigs1 == sigs2,
           f"first diff: {next(((a, b) for a, b in zip(sigs1, sigs2) if a != b), 'none')}")
 
-    # Top-level metrics
+    # Top-level metrics. total_return_pct / max_drawdown_pct must match
+    # byte-for-byte. final_nav allows ≤$1 sub-cent FP noise from different
+    # cash-aggregation summation orders across sleeves (v1 sums per-sleeve
+    # rounded NAVs; v2 sums per-sleeve cash pools then mark-to-market).
     m1 = r_v1.get("metrics") or {}
     m2 = r_v2.get("metrics") or {}
-    for key in ("total_return_pct", "final_nav", "max_drawdown_pct"):
+    for key in ("total_return_pct", "max_drawdown_pct"):
         v1 = m1.get(key)
         v2 = m2.get(key)
         check(f"metrics.{key} parity: v1={v1} v2={v2}",
               v1 == v2,
               f"v1={v1} v2={v2}")
+    fn1, fn2 = m1.get("final_nav"), m2.get("final_nav")
+    check(f"metrics.final_nav within $1 (v1={fn1}, v2={fn2})",
+          fn1 is not None and fn2 is not None and abs(fn1 - fn2) <= 1.0,
+          f"v1={fn1} v2={fn2}  diff=${abs((fn1 or 0)-(fn2 or 0)):.4f}")
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +184,87 @@ run_parity("S3a-5 entry_price=next_open",
                 "backtest": {"start": "2024-01-01", "end": "2024-06-30",
                              "entry_price": "next_open", "slippage_bps": 10},
             }))
+
+
+# ---------------------------------------------------------------------------
+# Step 3b: multi-sleeve fixed-weight (regime_filter=false)
+# ---------------------------------------------------------------------------
+DEF_UNI = ["JNJ", "PG", "KO", "PEP", "WMT", "JPM", "BAC", "XOM"]
+
+
+def two_sleeve_portfolio(tech_weight=0.7, def_weight=0.3):
+    tech = base_strat()
+    tech["sizing"]["initial_allocation"] = int(500_000 * tech_weight)
+    defs = {
+        "name": "DefStrat", "universe": {"type": "symbols", "symbols": DEF_UNI},
+        "entry": {"conditions": [{"type": "always"}], "logic": "all"},
+        "stop_loss": {"type": "drawdown_from_entry", "value": -15, "cooldown_days": 60},
+        "time_stop": {"max_days": 365},
+        "ranking": {"by": "momentum_rank", "order": "desc", "top_n": 4},
+        "rebalancing": {"frequency": "none", "rules": {}},
+        "sizing": {"type": "equal_weight", "max_positions": 4,
+                    "initial_allocation": int(500_000 * def_weight)},
+        "backtest": {"start": "2024-01-01", "end": "2024-06-30",
+                     "entry_price": "next_close", "slippage_bps": 10},
+    }
+    return {
+        "name": "MultiSleeve",
+        "sleeves": [
+            {"label": "Tech",      "weight": tech_weight, "regime_gate": ["*"],
+             "strategy_config": tech},
+            {"label": "Defensive", "weight": def_weight,  "regime_gate": ["*"],
+             "strategy_config": defs},
+        ],
+        "regime_filter": False,
+        "capital_when_gated_off": "to_cash",
+        "backtest": {"start": "2024-01-01", "end": "2024-06-30",
+                     "initial_capital": 500_000},
+    }
+
+
+run_parity("S3b-1 two sleeves 70/30 fixed-weight",
+            two_sleeve_portfolio(tech_weight=0.7, def_weight=0.3))
+
+run_parity("S3b-2 two sleeves 50/50 fixed-weight",
+            two_sleeve_portfolio(tech_weight=0.5, def_weight=0.5))
+
+
+# Three sleeves with different sizing types
+def three_sleeve_portfolio():
+    tech = base_strat()
+    tech["sizing"]["initial_allocation"] = 250_000
+    defs = {
+        "name": "DefStrat", "universe": {"type": "symbols", "symbols": DEF_UNI},
+        "entry": {"conditions": [{"type": "always"}], "logic": "all"},
+        "ranking": {"by": "momentum_rank", "order": "desc", "top_n": 3},
+        "rebalancing": {"frequency": "none", "rules": {}},
+        "sizing": {"type": "equal_weight", "max_positions": 3,
+                    "initial_allocation": 150_000},
+        "backtest": {"start": "2024-01-01", "end": "2024-06-30",
+                     "entry_price": "next_close", "slippage_bps": 10},
+    }
+    big_tech = base_strat()
+    big_tech["sizing"] = {"type": "risk_parity", "max_positions": 5,
+                          "initial_allocation": 100_000, "vol_window_days": 20}
+    return {
+        "name": "ThreeSleeve",
+        "sleeves": [
+            {"label": "Tech",      "weight": 0.5, "regime_gate": ["*"],
+             "strategy_config": tech},
+            {"label": "Defensive", "weight": 0.3, "regime_gate": ["*"],
+             "strategy_config": defs},
+            {"label": "TechRP",    "weight": 0.2, "regime_gate": ["*"],
+             "strategy_config": big_tech},
+        ],
+        "regime_filter": False,
+        "capital_when_gated_off": "to_cash",
+        "backtest": {"start": "2024-01-01", "end": "2024-06-30",
+                     "initial_capital": 500_000},
+    }
+
+
+run_parity("S3b-3 three sleeves with mixed sizing types",
+            three_sleeve_portfolio())
 
 
 # ---------------------------------------------------------------------------

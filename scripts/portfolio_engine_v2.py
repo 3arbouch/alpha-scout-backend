@@ -202,33 +202,33 @@ def _execute_pending_entries(
             break
 
         # ---- v1-equivalent per-iteration NAV-based sizing ------------------
-        current_nav = book.nav(price_index, date)
-        if current_nav <= 0:
+        # Per-sleeve NAV (matches v1's standalone sleeve simulation).
+        sleeve_nav_now = book.sleeve_nav(sleeve.label, price_index, date)
+        if sleeve_nav_now <= 0:
             continue
 
         if sizing_type == "equal_weight":
-            amount = current_nav / max_positions
+            amount = sleeve_nav_now / max_positions
         elif sizing_type == "fixed_amount":
             amount = cfg["sizing"].get("amount_per_position", initial_alloc / max_positions)
         elif sizing_type == "risk_parity":
-            pool = (n_batch / max_positions) * current_nav
+            pool = (n_batch / max_positions) * sleeve_nav_now
             w = rp_weights.get(d.symbol)
             if w is not None:
                 amount = pool * w
             else:
-                # Insufficient vol history → equal-weight slot fallback
-                amount = current_nav / max_positions
+                amount = sleeve_nav_now / max_positions
         else:
-            amount = current_nav / max_positions
+            amount = sleeve_nav_now / max_positions
 
-        # max_position_pct cap
-        if max_pct < 100 and (amount / current_nav) * 100 > max_pct:
-            amount = current_nav * (max_pct / 100.0)
+        # max_position_pct cap (against sleeve nav)
+        if max_pct < 100 and (amount / sleeve_nav_now) * 100 > max_pct:
+            amount = sleeve_nav_now * (max_pct / 100.0)
 
-        # Cash buffer cap (matches v1's `amount = min(amount, portfolio.cash * 0.99)`)
-        # NOTE: PositionBook.open ALSO applies this cap internally; we replicate
-        # it here so the min-amount guard below sees the same value v1 sees.
-        amount = min(amount, book.cash * 0.99)
+        # Cash buffer cap — uses this sleeve's cash pool, matching v1's
+        # per-sleeve standalone simulation where each sleeve had its own
+        # portfolio.cash. min(amount, sleeve_cash * 0.99).
+        amount = min(amount, book.sleeve_cash(sleeve.label) * 0.99)
         if amount < 1000:   # v1 minimum position size
             continue
 
@@ -346,18 +346,13 @@ def _run_daily_loop(
         # 3. Apply rebalance directives
         # -------------------------------------------------------------------
         for sleeve in sleeves:
-            sleeve_nav = sum(
-                p.market_value(price_index.get(p.symbol, {}).get(date, p.high_since_entry))
-                for p in book.positions_for_sleeve(sleeve.label).values()
-            )
-            # plus this sleeve's cash share (single-sleeve: all cash; multi-sleeve handled in 3b)
-            sleeve_nav += book.cash * (1.0 if len(sleeves) == 1 else sleeve.weight)
-
+            sleeve_nav = book.sleeve_nav(sleeve.label, price_index, date)
             rds = get_rebalance_directives(
                 sleeve_label=sleeve.label, sleeve_config=sleeve.config, date=date,
                 sleeve_positions=book.positions_for_sleeve(sleeve.label),
                 price_index=price_index, state=sleeve.state,
-                sleeve_nav=sleeve_nav, available_cash=book.cash,
+                sleeve_nav=sleeve_nav,
+                available_cash=book.sleeve_cash(sleeve.label),
                 earnings_data=earnings_data,
             )
             for d in rds:
@@ -474,80 +469,83 @@ def run_portfolio_backtest(
     print(f"Capital: ${initial_capital:,.0f} | Period: {bt_start} to {bt_end}")
     print(f"{'=' * 70}")
 
-    # --- Step 3a guardrails: only the simplest case is supported here ----
+    # --- Phase 2 Step 3b guardrail: regime_filter still not supported ----
     sleeves_def = portfolio_config["sleeves"]
-    if len(sleeves_def) != 1:
-        raise NotImplementedError(
-            "engine_version=v2 currently supports single-sleeve portfolios only. "
-            "Multi-sleeve + regime support is in progress (Phase 2 Steps 3b-3e). "
-            f"Got {len(sleeves_def)} sleeves."
-        )
     if portfolio_config.get("regime_filter"):
         raise NotImplementedError(
             "engine_version=v2 currently does not support regime_filter. "
             "In progress (Phase 2 Step 3c-3e). Use engine_version=v1 for now."
         )
 
-    sleeve_def = sleeves_def[0]
-    sleeve_config = validate_strategy(sleeve_def["strategy_config"])
-    sleeve_config["sizing"]["initial_allocation"] = initial_capital * float(
-        sleeve_def.get("weight", 1.0)
-    )
-
-    # --- Resolve universe + load shared price index ---
+    # --- Resolve universe (union across sleeves) + load shared price index ---
     conn = get_connection()
-    symbols = resolve_universe(sleeve_config, conn)
-    print(f"Universe: {len(symbols)} tickers")
-    price_index, open_index, all_trading_dates = build_price_index(symbols, conn)
+    sleeve_configs: list[dict] = []
+    sleeve_symbols: list[list[str]] = []
+    all_sleeve_symbols: set[str] = set()
+    for sd in sleeves_def:
+        scfg = validate_strategy(sd["strategy_config"])
+        scfg["sizing"]["initial_allocation"] = initial_capital * float(sd.get("weight", 1.0))
+        syms = resolve_universe(scfg, conn)
+        sleeve_configs.append(scfg)
+        sleeve_symbols.append(syms)
+        all_sleeve_symbols.update(syms)
+    print(f"Universe (across sleeves): {len(all_sleeve_symbols)} tickers")
+    price_index, open_index, all_trading_dates = build_price_index(
+        list(all_sleeve_symbols), conn,
+    )
     trading_dates = [d for d in all_trading_dates if bt_start <= d <= bt_end]
     if not trading_dates:
         conn.close()
         raise ValueError(f"No trading dates in range {bt_start} to {bt_end}")
 
-    # --- Precompute signals + exit signals + earnings + pe + composite ---
-    signals, signal_metadata = precompute_signals(
-        sleeve_config, symbols, conn, price_index=price_index,
-    )
-    print(f"Pre-computed {sum(len(v) for v in signals.values())} signal dates")
-    exit_signals = {}
-    if sleeve_config.get("exit_conditions"):
-        exit_signals = _precompute_exit_signals(sleeve_config, symbols, conn)
-    earnings_data = load_earnings_data(symbols, conn)
+    # --- Build per-sleeve precomputed context ---
+    earnings_data = load_earnings_data(list(all_sleeve_symbols), conn)
+    sleeve_ctxs: list[_SleeveContext] = []
+    for sd, scfg, syms in zip(sleeves_def, sleeve_configs, sleeve_symbols):
+        signals, signal_metadata = precompute_signals(
+            scfg, syms, conn, price_index=price_index,
+        )
+        exit_signals = (_precompute_exit_signals(scfg, syms, conn)
+                        if scfg.get("exit_conditions") else {})
+        pe_series = _load_pe_timeseries(syms)
+        composite_series: dict | None = None
+        ranking_cfg = scfg.get("ranking") or {}
+        if ranking_cfg.get("by") == "composite_score":
+            composite_cfg = scfg.get("composite_score") or {}
+            factor_names: set[str] = set()
+            for b in (composite_cfg.get("buckets") or {}).values():
+                for f in b.get("factors", []):
+                    factor_names.add(f["name"] if isinstance(f, dict) else f.name)
+            if factor_names:
+                composite_series = {}
+                for fname in factor_names:
+                    composite_series[fname] = _load_feature_series(
+                        fname, syms, bt_start, bt_end, conn, price_index=price_index,
+                    )
+        ctx = _SleeveContext(
+            sleeve_def={**sd, "strategy_config": scfg},
+            signals=signals, signal_metadata=signal_metadata,
+            exit_signals=exit_signals,
+            pe_series=pe_series, composite_series=composite_series,
+            symbols=syms,
+        )
+        ctx.allocated_capital = initial_capital * ctx.weight
+        sleeve_ctxs.append(ctx)
+        print(f"  Sleeve '{ctx.label}' (weight {ctx.weight:.0%}): "
+              f"{len(syms)} tickers, "
+              f"{sum(len(v) for v in signals.values())} signal dates")
 
-    pe_series = _load_pe_timeseries(symbols)
-
-    composite_series: dict | None = None
-    ranking_cfg = sleeve_config.get("ranking") or {}
-    if ranking_cfg.get("by") == "composite_score":
-        composite_cfg = sleeve_config.get("composite_score") or {}
-        factor_names: set[str] = set()
-        for b in (composite_cfg.get("buckets") or {}).values():
-            for f in b.get("factors", []):
-                factor_names.add(f["name"] if isinstance(f, dict) else f.name)
-        if factor_names:
-            composite_series = {}
-            for fname in factor_names:
-                composite_series[fname] = _load_feature_series(
-                    fname, symbols, bt_start, bt_end, conn, price_index=price_index,
-                )
-
-    sleeve_ctx = _SleeveContext(
-        sleeve_def={
-            **sleeve_def,
-            "strategy_config": sleeve_config,
-        },
-        signals=signals, signal_metadata=signal_metadata,
-        exit_signals=exit_signals,
-        pe_series=pe_series, composite_series=composite_series,
-        symbols=symbols,
-    )
-    sleeve_ctx.allocated_capital = initial_capital * sleeve_ctx.weight
-
-    # --- Run the unified daily loop ---
-    book = PositionBook(initial_capital)
+    # --- Initialize PositionBook with per-sleeve cash pools ---
+    initial_cash_by_sleeve = {ctx.label: ctx.allocated_capital for ctx in sleeve_ctxs}
+    # If sleeve weights don't sum to 1.0, the leftover stays unallocated.
+    leftover = initial_capital - sum(initial_cash_by_sleeve.values())
+    if abs(leftover) > 0.01:
+        # Park leftover in the wildcard pool so it doesn't get lost.
+        initial_cash_by_sleeve["*"] = leftover
+    book = PositionBook(initial_cash_by_sleeve)
     print(f"Running V2 simulation with ${initial_capital:,.0f}...")
     loop_result = _run_daily_loop(
-        book=book, sleeves=[sleeve_ctx],
+        book=book, sleeves=sleeve_ctxs,
         price_index=price_index, open_index=open_index,
         trading_dates=trading_dates, conn=conn,
         earnings_data=earnings_data,
@@ -578,6 +576,26 @@ def run_portfolio_backtest(
     print(f"  Total trades: {len(loop_result['trades'])}")
     print(f"  Sharpe:       {metrics.get('sharpe_ratio')}")
 
+    # --- Per-sleeve trade attribution ---
+    trades_by_sleeve: dict[str, list[dict]] = {ctx.label: [] for ctx in sleeve_ctxs}
+    for t in loop_result["trades"]:
+        lbl = t.get("sleeve_label")
+        if lbl in trades_by_sleeve:
+            trades_by_sleeve[lbl].append(t)
+
+    sleeve_results = [{
+        "label": ctx.label,
+        "trades": trades_by_sleeve.get(ctx.label, []),
+        "nav_history": loop_result["nav_history"],   # combined book nav for now
+    } for ctx in sleeve_ctxs]
+
+    per_sleeve = [{
+        "label": ctx.label,
+        "weight": ctx.weight,
+        "allocated_capital": ctx.allocated_capital,
+        "regime_gate": ctx.regime_gate,
+    } for ctx in sleeve_ctxs]
+
     return {
         "portfolio": name,
         "engine_version": "v2",
@@ -585,18 +603,8 @@ def run_portfolio_backtest(
         "trades": loop_result["trades"],
         "nav_history": loop_result["nav_history"],
         "combined_nav_history": loop_result["nav_history"],   # alias for compat
-        "sleeve_results": [{
-            "label": sleeve_ctx.label,
-            "trades": loop_result["trades"],
-            "nav_history": loop_result["nav_history"],
-            "metrics": metrics,
-        }],
-        "per_sleeve": [{
-            "label": sleeve_ctx.label,
-            "weight": sleeve_ctx.weight,
-            "allocated_capital": sleeve_ctx.allocated_capital,
-            "regime_gate": sleeve_ctx.regime_gate,
-        }],
+        "sleeve_results": sleeve_results,
+        "per_sleeve": per_sleeve,
         "config": portfolio_config,
         "backtest": {"start": bt_start, "end": bt_end,
                      "initial_capital": initial_capital},

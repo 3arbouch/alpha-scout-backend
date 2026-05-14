@@ -83,29 +83,97 @@ class Position:
             self.high_since_entry = price
 
 
+# Wildcard sleeve label for single-pool (backward-compatibility) cash mode.
+_DEFAULT_CASH_POOL = "*"
+
+
 # ---------------------------------------------------------------------------
 # PositionBook — the single unified live position state + cash.
 # ---------------------------------------------------------------------------
 class PositionBook:
     """Unified position book across all sleeves in a portfolio.
 
-    Positions are keyed by (sleeve_label, symbol) so that:
+    Positions are keyed by (sleeve_label, symbol):
       - Same-sleeve add-ons merge into ONE Position (weighted-avg basis).
       - Two different sleeves holding the same symbol are TWO Positions.
 
-    Cash is a single scalar — debited on BUY, credited on SELL.
+    Cash is tracked PER-SLEEVE. Multi-sleeve fixed-weight portfolios need
+    this so each sleeve's sizing respects its own NAV trajectory (matching
+    v1's per-sleeve standalone simulation semantics).
+
+    Two construction modes:
+      - Scalar: PositionBook(100_000) creates a single-pool mode where all
+        cash lives under sleeve label "*". open()/sell() with any sleeve_label
+        fall through to that pool. Backward-compatible with single-sleeve usage.
+      - Dict:   PositionBook({"Tech": 70_000, "Def": 30_000}) creates per-
+        sleeve pools. open("Tech", ...) debits cash_by_sleeve["Tech"] only.
     """
 
-    def __init__(self, initial_cash: float):
-        if initial_cash < 0:
-            raise ValueError(f"initial_cash must be non-negative, got {initial_cash}")
-        self._initial_cash = float(initial_cash)
-        self.cash = float(initial_cash)
+    def __init__(self, initial_cash):
+        if isinstance(initial_cash, (int, float)):
+            if initial_cash < 0:
+                raise ValueError(f"initial_cash must be non-negative, got {initial_cash}")
+            self.cash_by_sleeve: dict[str, float] = {_DEFAULT_CASH_POOL: float(initial_cash)}
+            self._initial_cash = float(initial_cash)
+        elif isinstance(initial_cash, dict):
+            negatives = {k: v for k, v in initial_cash.items() if v < 0}
+            if negatives:
+                raise ValueError(f"all per-sleeve cash values must be non-negative; got {negatives}")
+            self.cash_by_sleeve = {k: float(v) for k, v in initial_cash.items()}
+            self._initial_cash = sum(self.cash_by_sleeve.values())
+        else:
+            raise TypeError(
+                "initial_cash must be a scalar or a dict[sleeve_label, amount]; "
+                f"got {type(initial_cash).__name__}"
+            )
         self.positions: dict[tuple[str, str], Position] = {}
         # SELL trades only; for win/loss / round-trip stats. Executor still
         # owns the full trade ledger (BUYs + SELLs).
         self.closed_trades: list[dict] = []
         self.nav_history: list[dict] = []
+
+    # -----------------------------------------------------------------------
+    # Cash accessors — per-sleeve aware
+    # -----------------------------------------------------------------------
+    @property
+    def cash(self) -> float:
+        """Total cash across all sleeve pools."""
+        return sum(self.cash_by_sleeve.values())
+
+    def sleeve_cash(self, sleeve_label: str) -> float:
+        """Cash available to a specific sleeve. In single-pool mode (constructor
+        called with a scalar), returns the shared pool's balance regardless of
+        the label."""
+        if sleeve_label in self.cash_by_sleeve:
+            return self.cash_by_sleeve[sleeve_label]
+        if _DEFAULT_CASH_POOL in self.cash_by_sleeve:
+            return self.cash_by_sleeve[_DEFAULT_CASH_POOL]
+        return 0.0
+
+    def _resolve_cash_pool(self, sleeve_label: str) -> str:
+        """Which pool key handles BUYs/SELLs for `sleeve_label`?
+        Prefers the explicit per-sleeve pool, falls back to the shared wildcard."""
+        if sleeve_label in self.cash_by_sleeve:
+            return sleeve_label
+        if _DEFAULT_CASH_POOL in self.cash_by_sleeve:
+            return _DEFAULT_CASH_POOL
+        # Neither exists — auto-create an empty per-sleeve pool so the BUY
+        # safely returns None (insufficient funds) without KeyError.
+        self.cash_by_sleeve[sleeve_label] = 0.0
+        return sleeve_label
+
+    def sleeve_nav(self, sleeve_label: str, price_index: dict, date: str) -> float:
+        """sleeve cash + market value of positions tagged with this sleeve."""
+        cash = self.sleeve_cash(sleeve_label)
+        pv = 0.0
+        for (lbl, _), pos in self.positions.items():
+            if lbl != sleeve_label:
+                continue
+            price = price_index.get(pos.symbol, {}).get(date)
+            if price is None:
+                price = pos.high_since_entry
+            pv += pos.market_value(price)
+        return cash + pv
 
     # -----------------------------------------------------------------------
     # Accessors
@@ -197,8 +265,9 @@ class PositionBook:
         if fill_price <= 0:
             return None
 
-        # Cap at available cash (keep 1% buffer like v1)
-        max_amount = self.cash * 0.99
+        # Per-sleeve cash buffer cap (1% buffer like v1)
+        pool_key = self._resolve_cash_pool(sleeve_label)
+        max_amount = self.cash_by_sleeve[pool_key] * 0.99
         if amount > max_amount:
             amount = max_amount
         if amount <= min_amount:
@@ -232,7 +301,7 @@ class PositionBook:
             # Don't update entry_date (preserve first-entry semantics).
             # Don't update peak_price (pre-entry reference is from the original entry).
 
-        self.cash -= amount
+        self.cash_by_sleeve[pool_key] -= amount
 
         trade = {
             "date": date,
@@ -299,7 +368,9 @@ class PositionBook:
             if pos.entry_price > 0 else 0.0
         days_held = pos.days_held(date)
 
-        self.cash += proceeds
+        # Credit proceeds back to the sleeve's cash pool (same pool that paid for the BUY)
+        pool_key = self._resolve_cash_pool(sleeve_label)
+        self.cash_by_sleeve[pool_key] += proceeds
 
         trade = {
             "date": date,
