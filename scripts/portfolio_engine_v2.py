@@ -45,6 +45,15 @@ from backtest_engine import (
     _precompute_exit_signals,
     SECTOR_ETF_MAP,
 )
+# v1's regime resolver — same code, same regimes, same dates
+from portfolio_engine import _load_regime_configs
+from db_config import APP_DB_PATH
+from regime import evaluate_regime_series_with_stats
+
+# Match v1's persistence defaults (defined as local vars inside v1's
+# run_portfolio_backtest at lines 272-273)
+_DEFAULT_ENTRY_PERSIST = 3
+_DEFAULT_EXIT_PERSIST = 3
 from position_book import PositionBook
 from sleeve_signals import (
     SleeveRuntimeState,
@@ -94,6 +103,12 @@ class _SleeveContext:
         # Bookkeeping
         self.entry_mode: str = self.config["backtest"].get("entry_price", "next_close")
         self.slippage_bps: float = self.config["backtest"].get("slippage_bps", 10)
+        # Gate dates: None means always-on (regime_gate=["*"] or [] or regime
+        # disabled). A set means the sleeve is on ONLY on those dates.
+        self.gate_dates_on: set[str] | None = None
+
+    def is_gated_on(self, date: str) -> bool:
+        return self.gate_dates_on is None or date in self.gate_dates_on
 
 
 # ---------------------------------------------------------------------------
@@ -313,16 +328,25 @@ def _run_daily_loop(
         # -------------------------------------------------------------------
         # 1. Execute pending entries from yesterday (next_close / next_open)
         # -------------------------------------------------------------------
+        # Per-sleeve gating: when a sleeve is gated off today, v1 clears its
+        # pending_entries (no fills) — match that here. Otherwise process
+        # pending fills normally.
         for sleeve in sleeves:
+            if not sleeve.is_gated_on(date):
+                sleeve.pending_entries = []
+                continue
             trades = _execute_pending_entries(
                 sleeve, book, price_index, open_index, date,
             )
             all_trades.extend(trades)
 
         # -------------------------------------------------------------------
-        # 2. Apply exits
+        # 2. Apply exits — gated off when sleeve is gated. v1 fix 9d0fead
+        # suppresses exits on gated-off days; v2 mirrors that.
         # -------------------------------------------------------------------
         for sleeve in sleeves:
+            if not sleeve.is_gated_on(date):
+                continue
             exits = get_exit_recommendations(
                 sleeve_label=sleeve.label, sleeve_config=sleeve.config, date=date,
                 sleeve_positions=book.positions_for_sleeve(sleeve.label),
@@ -343,9 +367,11 @@ def _run_daily_loop(
                         sleeve.state.stop_loss_cooldowns[d.symbol] = date
 
         # -------------------------------------------------------------------
-        # 3. Apply rebalance directives
+        # 3. Apply rebalance directives — gated-off days skip entirely
         # -------------------------------------------------------------------
         for sleeve in sleeves:
+            if not sleeve.is_gated_on(date):
+                continue
             sleeve_nav = book.sleeve_nav(sleeve.label, price_index, date)
             rds = get_rebalance_directives(
                 sleeve_label=sleeve.label, sleeve_config=sleeve.config, date=date,
@@ -381,25 +407,23 @@ def _run_daily_loop(
                         if t is not None:
                             all_trades.append(t)
             # Advance the rebalance anchor regardless of whether directives
-            # fired today. Matches v1's loop: last_rebal_date is set on every
-            # is_rebalance_date day (even if _do_rebalance emits no trades),
-            # so the next rebalance is ~90/30 days from THIS anchor, not from
-            # the prior one. Without this advance, v2 keeps firing the
-            # rebalance check daily after the first cadence hit, which can
-            # generate unintended earnings-beat adds.
+            # fired today (matches v1 line 2380-2390 in run_backtest).
             freq = (sleeve.config.get("rebalancing") or {}).get("frequency", "none")
             if freq != "none" and is_rebalance_date(
                 date, sleeve.state.last_rebal_date, freq
             ):
                 sleeve.state.last_rebal_date = date
             elif sleeve.state.last_rebal_date is None and book.num_positions(sleeve.label) > 0:
-                # Seed: first time we have positions, treat as anchor
                 sleeve.state.last_rebal_date = date
 
         # -------------------------------------------------------------------
-        # 4. Collect new entry candidates → queue for tomorrow
+        # 4. Collect new entry candidates → queue for tomorrow.
+        #    Gated-off sleeves emit nothing (v1 line 2256-2257).
         # -------------------------------------------------------------------
         for sleeve in sleeves:
+            if not sleeve.is_gated_on(date):
+                sleeve.pending_entries = []
+                continue
             held_now = book.symbols_held_by_sleeve(sleeve.label)
             available_slots = sleeve.config["sizing"].get("max_positions", 10) - len(held_now)
             if available_slots <= 0:
@@ -469,12 +493,14 @@ def run_portfolio_backtest(
     print(f"Capital: ${initial_capital:,.0f} | Period: {bt_start} to {bt_end}")
     print(f"{'=' * 70}")
 
-    # --- Phase 2 Step 3b guardrail: regime_filter still not supported ----
+    # --- Phase 2 Step 3c+ guardrail: allocation_profiles not yet supported.
+    # Step 3c handles regime_gate (sleeve gates off on regime-off days).
+    # Step 3d/3e will add allocation_profile-driven weight transitions.
     sleeves_def = portfolio_config["sleeves"]
-    if portfolio_config.get("regime_filter"):
+    if portfolio_config.get("allocation_profiles"):
         raise NotImplementedError(
-            "engine_version=v2 currently does not support regime_filter. "
-            "In progress (Phase 2 Step 3c-3e). Use engine_version=v1 for now."
+            "engine_version=v2 does not yet support allocation_profiles. "
+            "In progress (Phase 2 Step 3d-3e). Use engine_version=v1 for now."
         )
 
     # --- Resolve universe (union across sleeves) + load shared price index ---
@@ -534,6 +560,75 @@ def run_portfolio_backtest(
         print(f"  Sleeve '{ctx.label}' (weight {ctx.weight:.0%}): "
               f"{len(syms)} tickers, "
               f"{sum(len(v) for v in signals.values())} signal dates")
+
+    # --- Resolve regimes (Step 3c+) and per-sleeve gate dates -----------------
+    regime_enabled = bool(portfolio_config.get("regime_filter"))
+    regime_id_to_name: dict[str, str] = {}
+    regime_series: dict[str, list[str]] = {}
+
+    if regime_enabled:
+        all_regime_ids: set[str] = set()
+        for sd in sleeves_def:
+            for rid in sd.get("regime_gate", []):
+                if rid != "*":
+                    all_regime_ids.add(rid)
+        if all_regime_ids:
+            print(f"\n  Loading {len(all_regime_ids)} regime definitions...")
+            inline_defs = portfolio_config.get("regime_definitions") or {}
+            regime_configs = []
+            db_ids: list[str] = []
+            for rid in all_regime_ids:
+                if rid in inline_defs:
+                    defn = inline_defs[rid]
+                    rc = {"name": rid}
+                    rc.update(defn if isinstance(defn, dict) else defn.model_dump())
+                    regime_configs.append(rc)
+                    regime_id_to_name[rid] = rid
+                    print(f"    {rid}: resolved from inline regime_definitions")
+                else:
+                    db_ids.append(rid)
+            if db_ids:
+                import sqlite3 as _sqlite3
+                _app_conn = _sqlite3.connect(str(APP_DB_PATH))
+                _app_conn.row_factory = _sqlite3.Row
+                db_configs, db_id_to_name = _load_regime_configs(db_ids, _app_conn)
+                _app_conn.close()
+                regime_configs.extend(db_configs)
+                regime_id_to_name.update(db_id_to_name)
+            # Stamp version-aware persistence defaults (match v1)
+            for rc in regime_configs:
+                rc.setdefault("entry_persistence_days", _DEFAULT_ENTRY_PERSIST)
+                rc.setdefault("exit_persistence_days", _DEFAULT_EXIT_PERSIST)
+            print(f"  Computing regime series {bt_start} to {bt_end}...")
+            regime_series, _persistence_stats = evaluate_regime_series_with_stats(
+                bt_start, bt_end, regime_configs,
+            )
+            from collections import Counter
+            counts: Counter = Counter()
+            for _date, active in regime_series.items():
+                for r in active:
+                    counts[r] += 1
+            for rname, cnt in counts.most_common():
+                pct = cnt / max(len(regime_series), 1) * 100
+                print(f"    {rname}: {cnt} days ({pct:.1f}%)")
+
+    # --- Per-sleeve gate dates (regime_gate layer only — Step 3c) -----------
+    for ctx in sleeve_ctxs:
+        gate = ctx.regime_gate
+        # ["*"], empty, or regime disabled → always on
+        if not regime_enabled or gate == ["*"] or not gate:
+            ctx.gate_dates_on = None
+            continue
+        gated_names = {regime_id_to_name.get(rid, rid) for rid in gate}
+        dates_on = {
+            d for d, active in regime_series.items()
+            if gated_names & set(active)
+        }
+        ctx.gate_dates_on = dates_on
+        total = len(regime_series) if regime_series else len(trading_dates)
+        on = len(dates_on)
+        pct = on / max(total, 1) * 100
+        print(f"  Sleeve '{ctx.label}' gate {gate}: {on}/{total} days active ({pct:.1f}%)")
 
     # --- Initialize PositionBook with per-sleeve cash pools ---
     initial_cash_by_sleeve = {ctx.label: ctx.allocated_capital for ctx in sleeve_ctxs}

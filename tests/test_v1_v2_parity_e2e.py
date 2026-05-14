@@ -268,6 +268,78 @@ run_parity("S3b-3 three sleeves with mixed sizing types",
 
 
 # ---------------------------------------------------------------------------
+# Step 3c: regime_gate parity — sleeve on only when its regime fires
+# ---------------------------------------------------------------------------
+STRESS_SPX = {
+    "conditions": [{"series": "spx_vs_200dma_pct", "operator": "<", "value": 0}],
+    "logic": "all",
+    "entry_persistence_days": 3,
+    "exit_persistence_days": 7,
+}
+
+
+def regime_gated_single_sleeve(window=("2022-01-01", "2022-12-31")):
+    """Sleeve trades only when stress_spx is firing. 2022 had a long bear
+    period, so the gate spends a lot of time ON."""
+    tech = base_strat()
+    tech["sizing"]["initial_allocation"] = 500_000
+    tech["backtest"] = {"start": window[0], "end": window[1],
+                         "entry_price": "next_close", "slippage_bps": 10}
+    return {
+        "name": "RegimeGated",
+        "sleeves": [{
+            "label": "Tech", "weight": 1.0, "regime_gate": ["stress_spx"],
+            "strategy_config": tech,
+        }],
+        "regime_filter": True,
+        "regime_definitions": {"stress_spx": STRESS_SPX},
+        "capital_when_gated_off": "to_cash",
+        "backtest": {"start": window[0], "end": window[1],
+                     "initial_capital": 500_000},
+    }
+
+
+run_parity("S3c-1 single sleeve regime_gate=[stress_spx] (2022)",
+            regime_gated_single_sleeve())
+
+
+def regime_gated_two_sleeve():
+    """Tech gates on stress_spx, Defensive is always on (regime_gate=['*'])."""
+    tech = base_strat()
+    tech["sizing"]["initial_allocation"] = 350_000
+    tech["backtest"] = {"start": "2022-01-01", "end": "2022-12-31",
+                         "entry_price": "next_close", "slippage_bps": 10}
+    defs = {
+        "name": "DefStrat", "universe": {"type": "symbols", "symbols": DEF_UNI},
+        "entry": {"conditions": [{"type": "always"}], "logic": "all"},
+        "ranking": {"by": "momentum_rank", "order": "desc", "top_n": 4},
+        "rebalancing": {"frequency": "none", "rules": {}},
+        "sizing": {"type": "equal_weight", "max_positions": 4,
+                    "initial_allocation": 150_000},
+        "backtest": {"start": "2022-01-01", "end": "2022-12-31",
+                     "entry_price": "next_close", "slippage_bps": 10},
+    }
+    return {
+        "name": "TwoSleeveRegime",
+        "sleeves": [
+            {"label": "Tech",      "weight": 0.7, "regime_gate": ["stress_spx"],
+             "strategy_config": tech},
+            {"label": "Defensive", "weight": 0.3, "regime_gate": ["*"],
+             "strategy_config": defs},
+        ],
+        "regime_filter": True,
+        "regime_definitions": {"stress_spx": STRESS_SPX},
+        "capital_when_gated_off": "to_cash",
+        "backtest": {"start": "2022-01-01", "end": "2022-12-31",
+                     "initial_capital": 500_000},
+    }
+
+
+run_parity("S3c-2 two sleeves — one gated on stress_spx, one always-on",
+            regime_gated_two_sleeve())
+
+
+# ---------------------------------------------------------------------------
 print("\n" + "=" * 70)
 print(f"PASSED: {PASS}")
 print(f"FAILED: {FAIL}")
