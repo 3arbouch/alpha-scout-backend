@@ -556,6 +556,16 @@ def run_portfolio_backtest(
     all_sleeve_symbols: set[str] = set()
     for sd in sleeves_def:
         scfg = validate_strategy(sd["strategy_config"])
+        # Match v1's portfolio_engine.py:340-345: override the strategy's
+        # backtest range with the PORTFOLIO's range. The strategy's own
+        # window in the config is the historical training window; the
+        # portfolio window is what we actually backtest/deploy.
+        scfg["backtest"] = {
+            "start": bt_start,
+            "end": bt_end,
+            "slippage_bps": scfg.get("backtest", {}).get("slippage_bps", 10),
+            "entry_price": scfg.get("backtest", {}).get("entry_price", "next_close"),
+        }
         scfg["sizing"]["initial_allocation"] = initial_capital * float(sd.get("weight", 1.0))
         syms = resolve_universe(scfg, conn)
         sleeve_configs.append(scfg)
