@@ -531,7 +531,12 @@ def evaluate_one(deploy_id: str) -> dict | None:
     (deploy_dir / "config.json").write_text(json.dumps(config, indent=2))
 
     try:
-        from portfolio_engine import run_portfolio_backtest
+        # Engine-version routing: opt in to v2 by setting
+        # engine_version="v2" on the portfolio config. v1 is the default.
+        if config.get("engine_version") == "v2":
+            from portfolio_engine_v2 import run_portfolio_backtest
+        else:
+            from portfolio_engine import run_portfolio_backtest
         result = run_portfolio_backtest(config, force_close_at_end=False)
 
         # Save full results to disk

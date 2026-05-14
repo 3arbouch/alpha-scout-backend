@@ -114,6 +114,18 @@ class PortfolioConfig(BaseModel):
     name: str = Field(min_length=1)
     sleeves: list[SleeveConfig] = Field(min_length=1)
 
+    # Execution engine selection (Phase 2 unified position book rollout).
+    # v1 = legacy per-sleeve standalone-simulation + portfolio-level lerp
+    #      (default; backward compatible)
+    # v2 = unified PositionBook with clean broker-equivalent trade ledger
+    #      (no dual-bookkeeping, no phantom trades on gated days,
+    #      cum_shares structurally non-negative)
+    engine_version: Literal["v1", "v2"] = Field(
+        default="v1",
+        description="Backtest/deploy engine. Default v1; set 'v2' to opt in "
+                    "to the unified-position-book executor (Phase 2 rollout).",
+    )
+
     @model_validator(mode="before")
     @classmethod
     def _normalize_legacy_fields(cls, data):

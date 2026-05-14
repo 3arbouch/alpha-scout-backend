@@ -2898,7 +2898,26 @@ async def evaluate_multiple_regimes(
 # Portfolios
 # ---------------------------------------------------------------------------
 sys.path.insert(0, str(WORKSPACE / "scripts"))
-from portfolio_engine import run_portfolio_backtest as _run_portfolio_bt, save_portfolio_results as _save_portfolio_results, compute_portfolio_id as _compute_portfolio_id
+from portfolio_engine import (
+    run_portfolio_backtest as _run_portfolio_bt_v1,
+    save_portfolio_results as _save_portfolio_results,
+    compute_portfolio_id as _compute_portfolio_id,
+)
+from portfolio_engine_v2 import run_portfolio_backtest as _run_portfolio_bt_v2
+
+
+def _run_portfolio_bt(config: dict, force_close_at_end: bool = True):
+    """Route the portfolio backtest to v1 or v2 based on config.engine_version.
+
+    Default: v1 (engine_version absent or != "v2"). Opt-in to v2 by setting
+    engine_version="v2" on the portfolio config. v2 produces a clean
+    broker-equivalent trade ledger for regime/allocation_profile configs
+    (no dual-bookkeeping); v1 keeps current behavior including the
+    9d0fead reconciliation patch.
+    """
+    if (config or {}).get("engine_version") == "v2":
+        return _run_portfolio_bt_v2(config, force_close_at_end=force_close_at_end)
+    return _run_portfolio_bt_v1(config, force_close_at_end=force_close_at_end)
 
 
 # PortfolioCreate uses the domain PortfolioConfig directly.
