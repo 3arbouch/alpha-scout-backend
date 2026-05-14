@@ -2359,38 +2359,49 @@ def run_backtest(config: dict, force_close_at_end: bool = True,
         pending_entries = []
 
         # --- Check exits for open positions ---
+        # Gated-off days suppress exits too. Rationale: when an allocation
+        # profile sets the sleeve to 0%, the portfolio-level lerp has already
+        # liquidated the sleeve's allocated capital. In a live deployment the
+        # underlying broker positions are gone; only the sleeve's internal
+        # bookkeeping still tracks them. Firing stop_loss / take_profit /
+        # time_stop / fundamental_exit on those phantom positions would emit
+        # SELL trades the broker can't execute, and create a dual-bookkeeping
+        # mismatch where cumulative shares per symbol go negative in the
+        # combined trade ledger (sleeve-internal SELL after a portfolio-level
+        # rebalance SELL of the same lot).
         closed_today = []
-        for symbol, pos in list(portfolio.positions.items()):
-            price = price_index.get(symbol, {}).get(date)
-            if not price:
-                continue
+        if _gate_on:
+            for symbol, pos in list(portfolio.positions.items()):
+                price = price_index.get(symbol, {}).get(date)
+                if not price:
+                    continue
 
-            # Check stop loss
-            if check_stop_loss(pos, price, config):
-                portfolio.close_position(symbol, date, price, "stop_loss", slippage)
-                closed_today.append(symbol)
-                if cooldown_days > 0:
-                    stop_loss_cooldowns[symbol] = date
-                continue
+                # Check stop loss
+                if check_stop_loss(pos, price, config):
+                    portfolio.close_position(symbol, date, price, "stop_loss", slippage)
+                    closed_today.append(symbol)
+                    if cooldown_days > 0:
+                        stop_loss_cooldowns[symbol] = date
+                    continue
 
-            # Check take profit
-            if check_take_profit(pos, price, config):
-                portfolio.close_position(symbol, date, price, "take_profit", slippage)
-                closed_today.append(symbol)
-                continue
+                # Check take profit
+                if check_take_profit(pos, price, config):
+                    portfolio.close_position(symbol, date, price, "take_profit", slippage)
+                    closed_today.append(symbol)
+                    continue
 
-            # Check time stop
-            if check_time_stop(pos, date, config):
-                portfolio.close_position(symbol, date, price, "time_stop", slippage)
-                closed_today.append(symbol)
-                continue
+                # Check time stop
+                if check_time_stop(pos, date, config):
+                    portfolio.close_position(symbol, date, price, "time_stop", slippage)
+                    closed_today.append(symbol)
+                    continue
 
-            # Check fundamental exit conditions
-            if exit_signals.get(symbol, {}).get(date):
-                reason = exit_signals[symbol][date].get("reason", "fundamental_exit")
-                portfolio.close_position(symbol, date, price, reason, slippage)
-                closed_today.append(symbol)
-                continue
+                # Check fundamental exit conditions
+                if exit_signals.get(symbol, {}).get(date):
+                    reason = exit_signals[symbol][date].get("reason", "fundamental_exit")
+                    portfolio.close_position(symbol, date, price, reason, slippage)
+                    closed_today.append(symbol)
+                    continue
 
         # --- Check rebalancing (only if regime gate is on) ---
         rebal_freq = config.get("rebalancing", {}).get("frequency", "none")

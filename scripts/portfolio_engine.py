@@ -1515,6 +1515,71 @@ def run_portfolio_backtest(portfolio_config: dict, force_close_at_end: bool = Tr
             sleeve_result.setdefault("trades", []).extend(rebalance_trades_by_sleeve[i])
             n_rebalance_trades += len(rebalance_trades_by_sleeve[i])
 
+    # ---- Reconcile the merged trade ledger against actual holdings ----------
+    # The sleeve's standalone simulation and the portfolio-level rebalance lerp
+    # are independent traces. When merged, sleeve-level SELLs (stop_loss,
+    # take_profit, time_stop, fundamental_exit, backtest_end) can refer to
+    # share counts that exceed what the broker actually holds after a prior
+    # rebalance liquidation. Left unfixed, cumulative shares per symbol go
+    # negative — fine for sleeve-internal NAV (it's tracked separately) but
+    # misleading for the user-facing trade ledger and for live execution.
+    #
+    # Reconciliation rule: walk trades chronologically per (sleeve, symbol).
+    # When a SELL would exceed currently-held shares, cap its `shares` at the
+    # remaining holding and recompute `amount` / `pnl`. If holdings are zero,
+    # drop the trade entirely — it represents a phantom exit on positions the
+    # broker has already liquidated. BUY trades and rebalance trades are
+    # unchanged. Sleeve NAV / Sharpe / metrics are unaffected (computed
+    # upstream from nav_history, not from the reconciled trade list).
+    from collections import defaultdict as _dd
+    for sleeve_result in sleeve_results:
+        all_trades = sleeve_result.get("trades", [])
+        if not all_trades:
+            continue
+        # Sort by (date, action-order). On the same date, rebalance trades
+        # represent the start-of-day portfolio reallocation and should be
+        # applied before sleeve-internal exits / entries.
+        def _trade_sort_key(t):
+            reason = t.get("reason", "") or ""
+            # Portfolio-level rebalance first, then BUYs, then SELLs.
+            phase = 0 if reason.startswith("rebalance_to_") else (1 if t["action"] == "BUY" else 2)
+            return (t["date"], phase)
+
+        ordered = sorted(all_trades, key=_trade_sort_key)
+        cum_shares: dict = _dd(float)
+        reconciled: list = []
+        for t in ordered:
+            sym = t["symbol"]
+            shares = float(t.get("shares", 0))
+            if t["action"] == "BUY":
+                cum_shares[sym] += shares
+                reconciled.append(t)
+                continue
+            # SELL
+            held = cum_shares[sym]
+            if held <= 1e-6:
+                # Phantom SELL on already-liquidated position — drop it.
+                continue
+            if shares > held + 1e-6:
+                # Scale this SELL down to the remaining holding.
+                scaled = dict(t)
+                scaled["shares"] = round(held, 6)
+                price = float(scaled.get("price", 0) or 0)
+                if price > 0:
+                    scaled["amount"] = round(held * price, 2)
+                entry_price = float(scaled.get("entry_price", 0) or 0)
+                if entry_price > 0 and price > 0:
+                    scaled["pnl"] = round((price - entry_price) * held, 2)
+                    # pnl_pct is per-share return; unchanged when shares scale
+                scaled["_reconciled_shares"] = round(shares, 6)
+                scaled["_reconciled_reason"] = "scaled_to_remaining_holding"
+                cum_shares[sym] = 0.0
+                reconciled.append(scaled)
+            else:
+                cum_shares[sym] -= shares
+                reconciled.append(t)
+        sleeve_result["trades"] = reconciled
+
     rebalance_summary = {
         "rebalance_active": emit_rebalance_trades,
         "rebalance_threshold": rebalance_threshold,
