@@ -239,8 +239,10 @@ class PositionBook:
             "symbol": symbol,
             "action": "BUY",
             "reason": reason,
-            "price": round(fill_price, 4),
-            "shares": round(shares, 6),
+            # Rounding matches v1 backtest_engine.Portfolio.open_position so
+            # ledger comparisons are byte-identical for parity tests.
+            "price": round(fill_price, 2),
+            "shares": round(shares, 4),
             "amount": round(amount, 2),
             "sleeve_label": sleeve_label,
         }
@@ -304,13 +306,14 @@ class PositionBook:
             "symbol": symbol,
             "action": "SELL",
             "reason": reason,
-            "price": round(fill_price, 4),
-            "shares": round(sell_shares, 6),
+            # Rounding matches v1 backtest_engine.Portfolio.close_position.
+            "price": round(fill_price, 2),
+            "shares": round(sell_shares, 4),
             "amount": round(proceeds, 2),
             "pnl": round(pnl, 2),
             "pnl_pct": round(pnl_pct, 2),
             "entry_date": pos.entry_date,
-            "entry_price": round(pos.entry_price, 4),
+            "entry_price": round(pos.entry_price, 2),
             "days_held": days_held,
             "sleeve_label": sleeve_label,
         }

@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""
+V1 ↔ V2 parity test (Phase 2 Step 3a).
+
+The unified-position-book V2 engine must produce BYTE-IDENTICAL trade
+ledgers and NAV trajectories as V1 for configurations where V1 is
+known to be correct (no dual-bookkeeping risk):
+
+  Step 3a — single sleeve, no regime, fixed-weight=1.0:
+    The trivial case. V1 has no lerp, no allocation profile, no phantom
+    trades. V2 should reproduce it exactly.
+
+Later steps add regime_gate, allocation profiles, multi-sleeve. Where V1's
+behavior was the broken dual-bookkeeping pattern, V2 will INTENTIONALLY
+diverge to produce the clean broker-equivalent ledger (those tests live
+elsewhere). This file is the parity gate — V2 cannot ship until the
+no-regime case is byte-identical.
+
+Run:
+    cd /home/mohamed/alpha-scout-backend-dev/tests
+    MARKET_DB_PATH=/home/mohamed/alpha-scout-backend/data/market.db \\
+    APP_DB_PATH=/home/mohamed/alpha-scout-backend/data/app_dev.db \\
+    python3 test_v1_v2_parity_e2e.py
+"""
+import copy
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
+
+from portfolio_engine import run_portfolio_backtest as run_v1
+from portfolio_engine_v2 import run_portfolio_backtest as run_v2
+
+PASS = 0
+FAIL = 0
+
+
+def check(name, cond, detail=""):
+    global PASS, FAIL
+    if cond:
+        PASS += 1
+        print(f"  ✅ {name}")
+    else:
+        FAIL += 1
+        print(f"  ❌ {name} — {detail}")
+
+
+def trade_sig(t):
+    """Canonical signature for comparing trades."""
+    return (
+        t["date"], t["symbol"], t["action"], t.get("reason"),
+        round(float(t.get("price", 0)), 4),
+        round(float(t.get("shares", 0)), 4),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Helper: build a no-regime single-sleeve config
+# ---------------------------------------------------------------------------
+TECH_UNI = ["AAPL", "MSFT", "NVDA", "AMD", "AVGO", "INTC",
+             "MU", "ARM", "COHR", "WDC", "TER", "GLW"]
+
+
+def base_strat(extra_strategy=None):
+    s = {
+        "name": "ParityProbe",
+        "universe": {"type": "symbols", "symbols": TECH_UNI},
+        "entry": {"conditions": [{"type": "always"}], "logic": "all"},
+        "stop_loss": {"type": "drawdown_from_entry", "value": -25, "cooldown_days": 60},
+        "time_stop": {"max_days": 365},
+        "ranking": {"by": "momentum_rank", "order": "desc", "top_n": 5},
+        "rebalancing": {"frequency": "none", "rules": {}},
+        "sizing": {"type": "equal_weight", "max_positions": 5,
+                    "initial_allocation": 500_000},
+        "backtest": {"start": "2024-01-01", "end": "2024-06-30",
+                     "entry_price": "next_close", "slippage_bps": 10},
+    }
+    if extra_strategy:
+        for k, v in extra_strategy.items():
+            s[k] = v
+    return s
+
+
+def base_portfolio(strat_overrides=None):
+    return {
+        "name": "ParityPortfolio",
+        "sleeves": [{
+            "label": "Tech", "weight": 1.0, "regime_gate": ["*"],
+            "strategy_config": base_strat(strat_overrides),
+        }],
+        "regime_filter": False,
+        "capital_when_gated_off": "to_cash",
+        "backtest": {"start": "2024-01-01", "end": "2024-06-30",
+                     "initial_capital": 500_000},
+    }
+
+
+# ---------------------------------------------------------------------------
+# Run a config through both engines and compare
+# ---------------------------------------------------------------------------
+def run_parity(name: str, config: dict):
+    print(f"\n{'━' * 70}\n  {name}\n{'━' * 70}")
+
+    r_v1 = run_v1(copy.deepcopy(config), force_close_at_end=True)
+    r_v2 = run_v2(copy.deepcopy(config), force_close_at_end=True)
+
+    # Trade ledger
+    t1 = r_v1.get("trades", [])
+    if not t1:
+        # v1's run_portfolio_backtest stores trades inside sleeve_results
+        t1 = r_v1.get("sleeve_results", [{}])[0].get("trades", [])
+    t2 = r_v2.get("trades", [])
+
+    sigs1 = sorted([trade_sig(t) for t in t1])
+    sigs2 = sorted([trade_sig(t) for t in t2])
+
+    check(f"trade count parity (v1={len(t1)}, v2={len(t2)})",
+          len(t1) == len(t2),
+          f"v1 has {len(t1)}, v2 has {len(t2)}")
+
+    check("trade ledger byte-identical (sorted)",
+          sigs1 == sigs2,
+          f"first diff: {next(((a, b) for a, b in zip(sigs1, sigs2) if a != b), 'none')}")
+
+    # Top-level metrics
+    m1 = r_v1.get("metrics") or {}
+    m2 = r_v2.get("metrics") or {}
+    for key in ("total_return_pct", "final_nav", "max_drawdown_pct"):
+        v1 = m1.get(key)
+        v2 = m2.get(key)
+        check(f"metrics.{key} parity: v1={v1} v2={v2}",
+              v1 == v2,
+              f"v1={v1} v2={v2}")
+
+
+# ---------------------------------------------------------------------------
+# Scenario tests
+# ---------------------------------------------------------------------------
+
+# Scenario 1: simplest — always entry, momentum_rank, equal_weight, no rebalance, no stops fire
+run_parity("S3a-1 simplest single sleeve",
+            base_portfolio())
+
+# Scenario 2: with stops + take_profit
+run_parity("S3a-2 with stop_loss + take_profit",
+            base_portfolio({
+                "take_profit": {"type": "above_peak", "value": 20},
+            }))
+
+# Scenario 3: with quarterly rebalance + add_on_earnings_beat
+run_parity("S3a-3 quarterly trim rebalance + earnings_beat add",
+            base_portfolio({
+                "rebalancing": {"frequency": "quarterly", "mode": "trim",
+                                "rules": {"max_position_pct": 30,
+                                          "trim_pct": 50,
+                                          "on_earnings_beat": "add",
+                                          "add_on_earnings_beat": {
+                                              "min_gain_pct": 10,
+                                              "max_add_multiplier": 1.5,
+                                              "lookback_days": 90}}},
+            }))
+
+# Scenario 4: risk_parity sizing
+run_parity("S3a-4 risk_parity sizing",
+            base_portfolio({
+                "sizing": {"type": "risk_parity", "max_positions": 5,
+                            "initial_allocation": 500_000, "vol_window_days": 20},
+            }))
+
+# Scenario 5: next_open entry mode
+run_parity("S3a-5 entry_price=next_open",
+            base_portfolio({
+                "backtest": {"start": "2024-01-01", "end": "2024-06-30",
+                             "entry_price": "next_open", "slippage_bps": 10},
+            }))
+
+
+# ---------------------------------------------------------------------------
+print("\n" + "=" * 70)
+print(f"PASSED: {PASS}")
+print(f"FAILED: {FAIL}")
+print("=" * 70)
+sys.exit(0 if FAIL == 0 else 1)

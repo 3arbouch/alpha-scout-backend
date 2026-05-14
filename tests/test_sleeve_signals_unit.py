@@ -359,6 +359,7 @@ rds = get_rebalance_directives(
     sleeve_label="Tech", sleeve_config=cfg_none, date=TODAY,
     sleeve_positions=book.positions_for_sleeve("Tech"),
     price_index=pi, state=state, sleeve_nav=100_000,
+    available_cash=90_000,
 )
 check("frequency=none → no directives", rds == [])
 
@@ -366,26 +367,29 @@ check("frequency=none → no directives", rds == [])
 # ---------------------------------------------------------------------------
 # 13. Rebalance: quarterly + earnings_beat → BUY add directive
 # ---------------------------------------------------------------------------
-print("\n=== 13. Quarterly rebalance + earnings_beat → ADD ===")
+print("\n=== 13. Quarterly rebalance + earnings_beat → ADD (matches v1 _do_rebalance) ===")
 
 # Set last_rebal_date 100 days ago so today qualifies for quarterly
 old_rebal = (datetime.strptime(TODAY, "%Y-%m-%d") - timedelta(days=100)).strftime("%Y-%m-%d")
 state_quart = SleeveRuntimeState("Tech", last_rebal_date=old_rebal)
 
-# Earnings event 10 days ago: beat with 15% gain
+# AAPL is up by 20% from entry (200 → 240); earnings beat 10 days ago
 beat_date = (datetime.strptime(TODAY, "%Y-%m-%d") - timedelta(days=10)).strftime("%Y-%m-%d")
 earnings_data = {
-    "AAPL": [{"date": beat_date, "type": "beat", "gain_pct": 15.0}],
+    "AAPL": {beat_date: {"eps_actual": 1.5, "eps_estimated": 1.0, "beat": True}},
 }
+pi_up = {"AAPL": {TODAY: 240.0}}   # pnl_pct = (240-220)/220 ≈ 9.1% (entry weighted-avg from earlier in this test was 220 due to add-on)
+
+book2 = PositionBook(100_000)
+book2.open("Tech", "AAPL", "2024-01-02", 10_000, 200.0)  # 50 shares @ 200
+# Position pnl_pct at 240 = 20%, threshold is 10% → qualifies for add
+
 cfg_q = {
     "rebalancing": {
         "frequency": "quarterly",
         "mode": "trim",
         "rules": {
-            "max_position_pct": 25,
-            "trim_pct": 50,
-            "on_earnings_beat": "add",
-            "on_earnings_miss": "trim",
+            "max_position_pct": 100,   # high cap so trim doesn't fire
             "add_on_earnings_beat": {
                 "min_gain_pct": 10, "max_add_multiplier": 1.5, "lookback_days": 90,
             },
@@ -394,43 +398,41 @@ cfg_q = {
 }
 rds = get_rebalance_directives(
     sleeve_label="Tech", sleeve_config=cfg_q, date=TODAY,
-    sleeve_positions=book.positions_for_sleeve("Tech"),
-    price_index=pi, state=state_quart,
-    sleeve_nav=100_000, earnings_data=earnings_data,
+    sleeve_positions=book2.positions_for_sleeve("Tech"),
+    price_index=pi_up, state=state_quart,
+    sleeve_nav=100_000, available_cash=90_000, earnings_data=earnings_data,
 )
-check("quarterly + earnings_beat → exactly 1 directive",
-      len(rds) == 1,
-      f"got {len(rds)}")
+check("quarterly + earnings_beat + pnl >= threshold → 1 BUY add directive",
+      len(rds) == 1 and rds[0].action == "BUY" and rds[0].reason == "entry",
+      f"got {[(r.action, r.reason) for r in rds]}")
 if rds:
     d = rds[0]
-    check("directive is BUY (add)", d.action == "BUY")
-    check("reason = entry (add-on)", d.reason == "entry")
-    check("shares = current × (max_add_multiplier - 1) = 50 × 0.5 = 25",
-          approx(d.shares, 25.0, tol=1e-3))
+    # original_cost = 10000, max_total = 15000, current_value = 50 * 240 = 12000
+    # room_to_add = 15000 - 12000 = 3000
+    # amount = min(3000, 90000 * 0.25 = 22500) = 3000
+    check("amount = room_to_add = max_total - current_value = 3000",
+          approx(d.amount, 3_000.0, tol=1.0),
+          f"got amount={d.amount}")
     check("detail.trigger = earnings_beat",
           d.detail.get("trigger") == "earnings_beat")
 
 
 # ---------------------------------------------------------------------------
-# 14. Rebalance: earnings_miss → SELL trim directive
+# 14. Rebalance: no beat, no qualifying pnl → no directive
 # ---------------------------------------------------------------------------
-print("\n=== 14. Quarterly rebalance + earnings_miss → TRIM ===")
+print("\n=== 14. Earnings miss → NO add directive (v1 doesn't trim on miss in this path) ===")
 
 earnings_miss = {
-    "AAPL": [{"date": beat_date, "type": "miss", "gain_pct": -3.0}],
+    "AAPL": {beat_date: {"eps_actual": 0.8, "eps_estimated": 1.0, "beat": False}},
 }
 rds = get_rebalance_directives(
     sleeve_label="Tech", sleeve_config=cfg_q, date=TODAY,
-    sleeve_positions=book.positions_for_sleeve("Tech"),
-    price_index=pi, state=state_quart,
-    sleeve_nav=100_000, earnings_data=earnings_miss,
+    sleeve_positions=book2.positions_for_sleeve("Tech"),
+    price_index=pi_up, state=state_quart,
+    sleeve_nav=100_000, available_cash=90_000, earnings_data=earnings_miss,
 )
-check("earnings_miss → 1 SELL trim directive",
-      len(rds) == 1 and rds[0].action == "SELL"
-      and rds[0].reason == "rebalance_trim",
-      f"got {[(r.action, r.reason) for r in rds]}")
-check("trim shares = 50 × 0.5 = 25",
-      rds and approx(rds[0].shares, 25.0))
+check("earnings_miss + no max_pct breach → no directives (v1 silently ignores on_earnings_miss)",
+      rds == [])
 
 
 # ---------------------------------------------------------------------------
@@ -438,14 +440,13 @@ check("trim shares = 50 × 0.5 = 25",
 # ---------------------------------------------------------------------------
 print("\n=== 15. Quarterly rebalance — not yet at cadence ===")
 
-# last_rebal 30 days ago (not 90+) → not a quarterly date yet
 recent_rebal = (datetime.strptime(TODAY, "%Y-%m-%d") - timedelta(days=30)).strftime("%Y-%m-%d")
 state_recent = SleeveRuntimeState("Tech", last_rebal_date=recent_rebal)
 rds = get_rebalance_directives(
     sleeve_label="Tech", sleeve_config=cfg_q, date=TODAY,
-    sleeve_positions=book.positions_for_sleeve("Tech"),
-    price_index=pi, state=state_recent,
-    sleeve_nav=100_000, earnings_data=earnings_data,
+    sleeve_positions=book2.positions_for_sleeve("Tech"),
+    price_index=pi_up, state=state_recent,
+    sleeve_nav=100_000, available_cash=90_000, earnings_data=earnings_data,
 )
 check("30 days since last rebal (quarterly needs 90) → no directives",
       rds == [])
@@ -454,29 +455,39 @@ check("30 days since last rebal (quarterly needs 90) → no directives",
 # ---------------------------------------------------------------------------
 # 16. max_position_pct trim
 # ---------------------------------------------------------------------------
-print("\n=== 16. max_position_pct trim ===")
+print("\n=== 16. max_position_pct trim (matches v1 _do_rebalance formula) ===")
 
-# Position worth 30% of sleeve NAV, cap at 25% → trim 5%/30% of shares
-book = PositionBook(100_000)
-book.open("Tech", "AAPL", "2024-01-02", 30_000, 200.0)  # 150 shares
-pi = {"AAPL": {TODAY: 200.0}}   # mv = 30_000, sleeve_nav = 100_000 → 30%
+# Position worth 30% of sleeve NAV, cap at 25%
+# v1: trim_pct = ((30 - 25) / 30) * 100 = 16.67%
+# trim_shares = 150 * 0.1667 = 25
+book3 = PositionBook(100_000)
+book3.open("Tech", "AAPL", "2024-01-02", 30_000, 200.0)  # 150 shares
+pi3 = {"AAPL": {TODAY: 200.0}}
 
-# No earnings event in lookback so universal trim path applies
-state_q2 = SleeveRuntimeState("Tech", last_rebal_date=old_rebal)
+cfg_q2 = {
+    "rebalancing": {
+        "frequency": "quarterly", "mode": "trim",
+        "rules": {"max_position_pct": 25,
+                   "add_on_earnings_beat": {"min_gain_pct": 50,   # high threshold to skip add
+                                             "max_add_multiplier": 1.5,
+                                             "lookback_days": 90}},
+    },
+}
+state_q3 = SleeveRuntimeState("Tech", last_rebal_date=old_rebal)
 rds = get_rebalance_directives(
-    sleeve_label="Tech", sleeve_config=cfg_q, date=TODAY,
-    sleeve_positions=book.positions_for_sleeve("Tech"),
-    price_index=pi, state=state_q2,
-    sleeve_nav=100_000, earnings_data={},
+    sleeve_label="Tech", sleeve_config=cfg_q2, date=TODAY,
+    sleeve_positions=book3.positions_for_sleeve("Tech"),
+    price_index=pi3, state=state_q3,
+    sleeve_nav=100_000, available_cash=70_000, earnings_data={},
 )
 check("position at 30% (cap 25%) → SELL trim",
       len(rds) == 1 and rds[0].action == "SELL"
       and rds[0].reason == "rebalance_trim",
       f"got {rds}")
 if rds:
-    # target_mv = 25_000, trim_mv = 5_000, shares = 5_000 / 200 = 25
-    check("trim shares to bring under cap (5k MV → 25 shares)",
-          approx(rds[0].shares, 25.0, tol=1e-3))
+    check("trim shares ≈ 25 (((30-25)/30) × 150 = 25)",
+          approx(rds[0].shares, 25.0, tol=1e-2),
+          f"got shares={rds[0].shares}")
     check("detail.trigger = max_position_pct",
           rds[0].detail.get("trigger") == "max_position_pct")
 
