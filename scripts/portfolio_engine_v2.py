@@ -28,6 +28,7 @@ from typing import Optional
 sys.path.insert(0, str(Path(__file__).parent))
 
 from backtest_engine import (
+    rank_candidates,
     _calendar_to_trading_days,
     _find_recent_peak as _v1_find_recent_peak,
     _load_feature_series,
@@ -61,7 +62,7 @@ from sleeve_signals import (
     get_exit_recommendations,
     get_rebalance_directives,
 )
-from stop_pricing import compute_realized_vol, compute_stop_pricing
+from stop_pricing import compute_realized_vol, compute_stop_pricing, make_sqlite_ohlc_fetcher
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +175,7 @@ def _execute_pending_entries(
     price_index: dict,
     open_index: dict,
     date: str,
+    ohlc_fetcher=None,
 ) -> list[dict]:
     """Process a sleeve's pending entries from yesterday, filling at today's
     close (next_close) or today's open (next_open).
@@ -261,9 +263,18 @@ def _execute_pending_entries(
         # Peak-price reference for above_peak TP (uses v1's window logic)
         peak_price = _find_recent_peak(d.symbol, date, price_index, cfg)
 
-        # Vol-adaptive stop/TP pricing — frozen levels at entry
+        # Vol-adaptive stop/TP pricing — frozen levels at entry. v1 passes the
+        # SLIPPAGE-ADJUSTED entry price (backtest_engine.py:1948-1955), so the
+        # frozen stop/TP levels reflect what the broker actually paid; v2 must
+        # match to keep stop-fire dates byte-identical.
+        exec_entry_price = price * (1 + sleeve.slippage_bps / 10000)
+        # Use DB-backed OHLC fetcher when provided (matches v1's
+        # make_sqlite_ohlc_fetcher: real H/L for ATR, strict-before-entry to
+        # avoid lookahead). Falls back to the close-only stub only if the
+        # caller didn't pass a fetcher.
+        fetcher = ohlc_fetcher if ohlc_fetcher is not None else _make_ohlc_fetcher(price_index)
         pricing = compute_stop_pricing(
-            sleeve.config, d.symbol, date, price, _make_ohlc_fetcher(price_index),
+            sleeve.config, d.symbol, date, exec_entry_price, fetcher,
         )
         if pricing["abort"]:
             continue
@@ -295,17 +306,159 @@ def _execute_pending_entries(
     return trades
 
 
+# ---------------------------------------------------------------------------
+def _apply_equal_weight_rebalance(
+    sleeve: "_SleeveContext",
+    book: PositionBook,
+    conn,
+    price_index: dict,
+    date: str,
+) -> list[dict]:
+    """Equal-weight rebalance (mirrors v1 _do_equal_weight_rebalance).
+
+    Step 1: re-rank universe → pick top_n target set (or keep current
+            holdings if no ranking config).
+    Step 2: sell positions that fell out of target set (rebalance_rotation).
+    Step 3: reweight each surviving position toward target_amount = NAV/n
+            (trim → rebalance_trim, add → entry).
+    Step 4: buy new positions in target set not yet held (entry).
+
+    NAV is recomputed between phases (matches v1).
+    """
+    cfg = sleeve.config
+    sizing_cfg = cfg.get("sizing", {})
+    max_positions = sizing_cfg.get("max_positions", 10)
+    ranking_cfg = cfg.get("ranking")
+    slippage = sleeve.slippage_bps
+
+    trades: list[dict] = []
+    sleeve_label = sleeve.label
+
+    sleeve_nav = book.sleeve_nav(sleeve_label, price_index, date)
+    if sleeve_nav <= 0:
+        return trades
+
+    # ---- Determine target holdings -------------------------------------
+    if ranking_cfg:
+        top_n = ranking_cfg.get("top_n", max_positions)
+        candidates: list[tuple[str, float]] = []
+        for symbol in sorted(sleeve.signals.keys()):
+            sig_data = sleeve.signals.get(symbol, {})
+            if date not in sig_data:
+                continue
+            candidates.append((symbol, sig_data[date]))
+        if candidates:
+            ranked = rank_candidates(
+                candidates, cfg, conn, date, price_index,
+                pe_series=sleeve.pe_series,
+                composite_series=sleeve.composite_series,
+            )
+            target_symbols = set(sym for sym, _ in ranked[:top_n])
+        else:
+            target_symbols = set(book.symbols_held_by_sleeve(sleeve_label))
+    else:
+        target_symbols = set(book.symbols_held_by_sleeve(sleeve_label))
+
+    # ---- Step 1: rotation sells ----------------------------------------
+    for symbol in list(book.symbols_held_by_sleeve(sleeve_label)):
+        if symbol in target_symbols:
+            continue
+        price = price_index.get(symbol, {}).get(date)
+        if not price:
+            continue
+        t = book.sell(
+            sleeve_label=sleeve_label, symbol=symbol, date=date,
+            exec_price=price, reason="rebalance_rotation",
+            slippage_bps=slippage,
+        )
+        if t is not None:
+            trades.append(t)
+
+    # ---- Step 2: reweight survivors ------------------------------------
+    n_targets = len(target_symbols)
+    if n_targets == 0:
+        return trades
+
+    sleeve_nav = book.sleeve_nav(sleeve_label, price_index, date)
+    target_amount = sleeve_nav / n_targets
+
+    for symbol in list(book.symbols_held_by_sleeve(sleeve_label)):
+        if symbol not in target_symbols:
+            continue
+        price = price_index.get(symbol, {}).get(date)
+        if not price:
+            continue
+        pos = book.get(sleeve_label, symbol)
+        if pos is None:
+            continue
+        current_value = pos.market_value(price)
+        diff = target_amount - current_value
+        if diff < -1000:
+            # Overweight — trim
+            trim_pct = (abs(diff) / current_value) * 100
+            trim_pct = min(trim_pct, 99)
+            trim_shares = pos.shares * (trim_pct / 100.0)
+            if trim_shares > 0:
+                t = book.sell(
+                    sleeve_label=sleeve_label, symbol=symbol, date=date,
+                    exec_price=price, reason="rebalance_trim",
+                    shares=trim_shares, slippage_bps=slippage,
+                )
+                if t is not None:
+                    trades.append(t)
+        elif diff > 1000 and book.sleeve_cash(sleeve_label) > 1000:
+            # Underweight — add (v1 emits this with no explicit reason →
+            # `entry` is the default)
+            add_amount = min(diff, book.sleeve_cash(sleeve_label) * 0.95)
+            if add_amount >= 1000:
+                t = book.open(
+                    sleeve_label=sleeve_label, symbol=symbol, date=date,
+                    amount=add_amount, exec_price=price,
+                    slippage_bps=slippage, reason="entry",
+                )
+                if t is not None:
+                    trades.append(t)
+
+    # ---- Step 3: buy new top-N entrants --------------------------------
+    sleeve_nav = book.sleeve_nav(sleeve_label, price_index, date)
+    if n_targets == 0:
+        return trades
+    target_amount = sleeve_nav / n_targets
+
+    for symbol in target_symbols:
+        if book.has(sleeve_label, symbol):
+            continue
+        price = price_index.get(symbol, {}).get(date)
+        if not price:
+            continue
+        amount = min(target_amount, book.sleeve_cash(sleeve_label) * 0.95)
+        if amount < 1000:
+            continue
+        t = book.open(
+            sleeve_label=sleeve_label, symbol=symbol, date=date,
+            amount=amount, exec_price=price,
+            slippage_bps=slippage, reason="entry",
+        )
+        if t is not None:
+            trades.append(t)
+
+    return trades
+
+
 def _make_ohlc_fetcher(price_index: dict):
     """Stub OHLC fetcher used by compute_stop_pricing for vol-adaptive modes.
 
-    Returns (high, low, close) bars by computing high/low = close (degraded
-    case). Matches v1's behavior when prices are only close-only.
+    Returns (high, low, close) bars STRICTLY before `end_date` (no lookahead),
+    with high/low = close (degraded; matches v1 when prices are close-only).
+    The strict-before-entry semantics mirror v1's make_sqlite_ohlc_fetcher
+    contract ("strictly BEFORE entry_date"); otherwise the entry bar leaks
+    into the realized-vol window and stop levels diverge from v1.
     """
     def fetch(symbol: str, end_date: str, n: int):
         pm = price_index.get(symbol, {})
         if not pm:
             return []
-        closes_dates = sorted(d for d in pm if d <= end_date)
+        closes_dates = sorted(d for d in pm if d < end_date)
         tail = closes_dates[-n:]
         if len(tail) < n:
             return []
@@ -339,6 +492,11 @@ def _run_daily_loop(
     all_trades: list[dict] = []
     last_date = trading_dates[-1] if trading_dates else None
     profile_name_by_date = profile_name_by_date or {}
+    # DB-backed OHLC fetcher for vol-adaptive stops (matches v1). Built once,
+    # threaded into _execute_pending_entries so every entry's stop/TP uses
+    # real high/low data — critical for ATR-mode stops which collapse if
+    # high==low==close.
+    ohlc_fetcher = make_sqlite_ohlc_fetcher(conn)
 
     # Track each sleeve's ALLOCATION-PROFILE gate state from the prior day so
     # we can detect the day allocation_profile drops it to 0% and emit clean
@@ -389,6 +547,7 @@ def _run_daily_loop(
                 continue
             trades = _execute_pending_entries(
                 sleeve, book, price_index, open_index, date,
+                ohlc_fetcher=ohlc_fetcher,
             )
             all_trades.extend(trades)
 
@@ -423,6 +582,23 @@ def _run_daily_loop(
         # -------------------------------------------------------------------
         for sleeve in sleeves:
             if not sleeve.is_gated_on(date):
+                continue
+            rb_cfg = sleeve.config.get("rebalancing") or {}
+            rb_mode = rb_cfg.get("mode", "trim")
+            rb_freq = rb_cfg.get("frequency", "none")
+
+            # equal_weight rebalance mode (v1's _do_equal_weight_rebalance):
+            # re-rank universe on rebalance day, rotate out positions that
+            # fell out of top-N, reweight survivors, buy new entrants.
+            # Same rebalance-date gating as the trim-mode path.
+            if (rb_mode == "equal_weight" and rb_freq != "none"
+                    and is_rebalance_date(date, sleeve.state.last_rebal_date, rb_freq)):
+                ew_trades = _apply_equal_weight_rebalance(
+                    sleeve=sleeve, book=book, conn=conn,
+                    price_index=price_index, date=date,
+                )
+                all_trades.extend(ew_trades)
+                sleeve.state.last_rebal_date = date
                 continue
             sleeve_nav = book.sleeve_nav(sleeve.label, price_index, date)
             rds = get_rebalance_directives(
@@ -555,7 +731,10 @@ def run_portfolio_backtest(
     sleeve_symbols: list[list[str]] = []
     all_sleeve_symbols: set[str] = set()
     for sd in sleeves_def:
-        scfg = validate_strategy(sd["strategy_config"])
+        # Accept legacy `config` field (older deployments) — mirrors v1's
+        # _resolve_strategy_config (portfolio_engine.py:151).
+        raw = sd.get("strategy_config") or sd.get("config")
+        scfg = validate_strategy(raw)
         # Match v1's portfolio_engine.py:340-345: override the strategy's
         # backtest range with the PORTFOLIO's range. The strategy's own
         # window in the config is the historical training window; the

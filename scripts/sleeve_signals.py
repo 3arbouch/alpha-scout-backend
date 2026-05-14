@@ -141,7 +141,10 @@ def get_entry_candidates(
         return []
 
     cfg = sleeve_config
-    universe = list(signals.keys())   # only symbols that have ANY signal in the precomputed dict
+    # Iterate in alphabetical order to match v1's resolve_universe(sorted=True).
+    # Stable-sort ties downstream then depend on this ordering, so misaligning
+    # it causes shares-per-fill drift on multi-symbol days with tied signals.
+    universe = sorted(signals.keys())
 
     # Cooldown setup (per-sleeve via state)
     cooldown_calendar_days = 0
