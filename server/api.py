@@ -303,15 +303,27 @@ def _sync_universe_profiles():
                 is_etf       INTEGER DEFAULT 0,
                 is_adr       INTEGER DEFAULT 0,
                 cik          TEXT,
+                isin         TEXT,
+                cusip        TEXT,
                 description  TEXT,
                 synced_at    TEXT NOT NULL
             )
         """)
+        # Add isin / cusip columns when running against a DB created by an
+        # older schema. SQLite ALTER TABLE ADD COLUMN can't be IF NOT EXISTS,
+        # so we PRAGMA-check first.
+        existing_cols = {r[1] for r in conn.execute(
+            "PRAGMA table_info(universe_profiles)"
+        ).fetchall()}
+        for col in ("isin", "cusip"):
+            if col not in existing_cols:
+                conn.execute(f"ALTER TABLE universe_profiles ADD COLUMN {col} TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_up_sector ON universe_profiles(sector)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_up_industry ON universe_profiles(industry)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_up_market_cap ON universe_profiles(market_cap)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_up_exchange ON universe_profiles(exchange)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_up_country ON universe_profiles(country)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_up_isin ON universe_profiles(isin)")
         # Composite index for common filter combos
         conn.execute("CREATE INDEX IF NOT EXISTS idx_up_sector_mcap ON universe_profiles(sector, market_cap)")
 
@@ -326,8 +338,8 @@ def _sync_universe_profiles():
                 INSERT OR REPLACE INTO universe_profiles
                     (symbol, name, sector, industry, market_cap, exchange, country,
                      beta, price, volume, avg_volume, is_actively_trading,
-                     ipo_date, is_etf, is_adr, cik, description, synced_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     ipo_date, is_etf, is_adr, cik, isin, cusip, description, synced_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 p.get("symbol", f.stem),
                 p.get("companyName", ""),
@@ -345,6 +357,8 @@ def _sync_universe_profiles():
                 1 if p.get("isEtf") else 0,
                 1 if p.get("isAdr") else 0,
                 p.get("cik"),
+                p.get("isin"),
+                p.get("cusip"),
                 p.get("description"),
                 now,
             ))
@@ -408,7 +422,7 @@ async def get_universe(
         ).fetchone()[0]
         rows = conn.execute(
             f"""SELECT symbol, name, sector, industry, market_cap, exchange, country,
-                       is_actively_trading, beta, price
+                       is_actively_trading, beta, price, isin, cusip
                 FROM universe_profiles{where}
                 ORDER BY {sort} {order_dir}
                 LIMIT ? OFFSET ?""",
@@ -645,6 +659,71 @@ async def get_profile(symbol: str):
         raise HTTPException(status_code=404, detail=f"Profile not found for {symbol}")
     profile = data[0] if isinstance(data, list) else data
     return {"symbol": symbol, "data": profile}
+
+
+@app.get("/api/symbols/{symbol}/identifiers", dependencies=[Depends(verify_api_key)])
+async def get_identifiers(symbol: str):
+    """Cross-listing identifiers for a ticker.
+
+    Returns the security's persistent identifiers (ISIN, CUSIP, CIK) along
+    with venue metadata (exchange, country, currency-implied via country).
+    Source: universe_profiles, populated from FMP /profile.
+
+    Use this when sending orders to brokers that key on ISIN, or when
+    reconciling against compliance / restricted-list feeds.
+    """
+    symbol = validate_symbol(symbol)
+    with get_market_db() as conn:
+        row = conn.execute(
+            """SELECT symbol, name, isin, cusip, cik, exchange, country,
+                      is_actively_trading
+               FROM universe_profiles WHERE symbol = ?""",
+            (symbol,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"No profile for {symbol}")
+    return dict(row)
+
+
+@app.get("/api/symbols/lookup", dependencies=[Depends(verify_api_key)])
+async def lookup_by_identifier(
+    isin: Optional[str] = Query(None, min_length=12, max_length=12,
+                                description="12-char ISIN, e.g. US0378331005"),
+    cusip: Optional[str] = Query(None, min_length=8, max_length=9,
+                                 description="8 or 9-char CUSIP, e.g. 037833100"),
+    cik: Optional[str] = Query(None, max_length=20,
+                                description="SEC CIK, leading zeros optional"),
+):
+    """Reverse-resolve a ticker from an external identifier.
+
+    Pass exactly one of isin/cusip/cik. Returns the ticker (and minimal
+    profile) so a broker order received as ISIN can be mapped to the
+    symbol our engine and prices table use.
+    """
+    provided = [(k, v) for k, v in (("isin", isin), ("cusip", cusip), ("cik", cik)) if v]
+    if len(provided) != 1:
+        raise HTTPException(status_code=400,
+                            detail="Provide exactly one of isin, cusip, cik.")
+    col, value = provided[0]
+    # CIK in our DB is stored zero-padded ("0000320193"); accept either form.
+    if col == "cik":
+        with get_market_db() as conn:
+            row = conn.execute(
+                "SELECT symbol, name, isin, cusip, cik, exchange, country "
+                "FROM universe_profiles WHERE cik = ? OR cik = printf('%010d', ?)",
+                (value, int(value) if value.isdigit() else -1),
+            ).fetchone()
+    else:
+        with get_market_db() as conn:
+            row = conn.execute(
+                f"SELECT symbol, name, isin, cusip, cik, exchange, country "
+                f"FROM universe_profiles WHERE {col} = ? COLLATE NOCASE",
+                (value,),
+            ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404,
+                            detail=f"No symbol found for {col}={value}")
+    return dict(row)
 
 
 @app.get("/api/quotes/{symbol}", dependencies=[Depends(verify_api_key)])
