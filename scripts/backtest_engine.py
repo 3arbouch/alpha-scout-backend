@@ -2508,7 +2508,7 @@ def run_backtest(config: dict, force_close_at_end: bool = True,
 
             # Don't exceed available cash
             amount = min(amount, portfolio.cash * 0.99)  # Keep 1% cash buffer
-            if amount < 1000:  # Min position size
+            if amount <= 0:
                 continue
 
             # Check max position weight
@@ -2844,14 +2844,14 @@ def _do_rebalance(portfolio: Portfolio, price_index: dict, date: str,
                 continue
 
             amount = min(room_to_add, portfolio.cash * 0.25)  # Don't use more than 25% of cash
-            if amount < 1000:
+            if amount <= 0:
                 continue
 
             # Check weight cap
             new_weight = ((current_value + amount) / current_nav) * 100
             if new_weight > max_pct:
                 amount = (max_pct / 100 * current_nav) - current_value
-                if amount < 1000:
+                if amount <= 0:
                     continue
 
             portfolio.open_position(
@@ -2965,9 +2965,9 @@ def _do_equal_weight_rebalance(portfolio: Portfolio, price_index: dict, date: st
             continue
         
         amount = min(target_amount, portfolio.cash * 0.95)
-        if amount < 1000:
+        if amount <= 0:
             continue
-        
+
         sig_detail = signal_metadata.get(symbol, {}).get(date)
         portfolio.open_position(symbol, date, price, amount, slippage,
                                  signal_detail=sig_detail)

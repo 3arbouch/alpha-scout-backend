@@ -189,7 +189,7 @@ def _execute_pending_entries(
       - amount = current_nav / max_positions (equal_weight) — fresh per iter
       - risk_parity: pool = (n_batch / max_positions) × current_nav per iter
       - amount = min(amount, portfolio.cash * 0.99) — cash buffer cap
-      - min position size $1000 (matches v1)
+      - no minimum position size (only guard: amount > 0)
 
     Returns the list of BUY trade records executed.
     """
@@ -261,7 +261,7 @@ def _execute_pending_entries(
         # per-sleeve standalone simulation where each sleeve had its own
         # portfolio.cash. min(amount, sleeve_cash * 0.99).
         amount = min(amount, book.sleeve_cash(sleeve.label) * 0.99)
-        if amount < 1000:   # v1 minimum position size
+        if amount <= 0:
             continue
 
         # Peak-price reference for above_peak TP (uses v1's window logic)
@@ -436,7 +436,7 @@ def _apply_equal_weight_rebalance(
         if not price:
             continue
         amount = min(target_amount, book.sleeve_cash(sleeve_label) * 0.95)
-        if amount < 1000:
+        if amount <= 0:
             continue
         t = book.open(
             sleeve_label=sleeve_label, symbol=symbol, date=date,

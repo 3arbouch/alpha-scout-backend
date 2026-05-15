@@ -432,13 +432,13 @@ def _calendar_rebalance(
         if room_to_add <= 1000:
             continue
         amount = min(room_to_add, available_cash * 0.25)
-        if amount < 1000:
+        if amount <= 0:
             continue
         # Weight cap on the post-add value
         new_weight = ((current_value + amount) / sleeve_nav) * 100 if sleeve_nav > 0 else 0
         if new_weight > max_pct and max_pct > 0:
             amount = (max_pct / 100 * sleeve_nav) - current_value
-            if amount < 1000:
+            if amount <= 0:
                 continue
         out.append(RebalanceDirective(
             sleeve_label=sleeve_label, symbol=symbol,
