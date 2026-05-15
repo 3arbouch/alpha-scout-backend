@@ -24,6 +24,21 @@ from typing import Optional
 from contextlib import contextmanager
 from functools import partial
 
+# Load .env BEFORE any os.environ.get() reads below. The .env file lives at
+# the repo root (one level above this file). load_dotenv() is idempotent —
+# vars already set in the environment (e.g., `env VAR=… python …` overrides
+# or systemd unit Environment= lines) win, so this only fills in what the
+# launching shell didn't already set. Prevents the "dashboard auth not
+# configured" failure mode when api.py is restarted from a fresh shell.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+except ImportError:
+    # python-dotenv not installed — fall back to inherited environment.
+    # Dashboard auth / JWT signing / API keys will fail loudly downstream
+    # if the launching shell didn't source .env.
+    pass
+
 from fastapi import FastAPI, HTTPException, Query, Depends, Security, Header
 from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
@@ -288,15 +303,27 @@ def _sync_universe_profiles():
                 is_etf       INTEGER DEFAULT 0,
                 is_adr       INTEGER DEFAULT 0,
                 cik          TEXT,
+                isin         TEXT,
+                cusip        TEXT,
                 description  TEXT,
                 synced_at    TEXT NOT NULL
             )
         """)
+        # Add isin / cusip columns when running against a DB created by an
+        # older schema. SQLite ALTER TABLE ADD COLUMN can't be IF NOT EXISTS,
+        # so we PRAGMA-check first.
+        existing_cols = {r[1] for r in conn.execute(
+            "PRAGMA table_info(universe_profiles)"
+        ).fetchall()}
+        for col in ("isin", "cusip"):
+            if col not in existing_cols:
+                conn.execute(f"ALTER TABLE universe_profiles ADD COLUMN {col} TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_up_sector ON universe_profiles(sector)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_up_industry ON universe_profiles(industry)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_up_market_cap ON universe_profiles(market_cap)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_up_exchange ON universe_profiles(exchange)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_up_country ON universe_profiles(country)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_up_isin ON universe_profiles(isin)")
         # Composite index for common filter combos
         conn.execute("CREATE INDEX IF NOT EXISTS idx_up_sector_mcap ON universe_profiles(sector, market_cap)")
 
@@ -311,8 +338,8 @@ def _sync_universe_profiles():
                 INSERT OR REPLACE INTO universe_profiles
                     (symbol, name, sector, industry, market_cap, exchange, country,
                      beta, price, volume, avg_volume, is_actively_trading,
-                     ipo_date, is_etf, is_adr, cik, description, synced_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     ipo_date, is_etf, is_adr, cik, isin, cusip, description, synced_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 p.get("symbol", f.stem),
                 p.get("companyName", ""),
@@ -330,6 +357,8 @@ def _sync_universe_profiles():
                 1 if p.get("isEtf") else 0,
                 1 if p.get("isAdr") else 0,
                 p.get("cik"),
+                p.get("isin"),
+                p.get("cusip"),
                 p.get("description"),
                 now,
             ))
@@ -393,7 +422,7 @@ async def get_universe(
         ).fetchone()[0]
         rows = conn.execute(
             f"""SELECT symbol, name, sector, industry, market_cap, exchange, country,
-                       is_actively_trading, beta, price
+                       is_actively_trading, beta, price, isin, cusip
                 FROM universe_profiles{where}
                 ORDER BY {sort} {order_dir}
                 LIMIT ? OFFSET ?""",
@@ -630,6 +659,71 @@ async def get_profile(symbol: str):
         raise HTTPException(status_code=404, detail=f"Profile not found for {symbol}")
     profile = data[0] if isinstance(data, list) else data
     return {"symbol": symbol, "data": profile}
+
+
+@app.get("/api/symbols/{symbol}/identifiers", dependencies=[Depends(verify_api_key)])
+async def get_identifiers(symbol: str):
+    """Cross-listing identifiers for a ticker.
+
+    Returns the security's persistent identifiers (ISIN, CUSIP, CIK) along
+    with venue metadata (exchange, country, currency-implied via country).
+    Source: universe_profiles, populated from FMP /profile.
+
+    Use this when sending orders to brokers that key on ISIN, or when
+    reconciling against compliance / restricted-list feeds.
+    """
+    symbol = validate_symbol(symbol)
+    with get_market_db() as conn:
+        row = conn.execute(
+            """SELECT symbol, name, isin, cusip, cik, exchange, country,
+                      is_actively_trading
+               FROM universe_profiles WHERE symbol = ?""",
+            (symbol,),
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"No profile for {symbol}")
+    return dict(row)
+
+
+@app.get("/api/symbols/lookup", dependencies=[Depends(verify_api_key)])
+async def lookup_by_identifier(
+    isin: Optional[str] = Query(None, min_length=12, max_length=12,
+                                description="12-char ISIN, e.g. US0378331005"),
+    cusip: Optional[str] = Query(None, min_length=8, max_length=9,
+                                 description="8 or 9-char CUSIP, e.g. 037833100"),
+    cik: Optional[str] = Query(None, max_length=20,
+                                description="SEC CIK, leading zeros optional"),
+):
+    """Reverse-resolve a ticker from an external identifier.
+
+    Pass exactly one of isin/cusip/cik. Returns the ticker (and minimal
+    profile) so a broker order received as ISIN can be mapped to the
+    symbol our engine and prices table use.
+    """
+    provided = [(k, v) for k, v in (("isin", isin), ("cusip", cusip), ("cik", cik)) if v]
+    if len(provided) != 1:
+        raise HTTPException(status_code=400,
+                            detail="Provide exactly one of isin, cusip, cik.")
+    col, value = provided[0]
+    # CIK in our DB is stored zero-padded ("0000320193"); accept either form.
+    if col == "cik":
+        with get_market_db() as conn:
+            row = conn.execute(
+                "SELECT symbol, name, isin, cusip, cik, exchange, country "
+                "FROM universe_profiles WHERE cik = ? OR cik = printf('%010d', ?)",
+                (value, int(value) if value.isdigit() else -1),
+            ).fetchone()
+    else:
+        with get_market_db() as conn:
+            row = conn.execute(
+                f"SELECT symbol, name, isin, cusip, cik, exchange, country "
+                f"FROM universe_profiles WHERE {col} = ? COLLATE NOCASE",
+                (value,),
+            ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404,
+                            detail=f"No symbol found for {col}={value}")
+    return dict(row)
 
 
 @app.get("/api/quotes/{symbol}", dependencies=[Depends(verify_api_key)])
@@ -1808,6 +1902,8 @@ async def get_deployment_unified(deploy_id: str, _: str = Depends(verify_api_key
         result["benchmark_sector"] = _sanitize_floats(d["benchmark_sector"])
     if d.get("regime_history"):
         result["regime_history"] = d["regime_history"]
+    if d.get("allocation_profile_history"):
+        result["allocation_profile_history"] = d["allocation_profile_history"]
 
     return result
 
@@ -1969,6 +2065,31 @@ async def resume_deployment_unified(deploy_id: str, _: str = Depends(verify_api_
     from deploy_engine import resume_deployment as _resume
     _resume(deploy_id)
     return {"id": deploy_id, "status": "active"}
+
+
+class DeploymentPatchBody(_BM):
+    """Patch body for renaming a deployment."""
+    name: str | None = Field(default=None, min_length=1, max_length=200, description="New deployment name.")
+
+
+@app.patch("/deployments/{deploy_id}", tags=["Deployments (Unified)"])
+async def patch_deployment_unified(
+    deploy_id: str, body: DeploymentPatchBody,
+    _: str = Depends(verify_api_key),
+):
+    """Update a deployment's mutable fields (currently: name)."""
+    from datetime import datetime, timezone
+    if body.name is None:
+        raise HTTPException(400, "No fields to update.")
+    with get_db() as conn:
+        row = conn.execute("SELECT id FROM deployments WHERE id = ?", (deploy_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, f"Deployment '{deploy_id}' not found")
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute("UPDATE deployments SET name = ?, updated_at = ? WHERE id = ?",
+                     (body.name, now, deploy_id))
+        conn.commit()
+    return {"id": deploy_id, "name": body.name}
 
 
 @app.delete("/deployments/{deploy_id}", tags=["Deployments (Unified)"])
@@ -2213,6 +2334,8 @@ async def get_deployment(deploy_id: str, _: str = Depends(verify_api_key)):
         result["benchmark_sector"] = _sanitize_floats(d["benchmark_sector"])
     if d.get("regime_history"):
         result["regime_history"] = d["regime_history"]
+    if d.get("allocation_profile_history"):
+        result["allocation_profile_history"] = d["allocation_profile_history"]
 
     return result
 
@@ -2879,7 +3002,26 @@ async def evaluate_multiple_regimes(
 # Portfolios
 # ---------------------------------------------------------------------------
 sys.path.insert(0, str(WORKSPACE / "scripts"))
-from portfolio_engine import run_portfolio_backtest as _run_portfolio_bt, save_portfolio_results as _save_portfolio_results, compute_portfolio_id as _compute_portfolio_id
+from portfolio_engine import (
+    run_portfolio_backtest as _run_portfolio_bt_v1,
+    save_portfolio_results as _save_portfolio_results,
+    compute_portfolio_id as _compute_portfolio_id,
+)
+from portfolio_engine_v2 import run_portfolio_backtest as _run_portfolio_bt_v2
+
+
+def _run_portfolio_bt(config: dict, force_close_at_end: bool = True):
+    """Route the portfolio backtest to v1 or v2 based on config.engine_version.
+
+    Default: v1 (engine_version absent or != "v2"). Opt-in to v2 by setting
+    engine_version="v2" on the portfolio config. v2 produces a clean
+    broker-equivalent trade ledger for regime/allocation_profile configs
+    (no dual-bookkeeping); v1 keeps current behavior including the
+    9d0fead reconciliation patch.
+    """
+    if (config or {}).get("engine_version") == "v2":
+        return _run_portfolio_bt_v2(config, force_close_at_end=force_close_at_end)
+    return _run_portfolio_bt_v1(config, force_close_at_end=force_close_at_end)
 
 
 # PortfolioCreate uses the domain PortfolioConfig directly.
@@ -3289,6 +3431,7 @@ class PortfolioDeployRequest(_BM):
     start_date: str = Field(description="Start date (YYYY-MM-DD)")
     initial_capital: float = Field(default=1000000, ge=1000, description="Starting capital")
     name: str | None = Field(default=None, description="Override portfolio name")
+    shares_override: Literal["fractional", "whole"] | None = Field(default=None, description="Override sizing.shares for this deploy. Defaults to 'whole' (real broker constraint) when omitted.")
 
 
 class PortfolioDeployParams(_BM):
@@ -3296,6 +3439,7 @@ class PortfolioDeployParams(_BM):
     start_date: str = Field(description="Start date (YYYY-MM-DD)")
     initial_capital: float = Field(default=1000000, ge=1000, description="Starting capital")
     name: str | None = Field(default=None, description="Override portfolio name")
+    shares_override: Literal["fractional", "whole"] | None = Field(default=None, description="Override sizing.shares for this deploy. Defaults to 'whole' (real broker constraint) when omitted.")
 
 
 @app.post("/portfolios/{portfolio_id}/deploy", tags=["Portfolio Deployments"], status_code=201)
@@ -3312,6 +3456,7 @@ async def deploy_portfolio_subresource(
         start_date=body.start_date,
         initial_capital=body.initial_capital,
         name=body.name,
+        shares_override=body.shares_override,
     )
     return await deploy_portfolio_endpoint(legacy_body, _)
 
@@ -3331,6 +3476,12 @@ async def deploy_portfolio_endpoint(body: PortfolioDeployRequest, _: str = Depen
 
     config = json.loads(row["config"])
     config["portfolio_id"] = body.portfolio_id
+
+    # Live deploys default to whole shares (real broker constraint).
+    # Explicit override wins; otherwise apply "whole" to every sleeve's sizing.
+    shares_mode = body.shares_override or "whole"
+    for sleeve in config.get("sleeves", []):
+        sleeve.setdefault("strategy_config", {}).setdefault("sizing", {})["shares"] = shares_mode
 
     try:
         # Pass portfolio_id so deployment records the FK for lineage

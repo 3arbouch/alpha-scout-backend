@@ -51,40 +51,83 @@ def _build_factor_portfolio_nav(
     Walk semantics: positions opened on D contribute starting D+1 (first
     return is D → D+1). A position opened on D and held for H days closes
     after the return on D+H, i.e. it contributes returns on D+1 through D+H.
+
+    Vectorized: builds a (n_days × n_sym) price matrix, derives daily
+    returns once, then computes a position-count mask via a cumsum
+    diff-array trick (entry at e contributes +1 on day e+1 and -1 on
+    day e+H+1). Bit-exact parity with the prior loop implementation —
+    see auto_trader/.nav_vectorize_parity.py for the parity proof.
     """
+    n_days = len(walk_dates)
+    if n_days < 2:
+        return []
+    if not entries:
+        return [0.0] * (n_days - 1)
+
     date_to_walk_idx = {d: i for i, d in enumerate(walk_dates)}
-    by_entry_idx: dict[int, list[str]] = {}
+
+    valid_entries: list[tuple[int, str]] = []
+    used_symbols: set[str] = set()
     for sym, d in entries:
-        idx = date_to_walk_idx.get(d)
-        if idx is None:
+        i = date_to_walk_idx.get(d)
+        if i is None:
             continue
-        by_entry_idx.setdefault(idx, []).append(sym)
+        valid_entries.append((i, sym))
+        used_symbols.add(sym)
+    if not valid_entries:
+        return [0.0] * (n_days - 1)
 
-    open_positions: list[tuple[str, int]] = []  # (symbol, entry_walk_idx)
-    daily_returns: list[float] = []
+    symbols = sorted(used_symbols)
+    sym_to_col = {s: j for j, s in enumerate(symbols)}
+    n_sym = len(symbols)
 
-    for i in range(1, len(walk_dates)):
-        # Positions opened at the start of day i-1 contribute starting day i.
-        for sym in by_entry_idx.get(i - 1, []):
-            open_positions.append((sym, i - 1))
-        # Drop positions whose horizon has expired (held > horizon_days).
-        open_positions = [
-            (s, idx) for (s, idx) in open_positions if (i - idx) <= horizon_days
-        ]
-        if not open_positions:
-            daily_returns.append(0.0)
+    # Price matrix P[i, j] = close for symbol j on walk_dates[i]. NaN where
+    # the price is missing from price_index. Iterate the dict-of-dicts once.
+    P = np.full((n_days, n_sym), np.nan, dtype=np.float64)
+    for j, sym in enumerate(symbols):
+        sp = price_index.get(sym)
+        if not sp:
             continue
-        d_today = walk_dates[i]
-        d_prev = walk_dates[i - 1]
-        rets = []
-        for sym, _ in open_positions:
-            p = price_index.get(sym, {}).get(d_today)
-            p_prev = price_index.get(sym, {}).get(d_prev)
-            if p is not None and p_prev is not None and p_prev > 0:
-                rets.append((p - p_prev) / p_prev)
-        daily_returns.append(sum(rets) / len(rets) if rets else 0.0)
+        rows: list[int] = []
+        vals: list[float] = []
+        for d, v in sp.items():
+            i = date_to_walk_idx.get(d)
+            if i is not None and v is not None:
+                rows.append(i)
+                vals.append(v)
+        if rows:
+            P[rows, j] = vals
 
-    return daily_returns
+    # Daily simple returns. NaN iff prev<=0 / prev NaN / curr NaN.
+    prev = P[:-1]
+    curr = P[1:]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        R = (curr - prev) / prev
+    R = np.where(prev > 0, R, np.nan)
+
+    # Position-count matrix via diff-array: entry at e contributes +1 starting
+    # at day e+1 and -1 starting at day e+H+1. cumsum down rows → counts.
+    # Out-of-range endpoints are clipped (positions held past the window simply
+    # don't decrement, which is fine because the rows beyond n_days are dropped).
+    delta = np.zeros((n_days + 1, n_sym), dtype=np.float64)
+    for e, sym in valid_entries:
+        j = sym_to_col[sym]
+        s, ee = e + 1, e + horizon_days + 1
+        if s <= n_days:
+            delta[s, j] += 1
+        if ee <= n_days:
+            delta[ee, j] -= 1
+    Q = delta.cumsum(axis=0)[:n_days]
+    Qr = Q[1:]  # align with R: positions open on day k+1 use return R[k]
+
+    valid_mask = ~np.isnan(R)
+    R_clean = np.where(valid_mask, R, 0.0)
+    weights = Qr * valid_mask
+    num = (weights * R_clean).sum(axis=1)
+    den = weights.sum(axis=1)
+    with np.errstate(invalid="ignore"):
+        out = np.where(den > 0, num / den, 0.0)
+    return out.tolist()
 
 
 def _resolve_benchmark_ticker(
@@ -542,29 +585,35 @@ def _compute_ic(
     price_index: dict,
     include_rolling_series: bool = False,
 ) -> dict:
-    """Cross-sectional Information Coefficient (Spearman rank correlation).
+    """Cross-sectional IC — TIME-SERIES VIEW ONLY.
 
     For each trading day D in [start, end - horizon_days], rank IC-universe
     names by factor value at D, rank by forward return D → D + horizon_days,
-    compute Spearman rank correlation. Aggregate to ic_mean, ic_stdev, IR,
-    and t-statistic.
+    compute Spearman rank correlation. The resulting daily IC series feeds
+    `_build_rolling_block` for rolling-window stats + CUSUM change-points.
+
+    Point-estimate IC (mean, std, IR, t-stat) lives in `analyze_factor_library`
+    at 4 horizons + sector/size-neutralized; not re-surfaced here.
 
     Continuous-factor IC (feature_threshold / feature_percentile): IC on the
     raw feature value, regardless of the threshold the agent picked.
-    Other condition types: returned with `ic_basis = "binary"` and
-    `reason = "binary_ic_not_yet_supported"` for now.
+    Other condition types: null block with `reason = "binary_ic_not_yet_supported"`.
 
     Universe rules: sector members only (no benchmark ETFs); custom
     `universe` arg verbatim. <10 names total → return null block.
     Per-day filter: skip days with <10 valid cross-section or constant
-    factor. n_observations < 5 total → return null block.
+    factor. <5 daily IC observations total → null block.
     """
     import numpy as np
     from scipy import stats as scipy_stats
 
-    null_block = lambda reason, n_obs=0, basis=None, fact=None: {
-        "ic_mean": None, "ic_stdev": None, "ir": None, "ic_t_stat": None,
-        "n_observations": n_obs,
+    # Single-point IC stats (ic_mean / ic_stdev / ir / ic_t_stat / n_observations)
+    # are no longer surfaced here — analyze_factor_library provides those at 4
+    # horizons plus sector/size-neutralized version. This block now carries
+    # only the time-series view (rolling + change points) which is unique to
+    # rank_signals.
+    null_block = lambda reason, basis=None, fact=None: {
+        "ic_rolling": None,
         "ic_basis": basis, "factor_used_for_ic": fact,
         "reason": reason,
     }
@@ -661,25 +710,14 @@ def _compute_ic(
     n_obs = len(ic_values)
     if n_obs < 5:
         return null_block(
-            "insufficient_cross_section", n_obs=n_obs,
+            "insufficient_cross_section",
             basis="continuous", fact=feature,
         )
-
-    arr = np.array(ic_values)
-    ic_mean = float(arr.mean())
-    ic_stdev = float(arr.std(ddof=1)) if n_obs > 1 else 0.0
-    ir = ic_mean / ic_stdev if ic_stdev > 0 else 0.0
-    ic_t_stat = ir * (n_obs ** 0.5)
 
     rolling_block = _build_rolling_block(ic_values, ic_dates, include_rolling_series)
 
     return {
         "ic_rolling": rolling_block,
-        "ic_mean": round(ic_mean, 4),
-        "ic_stdev": round(ic_stdev, 4),
-        "ir": round(ir, 4),
-        "ic_t_stat": round(ic_t_stat, 4),
-        "n_observations": n_obs,
         "ic_basis": "continuous",
         "factor_used_for_ic": feature,
     }
@@ -970,7 +1008,6 @@ def rank_signals(
           forward_selection: [{step, added_signal, sharpe, sharpe_delta,
                                correlation_with_running_combo, trigger_count,
                                verdict, reason}],
-          recommended_signals: [...],
         }
     """
     import numpy as np
@@ -1180,11 +1217,8 @@ def rank_signals(
 
     conn.close()
 
-    recommended = [candidate_signals[i] for i in selected]
-
     return {
         "individual_signals": individual_results,
         "correlation_matrix": correlation_matrix,
         "forward_selection": forward_selection_steps,
-        "recommended_signals": recommended,
     }

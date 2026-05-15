@@ -529,6 +529,8 @@ CREATE TABLE IF NOT EXISTS universe_profiles (
     is_etf              INTEGER DEFAULT 0,
     is_adr              INTEGER DEFAULT 0,
     cik                 TEXT,
+    isin                TEXT,
+    cusip               TEXT,
     description         TEXT,
     synced_at           TEXT NOT NULL
 );
@@ -537,6 +539,7 @@ CREATE INDEX IF NOT EXISTS idx_up_industry ON universe_profiles(industry);
 CREATE INDEX IF NOT EXISTS idx_up_market_cap ON universe_profiles(market_cap);
 CREATE INDEX IF NOT EXISTS idx_up_exchange ON universe_profiles(exchange);
 CREATE INDEX IF NOT EXISTS idx_up_country ON universe_profiles(country);
+CREATE INDEX IF NOT EXISTS idx_up_isin ON universe_profiles(isin);
 CREATE INDEX IF NOT EXISTS idx_up_sector_mcap ON universe_profiles(sector, market_cap);
 """
 

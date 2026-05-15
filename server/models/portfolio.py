@@ -105,21 +105,26 @@ class InlineRegimeDefinition(BaseModel):
 class PortfolioConfig(BaseModel):
     """Complete portfolio definition.
 
-    `schema_version` controls which DEFAULT-SET the engine applies for the
-    smoothing knobs (regime persistence + asymmetric transition_days). Existing
-    configs in the DB have no `schema_version` field and are treated as v1 —
-    legacy defaults: persistence=1, no asymmetric transitions. New configs are
-    constructed at v2 — defaults: persistence=3, td_def=1, td_off=3. Bumping the
-    version in the future re-applies the dispatch without touching stored data.
-    Explicit smoothing fields on a config always win over the version's defaults.
+    Smoothing + rebalance defaults (regime persistence, asymmetric transitions,
+    drift threshold) are applied uniformly to every config by the engine.
+    Explicit fields on the config always win over the defaults. There is no
+    versioning — the latest engine behavior applies to every backtest.
     """
-    schema_version: int = Field(
-        default=2, ge=1,
-        description="Versioned default-set: v1=legacy (no smoothing), v2=smoothing on. Existing pre-v2 configs without this field are treated as v1.",
-    )
     portfolio_id: str | None = Field(default=None, description="Deterministic hash of core params.")
     name: str = Field(min_length=1)
     sleeves: list[SleeveConfig] = Field(min_length=1)
+
+    # Execution engine selection (Phase 2 unified position book rollout).
+    # v1 = legacy per-sleeve standalone-simulation + portfolio-level lerp
+    #      (default; backward compatible)
+    # v2 = unified PositionBook with clean broker-equivalent trade ledger
+    #      (no dual-bookkeeping, no phantom trades on gated days,
+    #      cum_shares structurally non-negative)
+    engine_version: Literal["v1", "v2"] = Field(
+        default="v1",
+        description="Backtest/deploy engine. Default v1; set 'v2' to opt in "
+                    "to the unified-position-book executor (Phase 2 rollout).",
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -176,6 +181,10 @@ class PortfolioConfig(BaseModel):
     transition_days_to_offensive: int | None = Field(
         default=3, ge=1,
         description="Trading days to lerp toward a profile with HIGHER equity weight (less cash). Default 3 — patient redeployment.",
+    )
+    rebalance_threshold: float = Field(
+        default=0.05, ge=0.0, le=1.0,
+        description="Drift tolerance for portfolio-level rebalancing. When the actual sleeve weight differs from the allocation_profile target by more than this fraction (e.g., 0.05 = 5%), the engine emits rebalance trades to bring the portfolio back to target. When set to 0, the portfolio rebalances continuously every day (institutional 'leveraged-ETF' pattern). Default 0.05 = 5% drift tolerance, the institutional balanced-portfolio standard. Regime-driven profile changes and lerp days bypass this threshold (the contract itself is changing, not just drift).",
     )
 
     backtest: BacktestParams = Field(default_factory=BacktestParams)
