@@ -3431,6 +3431,7 @@ class PortfolioDeployRequest(_BM):
     start_date: str = Field(description="Start date (YYYY-MM-DD)")
     initial_capital: float = Field(default=1000000, ge=1000, description="Starting capital")
     name: str | None = Field(default=None, description="Override portfolio name")
+    shares_override: Literal["fractional", "whole"] | None = Field(default=None, description="Override sizing.shares for this deploy. Defaults to 'whole' (real broker constraint) when omitted.")
 
 
 class PortfolioDeployParams(_BM):
@@ -3438,6 +3439,7 @@ class PortfolioDeployParams(_BM):
     start_date: str = Field(description="Start date (YYYY-MM-DD)")
     initial_capital: float = Field(default=1000000, ge=1000, description="Starting capital")
     name: str | None = Field(default=None, description="Override portfolio name")
+    shares_override: Literal["fractional", "whole"] | None = Field(default=None, description="Override sizing.shares for this deploy. Defaults to 'whole' (real broker constraint) when omitted.")
 
 
 @app.post("/portfolios/{portfolio_id}/deploy", tags=["Portfolio Deployments"], status_code=201)
@@ -3454,6 +3456,7 @@ async def deploy_portfolio_subresource(
         start_date=body.start_date,
         initial_capital=body.initial_capital,
         name=body.name,
+        shares_override=body.shares_override,
     )
     return await deploy_portfolio_endpoint(legacy_body, _)
 
@@ -3473,6 +3476,12 @@ async def deploy_portfolio_endpoint(body: PortfolioDeployRequest, _: str = Depen
 
     config = json.loads(row["config"])
     config["portfolio_id"] = body.portfolio_id
+
+    # Live deploys default to whole shares (real broker constraint).
+    # Explicit override wins; otherwise apply "whole" to every sleeve's sizing.
+    shares_mode = body.shares_override or "whole"
+    for sleeve in config.get("sleeves", []):
+        sleeve.setdefault("strategy_config", {}).setdefault("sizing", {})["shares"] = shares_mode
 
     try:
         # Pass portfolio_id so deployment records the FK for lineage
