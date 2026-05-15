@@ -166,15 +166,16 @@ def _ins_profile(conn, sym, rec_list):
     conn.execute(
         "INSERT OR REPLACE INTO universe_profiles "
         "(symbol,name,sector,industry,market_cap,exchange,country,beta,price,volume,"
-        "avg_volume,is_actively_trading,ipo_date,is_etf,is_adr,cik,description,synced_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "avg_volume,is_actively_trading,ipo_date,is_etf,is_adr,cik,isin,cusip,description,synced_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (sym, r.get("companyName", "") or "", r.get("sector", "") or "",
          r.get("industry", "") or "", r.get("marketCap"), r.get("exchange", "") or "",
          r.get("country", "") or "", r.get("beta"), r.get("price"),
          r.get("volume"), r.get("averageVolume"),
          int(bool(r.get("isActivelyTrading"))), r.get("ipoDate"),
          int(bool(r.get("isEtf"))), int(bool(r.get("isAdr"))),
-         r.get("cik"), r.get("description"), now),
+         r.get("cik"), r.get("isin"), r.get("cusip"),
+         r.get("description"), now),
     )
     return 1
 
