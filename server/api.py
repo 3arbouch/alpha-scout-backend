@@ -2067,6 +2067,31 @@ async def resume_deployment_unified(deploy_id: str, _: str = Depends(verify_api_
     return {"id": deploy_id, "status": "active"}
 
 
+class DeploymentPatchBody(_BM):
+    """Patch body for renaming a deployment."""
+    name: str | None = Field(default=None, min_length=1, max_length=200, description="New deployment name.")
+
+
+@app.patch("/deployments/{deploy_id}", tags=["Deployments (Unified)"])
+async def patch_deployment_unified(
+    deploy_id: str, body: DeploymentPatchBody,
+    _: str = Depends(verify_api_key),
+):
+    """Update a deployment's mutable fields (currently: name)."""
+    from datetime import datetime, timezone
+    if body.name is None:
+        raise HTTPException(400, "No fields to update.")
+    with get_db() as conn:
+        row = conn.execute("SELECT id FROM deployments WHERE id = ?", (deploy_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, f"Deployment '{deploy_id}' not found")
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute("UPDATE deployments SET name = ?, updated_at = ? WHERE id = ?",
+                     (body.name, now, deploy_id))
+        conn.commit()
+    return {"id": deploy_id, "name": body.name}
+
+
 @app.delete("/deployments/{deploy_id}", tags=["Deployments (Unified)"])
 async def delete_deployment_unified(deploy_id: str, _: str = Depends(verify_api_key)):
     """Delete a stopped deployment and all related data."""
