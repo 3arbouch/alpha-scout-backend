@@ -231,7 +231,23 @@ def resolve_universe(config: dict, conn) -> list[str]:
         symbols = universe_cfg.get("symbols", [])
     elif utype == "sector":
         sector = universe_cfg["sector"]
-        symbols = _get_sector_symbols(sector)
+        # Prefer the DB-backed universe_profiles table — includes every name
+        # we have profile data for (today's universe + the PIT backfill set).
+        # Falls back to profile JSONs only if the DB is empty (dev env without
+        # backfill done).
+        symbols = _get_sector_symbols_from_db(sector, conn) or _get_sector_symbols(sector)
+        # Optional PIT anchor: when set, intersect with ever-members of the
+        # named index over the backtest window. Gives PIT-aware sector
+        # universes (modulo the limitation that GICS sector itself is treated
+        # as time-invariant — we use today's sector classification because
+        # historical sector tags aren't tracked).
+        anchor = universe_cfg.get("anchor_index")
+        if anchor:
+            from universe_history import ever_members
+            bt = config.get("backtest", {})
+            start = universe_cfg.get("start") or bt.get("start") or "2015-01-01"
+            end = universe_cfg.get("end") or bt.get("end") or "2099-12-31"
+            symbols = list(set(symbols) & ever_members(conn, anchor, start, end))
     elif utype == "index":
         from universe_history import ever_members
         idx = universe_cfg.get("index", "sp500")
@@ -281,7 +297,7 @@ def pit_members_by_date(config: dict, conn, dates: list[str]) -> dict[str, froze
 
 
 def _get_sector_symbols(sector: str) -> list[str]:
-    """Get tickers for a sector from profile JSONs."""
+    """Get tickers for a sector from profile JSONs (legacy fallback)."""
     profile_dir = DATA_DIR / "universe" / "profiles"
     symbols = []
     for f in profile_dir.glob("*.json"):
@@ -296,6 +312,22 @@ def _get_sector_symbols(sector: str) -> list[str]:
         except (json.JSONDecodeError, KeyError):
             continue
     return symbols
+
+
+def _get_sector_symbols_from_db(sector: str, conn) -> list[str]:
+    """Get tickers for a sector from the universe_profiles table.
+
+    Includes the PIT backfill set (delisted historical index members whose
+    profile rows we wrote during ingest_index_history + backfill_pit_members).
+    Returns [] if the table is empty so the caller can fall back to the JSON
+    path in dev environments without a backfill run.
+    """
+    rows = conn.execute(
+        "SELECT symbol FROM universe_profiles "
+        "WHERE LOWER(sector) = LOWER(?) OR LOWER(industry) = LOWER(?)",
+        (sector, sector),
+    ).fetchall()
+    return [r[0] for r in rows]
 
 
 # ---------------------------------------------------------------------------
@@ -2028,6 +2060,12 @@ class Portfolio:
                 merged_signal["take_profit"] = pricing["tp_record"]
 
         shares = amount / exec_price
+        if self.strategy_config.get("sizing", {}).get("shares") == "whole":
+            import math
+            shares = math.floor(shares)
+            if shares <= 0:
+                return
+            amount = shares * exec_price
 
         if symbol in self.positions:
             # Add to existing position

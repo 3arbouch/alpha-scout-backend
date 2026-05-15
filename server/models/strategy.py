@@ -302,6 +302,10 @@ class UniverseConfig(BaseModel):
         default=None,
         description="Index name. Required when type='index'. Membership is computed as-of each trading day from the historical-constituent change log.",
     )
+    anchor_index: Literal["sp500", "nasdaq", "dowjones"] | None = Field(
+        default=None,
+        description="Optional with type='sector': intersect the sector tickers with the ever-members of this index over the backtest window. Gives a PIT-aware sector universe (sector classification itself remains today's GICS — historical sector tags aren't tracked).",
+    )
     exclude: list[str] = Field(default_factory=list, description="Tickers to exclude.")
 
     @model_validator(mode="before")
@@ -523,6 +527,8 @@ class SizingConfig(BaseModel):
                                   description="Window for risk_parity vol estimate. Ignored otherwise.")
     vol_source: Literal["historical", "ewma"] = Field(default="historical",
                                                       description="risk_parity vol source.")
+    shares: Literal["fractional", "whole"] = Field(default="fractional",
+                                                    description="Share rounding. 'whole' floors to integer shares (real broker constraint); 'fractional' allows partial shares (paper/idealized).")
 
 
 class BacktestParams(BaseModel):

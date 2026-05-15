@@ -196,6 +196,45 @@ except Exception as e:
     check("v1 backtest with loser-ranking", False, str(e)[:120])
 
 
+# ---------------------------------------------------------------------------
+# 6. Sector universe now reads from DB (includes backfilled delisted names)
+# ---------------------------------------------------------------------------
+print("\n=== 6. Sector universe pulls from universe_profiles (DB) ===")
+sector_cfg = {**cfg, "universe": {"type": "sector", "sector": "Technology"}}
+tech_universe = resolve_universe(sector_cfg, conn)
+check(f"sector='Technology' returns 100+ tickers (got {len(tech_universe)})",
+      len(tech_universe) >= 100)
+# Several backfilled delisted Tech names should now be visible
+backfilled_tech = ["ATVI", "XLNX", "DOCU", "ZM"]
+present = [s for s in backfilled_tech if s in tech_universe]
+check(f"sector universe includes backfilled delisted Tech names ({present})",
+      len(present) >= 3)
+
+
+# ---------------------------------------------------------------------------
+# 7. Sector + anchor_index gives PIT-aware sector universe
+# ---------------------------------------------------------------------------
+print("\n=== 7. anchor_index intersects sector with PIT index membership ===")
+anchored_cfg = {**cfg, "universe": {
+    "type": "sector", "sector": "Financial Services",
+    "anchor_index": "sp500",
+    "start": "2018-01-01", "end": "2023-12-31",
+}}
+fin_anchored = resolve_universe(anchored_cfg, conn)
+check(f"anchored Financial Services returns 30+ tickers (got {len(fin_anchored)})",
+      len(fin_anchored) >= 30)
+# SIVB was in S&P 500 and Financial Services — must be present
+check("SIVB ∈ anchored Financials (was S&P 500 member 2018-2023, Financial Services sector)",
+      "SIVB" in fin_anchored)
+# A current Financial Services name that was NEVER in S&P 500 should be excluded
+# (hard to assert universally; instead, sanity-check that the anchor narrows
+# the set below the un-anchored Financials count)
+unanchored_cfg = {**cfg, "universe": {"type": "sector", "sector": "Financial Services"}}
+fin_unanchored = resolve_universe(unanchored_cfg, conn)
+check(f"anchor_index narrows the set ({len(fin_anchored)} ⊆ {len(fin_unanchored)})",
+      len(fin_anchored) <= len(fin_unanchored))
+
+
 print("\n" + "=" * 60)
 print(f"PASSED: {PASS}")
 print(f"FAILED: {FAIL}")
