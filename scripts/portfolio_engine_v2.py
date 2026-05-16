@@ -973,13 +973,31 @@ def run_portfolio_backtest(
     # --- Benchmarks (same as v1) ---
     market_bench = compute_benchmark(trading_dates, initial_capital, sector=None)
     if market_bench:
-        metrics["market_benchmark_return_pct"] = market_bench["metrics"].get("total_return_pct")
+        market_total = market_bench["metrics"].get("total_return_pct")
+        market_ann = market_bench["metrics"].get("annualized_return_pct")
+        metrics["market_benchmark_return_pct"] = market_total
+        # v1 also writes a generic `benchmark_return_pct` alias (defaults to
+        # the market benchmark). deploy_engine.py reads that key when it
+        # updates `last_benchmark_return_pct` on the deployments row, which
+        # the frontend renders as "SPX return". V2 was missing this alias,
+        # so the frontend column came up empty under v2.
+        metrics["benchmark_return_pct"] = market_total
+        # Annualized alpha — gated by min_days_for_annualization in
+        # compute_metrics. Period alpha (always populatable) lives in
+        # alpha_vs_market_pct_period; consumers that want a day-1 number
+        # use that instead.
         metrics["alpha_vs_market_pct"] = (
-            metrics.get("annualized_return_pct", 0) - market_bench["metrics"].get("annualized_return_pct", 0)
-            if metrics.get("annualized_return_pct") is not None
-            and market_bench["metrics"].get("annualized_return_pct") is not None
+            metrics["annualized_return_pct"] - market_ann
+            if metrics.get("annualized_return_pct") is not None and market_ann is not None
             else None
         )
+        # Period alpha: strategy total return - benchmark total return.
+        # Always populated when both totals exist. Matches the "period sharpe"
+        # pattern in _nav_metrics where we expose a basis-aware figure.
+        strat_total = metrics.get("total_return_pct")
+        if strat_total is not None and market_total is not None:
+            metrics["alpha_vs_market_pct_period"] = round(strat_total - market_total, 2)
+            metrics["alpha_ann_pct"] = metrics.get("alpha_vs_market_pct")
 
     print(f"\n  Total Return: {metrics.get('total_return_pct', 0):+.2f}%")
     print(f"  Final NAV:    ${metrics.get('final_nav', initial_capital):,.2f}")
