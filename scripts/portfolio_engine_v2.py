@@ -1011,9 +1011,61 @@ def run_portfolio_backtest(
         if lbl in trades_by_sleeve:
             trades_by_sleeve[lbl].append(t)
 
+    # closed_trades and open_positions per sleeve — needed by the API's
+    # /deployments/{id}/positions endpoint (calls _build_position_book which
+    # reads sleeve["open_positions"] and sleeve["closed_trades"]). V2 was
+    # only emitting `trades`; the positions table on the frontend came up
+    # empty as a result.
+    closed_by_sleeve: dict[str, list[dict]] = {ctx.label: [] for ctx in sleeve_ctxs}
+    for ct in getattr(book, "closed_trades", []):
+        lbl = ct.get("sleeve_label")
+        if lbl in closed_by_sleeve:
+            closed_by_sleeve[lbl].append(ct)
+
+    from datetime import datetime as _dt
+    last_date = trading_dates[-1] if trading_dates else None
+
+    def _open_positions_for_sleeve(sleeve_label: str) -> list[dict]:
+        """Build the {symbol, entry_*, current_*, pnl, ...} list of currently-
+        held positions for a sleeve. Same shape v1 emits in
+        backtest_engine.py:2724 so _build_position_book is engine-agnostic."""
+        out: list[dict] = []
+        if last_date is None:
+            return out
+        for (lbl, sym), pos in book.positions.items():
+            if lbl != sleeve_label:
+                continue
+            cur_px = price_index.get(sym, {}).get(last_date)
+            if cur_px is None:
+                cur_px = pos.high_since_entry
+            pnl_pct = ((cur_px - pos.entry_price) / pos.entry_price * 100
+                       if pos.entry_price else 0.0)
+            days_held = 0
+            if pos.entry_date and last_date:
+                try:
+                    days_held = (_dt.strptime(last_date, "%Y-%m-%d")
+                                 - _dt.strptime(pos.entry_date, "%Y-%m-%d")).days
+                except ValueError:
+                    days_held = 0
+            out.append({
+                "symbol": sym,
+                "entry_date": pos.entry_date,
+                "entry_price": round(pos.entry_price, 2),
+                "current_price": round(cur_px, 2),
+                "shares": round(pos.shares, 4),
+                "market_value": round(pos.shares * cur_px, 2),
+                "cost_basis": round(pos.shares * pos.entry_price, 2),
+                "pnl": round(pos.shares * (cur_px - pos.entry_price), 2),
+                "pnl_pct": round(pnl_pct, 2),
+                "days_held": days_held,
+            })
+        return out
+
     sleeve_results = [{
         "label": ctx.label,
         "trades": trades_by_sleeve.get(ctx.label, []),
+        "closed_trades": closed_by_sleeve.get(ctx.label, []),
+        "open_positions": _open_positions_for_sleeve(ctx.label),
         "nav_history": loop_result["nav_history"],   # combined book nav for now
     } for ctx in sleeve_ctxs]
 
