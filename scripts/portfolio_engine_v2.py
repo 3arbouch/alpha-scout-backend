@@ -302,6 +302,7 @@ def _execute_pending_entries(
             signal_detail=merged_sig,
             stop_price=pricing["stop_price"],
             take_profit_price=pricing["take_profit_price"],
+            shares_mode=cfg.get("sizing", {}).get("shares"),
             slippage_bps=sleeve.slippage_bps,
             reason="entry",
         )
@@ -419,6 +420,7 @@ def _apply_equal_weight_rebalance(
                     sleeve_label=sleeve_label, symbol=symbol, date=date,
                     amount=add_amount, exec_price=price,
                     slippage_bps=slippage, reason="entry",
+                    shares_mode=cfg.get("sizing", {}).get("shares"),
                 )
                 if t is not None:
                     trades.append(t)
@@ -442,6 +444,7 @@ def _apply_equal_weight_rebalance(
             sleeve_label=sleeve_label, symbol=symbol, date=date,
             amount=amount, exec_price=price,
             slippage_bps=slippage, reason="entry",
+            shares_mode=cfg.get("sizing", {}).get("shares"),
         )
         if t is not None:
             trades.append(t)
@@ -635,6 +638,7 @@ def _run_daily_loop(
                             slippage_bps=sleeve.slippage_bps,
                             reason=d.reason,
                             signal_detail=d.detail,
+                            shares_mode=sleeve.config.get("sizing", {}).get("shares"),
                         )
                         if t is not None:
                             all_trades.append(t)

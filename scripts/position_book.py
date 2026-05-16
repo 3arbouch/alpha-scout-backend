@@ -236,6 +236,7 @@ class PositionBook:
         slippage_bps: float = 0,
         reason: str = "entry",
         min_amount: float = 1.0,
+        shares_mode: str | None = None,
     ) -> dict | None:
         """Open a new position or add to an existing (sleeve, symbol) position.
 
@@ -274,6 +275,17 @@ class PositionBook:
             return None
 
         shares = amount / fill_price
+        # Whole-share constraint (real broker reality for non-fractional venues).
+        # Mirrors v1 Portfolio.open_position (backtest_engine.py:2063-2068):
+        # floor shares, recompute amount, skip if rounded to 0. Default
+        # `fractional` matches v2's historical behavior; pass shares_mode="whole"
+        # to enforce broker-realistic sizing.
+        if shares_mode == "whole":
+            import math
+            shares = math.floor(shares)
+            if shares <= 0:
+                return None
+            amount = shares * fill_price
         if shares <= 0:
             return None
 
