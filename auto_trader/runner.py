@@ -641,9 +641,17 @@ def _run_one_backtest(portfolio_config: dict, start: str, end: str, capital: flo
 
     This is the unit of work — `run_backtest` calls this once for the training
     period and N more times for each eval sub-window (when configured).
+
+    Engine dispatch: default is v2 (the unified-position-book engine that all
+    live deployments run). Set `engine_version: "v1"` on the portfolio config
+    to opt back into the legacy engine. Keeping the agent on the same engine
+    as deployments prevents optimize-vs-deploy metric drift.
     """
     try:
-        from portfolio_engine import run_portfolio_backtest
+        if portfolio_config.get("engine_version") == "v1":
+            from portfolio_engine import run_portfolio_backtest
+        else:
+            from portfolio_engine_v2 import run_portfolio_backtest
         from backtest_engine import compute_benchmark, SECTOR_ETF_MAP
 
         config = normalize_config(portfolio_config)
