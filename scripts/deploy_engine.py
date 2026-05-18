@@ -882,6 +882,18 @@ def get_deployment(deploy_id: str) -> dict | None:
                 result["benchmark_sector"] = None
             result["regime_history"] = full.get("regime_history", [])
             result["allocation_profile_history"] = full.get("allocation_profile_history", [])
+            # Dense daily allocation timeline (one row per trading day). v2 emits
+            # this; v1 results stay empty. Frontend pairs with regime_history and
+            # nav_history (same date grid) to render the allocation overlay chart.
+            result["allocation_history"] = full.get("allocation_history", [])
+
+            # Prefer the engine's emitted config over the DB-stored config_json
+            # so the frontend gets annotations (regime_definitions[].label,
+            # condition.series_label) that the engine stamps at run time. The DB
+            # row remains the immutable record of what the user originally deployed.
+            full_config = full.get("config")
+            if isinstance(full_config, dict) and full_config:
+                result["config_json"] = json.dumps(full_config)
 
             # Per-sleeve detail
             sleeve_results = full.get("sleeve_results", [])
