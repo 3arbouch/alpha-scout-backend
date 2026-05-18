@@ -35,6 +35,149 @@ Aggregator = Literal[
 ]
 
 
+# Single source of truth for what aggregators exist, how to display them, and
+# how they behave. Exposed via GET /auto-trader/aggregators so the frontend
+# doesn't have to hardcode this list. Keep in sync with `Aggregator` above
+# and `AGGREGATOR_DIRECTION` in auto_trader/runner.py — there's a consistency
+# test (tests/test_aggregator_catalog_unit.py) that fails if they drift.
+AGGREGATOR_CATALOG: list[dict] = [
+    {
+        "id": "overall",
+        "label": "Overall (training period)",
+        "group": "no_aggregation",
+        "direction": "preserve_metric",
+        "requires_eval": False,
+        "recommended": False,
+        "description": (
+            "Use the training-period scalar. Today's behavior — eval is "
+            "shown as supporting evidence but not optimized against."
+        ),
+    },
+    {
+        "id": "mean",
+        "label": "Mean",
+        "group": "central_tendency",
+        "direction": "preserve_metric",
+        "requires_eval": True,
+        "recommended": False,
+        "description": (
+            "Average across eval windows. Better at large N (10+); median "
+            "is generally more robust at smaller N."
+        ),
+    },
+    {
+        "id": "median",
+        "label": "Median",
+        "group": "central_tendency",
+        "direction": "preserve_metric",
+        "requires_eval": True,
+        "recommended": True,
+        "description": (
+            "Median across eval windows. Robust to one outlier window — "
+            "the best default for walk-forward optimization."
+        ),
+    },
+    {
+        "id": "min",
+        "label": "Min (worst window)",
+        "group": "tail",
+        "direction": "preserve_metric",
+        "requires_eval": True,
+        "recommended": False,
+        "description": (
+            "Worst window dominates. Most conservative target — agent "
+            "hunts strategies that work everywhere, sometimes at the cost "
+            "of being mediocre everywhere."
+        ),
+    },
+    {
+        "id": "p10",
+        "label": "10th percentile",
+        "group": "tail",
+        "direction": "preserve_metric",
+        "requires_eval": True,
+        "recommended": False,
+        "description": (
+            "Smoothed worst-case. Less sensitive than min to a single "
+            "anomalous window."
+        ),
+    },
+    {
+        "id": "p25",
+        "label": "25th percentile",
+        "group": "tail",
+        "direction": "preserve_metric",
+        "requires_eval": True,
+        "recommended": False,
+        "description": (
+            "Coarser smoothed worst-case. Less aggressive than p10 about "
+            "penalizing the tail."
+        ),
+    },
+    {
+        "id": "max",
+        "label": "Max (best window)",
+        "group": "tail",
+        "direction": "preserve_metric",
+        "requires_eval": True,
+        "recommended": False,
+        "description": (
+            "Cherry-picks the best window. Almost never the right target "
+            "— exposes strategies to regime-specific overfitting."
+        ),
+    },
+    {
+        "id": "stdev",
+        "label": "Std deviation",
+        "group": "dispersion",
+        "direction": "minimize",
+        "requires_eval": True,
+        "recommended": False,
+        "description": (
+            "Sample standard deviation across eval windows. Agent "
+            "minimizes — rewards consistency. Undefined when N < 2."
+        ),
+    },
+    {
+        "id": "iqr",
+        "label": "Interquartile range",
+        "group": "dispersion",
+        "direction": "minimize",
+        "requires_eval": True,
+        "recommended": False,
+        "description": (
+            "p75 − p25 across eval windows. Robust spread; less sensitive "
+            "to outliers than stdev. Agent minimizes."
+        ),
+    },
+    {
+        "id": "range",
+        "label": "Range",
+        "group": "dispersion",
+        "direction": "minimize",
+        "requires_eval": True,
+        "recommended": False,
+        "description": (
+            "max − min across eval windows. Simplest spread measure. "
+            "Agent minimizes."
+        ),
+    },
+    {
+        "id": "snr",
+        "label": "Signal-to-noise (mean ÷ std)",
+        "group": "consistency",
+        "direction": "maximize",
+        "requires_eval": True,
+        "recommended": False,
+        "description": (
+            "\"Sharpe of Sharpes\" — high mean and low variance combined. "
+            "Agent maximizes. Honest caveat: at small N (<10 windows), "
+            "SNR estimates are noisy."
+        ),
+    },
+]
+
+
 class TargetMetric(BaseModel):
     """The single scalar the agent climbs.
 

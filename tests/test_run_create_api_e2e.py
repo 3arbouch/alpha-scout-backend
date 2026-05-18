@@ -180,6 +180,28 @@ for agg in ("p10", "stdev", "iqr", "range", "snr"):
           f"got {r.status_code}")
 
 
+# ---- 8. GET /aggregators returns the catalog ----
+print("\n8. GET /auto-trader/aggregators:")
+r = client.get("/auto-trader/aggregators")
+check("aggregators endpoint 200", r.status_code == 200, f"got {r.status_code}")
+if r.status_code == 200:
+    body = r.json()
+    check("response has total + data fields",
+          "total" in body and "data" in body)
+    ids = {e["id"] for e in body["data"]}
+    expected_ids = {"overall", "mean", "median", "min", "max",
+                    "p10", "p25", "stdev", "iqr", "range", "snr"}
+    check("response covers all 11 aggregators",
+          ids == expected_ids,
+          f"missing: {expected_ids - ids}; extra: {ids - expected_ids}")
+    check("median is marked recommended",
+          next(e for e in body["data"] if e["id"] == "median")["recommended"] is True)
+    check("stdev direction is 'minimize'",
+          next(e for e in body["data"] if e["id"] == "stdev")["direction"] == "minimize")
+    check("snr direction is 'maximize'",
+          next(e for e in body["data"] if e["id"] == "snr")["direction"] == "maximize")
+
+
 os.unlink(TMP_DB.name)
 print(f"\n{'=' * 50}\n{PASS} passed, {FAIL} failed\n{'=' * 50}")
 sys.exit(0 if FAIL == 0 else 1)

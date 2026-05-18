@@ -411,6 +411,19 @@ async def list_tools():
     return {"total": len(tools), "data": tools}
 
 
+@router.get("/aggregators")
+async def list_aggregators():
+    """Return the catalog of walk-forward eval aggregators.
+
+    Each entry has: id, label, group, direction, requires_eval, recommended,
+    description. The frontend should use this to populate the aggregator
+    dropdown in the run-creation form so that new aggregators auto-flow to
+    the UI without a frontend deploy.
+    """
+    from server.models.research_run import AGGREGATOR_CATALOG
+    return {"total": len(AGGREGATOR_CATALOG), "data": AGGREGATOR_CATALOG}
+
+
 @router.get("/config")
 async def get_config():
     """Returns available models, metrics, and defaults for creating a run."""
