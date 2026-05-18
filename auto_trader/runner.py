@@ -705,7 +705,17 @@ def _run_one_backtest(portfolio_config: dict, start: str, end: str, capital: flo
             for i, sr in enumerate(sleeve_results)
         ]
 
-        return {"metrics": metrics, "sleeve_trades": sleeve_trades}
+        # Surface which engine actually executed — observability + audit.
+        # v2 tags its result with engine_version="v2"; v1 doesn't tag (legacy).
+        engine_version = result.get("engine_version") or (
+            "v1" if portfolio_config.get("engine_version") == "v1" else "v2"
+        )
+
+        return {
+            "metrics": metrics,
+            "sleeve_trades": sleeve_trades,
+            "engine_version": engine_version,
+        }
     except Exception as e:
         print(f"  Backtest failed: {e}")
         import traceback

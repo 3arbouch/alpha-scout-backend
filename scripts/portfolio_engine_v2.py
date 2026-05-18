@@ -980,6 +980,7 @@ def run_portfolio_backtest(
         market_total = market_bench["metrics"].get("total_return_pct")
         market_ann = market_bench["metrics"].get("annualized_return_pct")
         metrics["market_benchmark_return_pct"] = market_total
+        metrics["market_benchmark_ann_return_pct"] = market_ann
         # v1 also writes a generic `benchmark_return_pct` alias (defaults to
         # the market benchmark). deploy_engine.py reads that key when it
         # updates `last_benchmark_return_pct` on the deployments row, which
@@ -1002,6 +1003,36 @@ def run_portfolio_backtest(
         if strat_total is not None and market_total is not None:
             metrics["alpha_vs_market_pct_period"] = round(strat_total - market_total, 2)
             metrics["alpha_ann_pct"] = metrics.get("alpha_vs_market_pct")
+
+    # Sector benchmark — compute when the portfolio is effectively single-sector.
+    # Mirrors v1's behavior at portfolio_engine.py:1422-1430. Without this,
+    # `sector_benchmark_return_pct` and `alpha_vs_sector_pct` are None on every
+    # v2-executed backtest, which leaves the frontend's sector-benchmark fields
+    # empty.
+    from portfolio_engine import _infer_sleeve_sector
+    per_sleeve_sectors = [_infer_sleeve_sector(ctx.config) for ctx in sleeve_ctxs]
+    bench_sector = None
+    if per_sleeve_sectors and all(s is not None for s in per_sleeve_sectors):
+        distinct = set(per_sleeve_sectors)
+        if len(distinct) == 1:
+            bench_sector = distinct.pop()
+
+    if bench_sector and bench_sector in SECTOR_ETF_MAP:
+        sector_bench = compute_benchmark(trading_dates, initial_capital, sector=bench_sector)
+        if sector_bench:
+            sector_total = sector_bench["metrics"].get("total_return_pct")
+            sector_ann = sector_bench["metrics"].get("annualized_return_pct")
+            metrics["sector_benchmark_return_pct"] = sector_total
+            metrics["sector_benchmark_ann_return_pct"] = sector_ann
+            metrics["alpha_vs_sector_pct"] = (
+                metrics["annualized_return_pct"] - sector_ann
+                if metrics.get("annualized_return_pct") is not None and sector_ann is not None
+                else None
+            )
+            strat_total = metrics.get("total_return_pct")
+            if strat_total is not None and sector_total is not None:
+                metrics["alpha_vs_sector_pct_period"] = round(strat_total - sector_total, 2)
+                metrics["period_excess_vs_sector_pct"] = metrics["alpha_vs_sector_pct_period"]
 
     print(f"\n  Total Return: {metrics.get('total_return_pct', 0):+.2f}%")
     print(f"  Final NAV:    ${metrics.get('final_nav', initial_capital):,.2f}")
