@@ -886,6 +886,11 @@ def get_deployment(deploy_id: str) -> dict | None:
             # this; v1 results stay empty. Frontend pairs with regime_history and
             # nav_history (same date grid) to render the allocation overlay chart.
             result["allocation_history"] = full.get("allocation_history", [])
+            # One entry per (date, sleeve) ranking event. NOT included in the
+            # default GET /deployments/{id} response (can be large); served by
+            # dedicated endpoints in the API layer. We pass it through here so
+            # those endpoints can read from get_deployment's return.
+            result["ranking_history"] = full.get("ranking_history", [])
 
             # Prefer the engine's emitted config over the DB-stored config_json
             # so the frontend gets annotations (regime_definitions[].label,

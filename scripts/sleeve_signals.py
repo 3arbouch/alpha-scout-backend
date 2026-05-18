@@ -37,6 +37,7 @@ from backtest_engine import (
     check_time_stop as _check_time_stop,
     is_rebalance_date as _is_rebalance_date,
     rank_candidates as _rank_candidates,
+    rank_candidates_with_detail as _rank_candidates_with_detail,
     _calendar_to_trading_days,
 )
 from position_book import Position
@@ -52,7 +53,8 @@ class EntryDirective:
     symbol: str
     signal_value: float                  # the raw signal value (drawdown, feature value, etc.)
     rank_score: Optional[float] = None   # post-ranking score; None means signal-order
-    signal_detail: Optional[dict] = None # rich metadata for the trade record
+    signal_detail: Optional[list] = None # raw entry-condition records (list shape from precompute_signals)
+    ranking: Optional[dict] = None       # per-pick ranking summary (composite_score / metric, bucket detail)
     peak_price: Optional[float] = None   # pre-entry peak (for above_peak TP)
 
 
@@ -179,10 +181,14 @@ def get_entry_candidates(
     if not candidates:
         return []
 
-    # Rank (delegates to v1's rank_candidates which already supports composite_series)
+    # Rank (delegates to v1's rank_candidates which already supports composite_series).
+    # We use the *_with_detail variant so we can stamp per-pick ranking info
+    # onto each directive's signal_detail and (separately) emit the full
+    # ranking event to the engine's ranking_history sink for the explorer endpoint.
     ranking_cfg = cfg.get("ranking") or {}
+    ranking_info: dict | None = None
     if ranking_cfg and len(candidates) > available_slots:
-        ranked = _rank_candidates(
+        ranked, ranking_info = _rank_candidates_with_detail(
             candidates, cfg, conn, date, price_index,
             pe_series=pe_series, rsi_cache=None,
             composite_series=composite_series,
@@ -194,14 +200,13 @@ def get_entry_candidates(
             ranked = ranked[:available_slots]
     else:
         # Fewer candidates than slots, or no ranking: keep all up to slot count.
-        # When v1 has no ranking + more candidates than slots, it falls back
-        # to pe_percentile asc via rank_candidates' internal default.
         if len(candidates) > available_slots:
-            ranked = _rank_candidates(
+            ranked, ranking_info = _rank_candidates_with_detail(
                 candidates, cfg, conn, date, price_index,
                 pe_series=pe_series, rsi_cache=None,
                 composite_series=composite_series,
-            )[:available_slots]
+            )
+            ranked = ranked[:available_slots]
         else:
             # priority handling for under-capacity batches
             entry_priority = (cfg.get("entry") or {}).get("priority", "worst_drawdown")
@@ -210,18 +215,117 @@ def get_entry_candidates(
             else:
                 ranked = candidates
 
-    # Convert to EntryDirective
+    # Convert to EntryDirective. The directive's `signal_detail` stays as the
+    # raw entry-condition list (what precompute_signals emitted). The new
+    # per-pick `ranking` block goes on its own field; the executor merges
+    # both into the trade record's signal_detail dict.
     out: list[EntryDirective] = []
     for symbol, signal_value in ranked:
         sig_detail = signal_metadata.get(symbol, {}).get(date)
+        rank_score = None
+        ranking_block: dict | None = None
+        if ranking_info:
+            rank_score = ranking_info["scores"].get(symbol)
+            ranking_block = _build_per_trade_ranking_block(
+                symbol, ranking_info, cfg,
+            )
         out.append(EntryDirective(
             sleeve_label=sleeve_label,
             symbol=symbol,
             signal_value=signal_value,
+            rank_score=rank_score,
             signal_detail=sig_detail,
-            peak_price=None,  # computed by the executor at fill time (needs price_index lookup)
+            ranking=ranking_block,
+            peak_price=None,
         ))
+
+    # Sidecar: stash the full ranking event on the returned list so the caller
+    # (engine) can pull it off without a second function signature change.
+    if ranking_info is not None:
+        _attach_ranking_event(out, ranking_info, candidates, ranked, cfg, date,
+                              sleeve_label)
     return out
+
+
+def _build_per_trade_ranking_block(symbol: str, info: dict, cfg: dict) -> dict:
+    """The slim, per-pick ranking summary that goes on every BUY trade.
+    Mirrors the full leaderboard entry shape so the frontend can render the
+    same component for both."""
+    by = info.get("by")
+    block: dict = {
+        "by":      by,
+        "rank":    info["ranks"].get(symbol),
+        "out_of":  info["n_candidates"],
+        "score":   info["scores"].get(symbol),
+        "order":   info.get("order", "desc"),
+    }
+    if by == "composite_score":
+        det = (info.get("details") or {}).get(symbol)
+        if det:
+            block["buckets"] = det["buckets"]
+        comp_cfg = cfg.get("composite_score") or {}
+        block["standardization"] = comp_cfg.get("standardization", "rank")
+    return block
+
+
+def _attach_ranking_event(directives_list: list, info: dict,
+                          all_candidates: list, picked: list, cfg: dict,
+                          date: str, sleeve_label: str) -> None:
+    """Attach the full ranking-event dict to the directives list so the caller
+    can capture it for the ranking-history sink. Built once per ranking call
+    (= once per (date, sleeve) event)."""
+    picked_set = {sym for sym, _ in picked}
+    candidates_out: list[dict] = []
+    by = info.get("by")
+    comp_cfg = cfg.get("composite_score") or {}
+    for sym, _signal in all_candidates:
+        score = info["scores"].get(sym)
+        rank = info["ranks"].get(sym)
+        row: dict = {
+            "symbol":   sym,
+            "rank":     rank,
+            "selected": sym in picked_set,
+            "score":    score,
+        }
+        if by == "composite_score":
+            det = (info.get("details") or {}).get(sym)
+            if det:
+                row["buckets"] = det["buckets"]
+        candidates_out.append(row)
+    # Sort the event entries by rank ascending for stable frontend display.
+    candidates_out.sort(key=lambda r: (r["rank"] is None, r["rank"]))
+
+    ranking_cfg = cfg.get("ranking") or {}
+    event = {
+        "date":          date,
+        "sleeve_label":  sleeve_label,
+        "by":            by,
+        "order":         info.get("order", "desc"),
+        "top_n_cutoff":  ranking_cfg.get("top_n"),
+        "n_candidates":  info["n_candidates"],
+        "n_selected":    len(picked),
+        "candidates":    candidates_out,
+    }
+    if by == "composite_score":
+        event["standardization"] = comp_cfg.get("standardization", "rank")
+
+    # Use object.__setattr__ to attach the event to the list. Plain `list` doesn't
+    # accept arbitrary attributes, so we use a thin subclass below... no — easier:
+    # store it on a module-level WeakKeyDictionary keyed by `directives_list` id.
+    _RANKING_EVENTS[id(directives_list)] = event
+
+
+# Per-process registry of "last ranking event for this directives list" — keyed
+# by id(list) so callers can pull the event without modifying function signatures.
+# Cleared opportunistically by the engine after consumption.
+_RANKING_EVENTS: dict[int, dict] = {}
+
+
+def pop_ranking_event(directives_list: list) -> dict | None:
+    """Pop and return the ranking event the caller attached to this directives
+    list (if any). Engine calls this once per (date, sleeve) get_entry_candidates
+    invocation to capture the event for ranking_history."""
+    return _RANKING_EVENTS.pop(id(directives_list), None)
 
 
 # ---------------------------------------------------------------------------

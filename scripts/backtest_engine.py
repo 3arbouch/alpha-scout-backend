@@ -1114,13 +1114,29 @@ def _compute_composite_score(
         z_by_factor[fname] = {syms[k]: float(z_vals[k]) for k in range(len(syms))}
 
     # Compose: per-bucket mean over (sign · z); cross-bucket weighted sum.
+    # `details_by_sym` mirrors the math, retaining every intermediate value the
+    # frontend / audit suite needs to reproduce the score from inputs:
+    #
+    #     score = Σ_b weights[b] · mean_{f ∈ b}(sign_f · z_f)
+    #
+    # Stored shape per symbol::
+    #
+    #     {"score": composite,
+    #      "buckets": {bname: {"score": bucket_mean,
+    #                          "weight": raw_w,
+    #                          "weight_normalized": weight,
+    #                          "factors": {fname: {"value": ..., "z": ...,
+    #                                              "sign": ..., "z_signed": ...}}}}}
     scores: dict[str, float] = {}
+    details_by_sym: dict[str, dict] = {}
     for sym in symbols:
         composite = 0.0
         any_factor_seen = False
+        bucket_detail: dict[str, dict] = {}
         for b_name, b in buckets.items():
             bucket_factors = b.get("factors", [])
             bucket_zs: list[float] = []
+            f_detail: dict[str, dict] = {}
             for f in bucket_factors:
                 if isinstance(f, dict):
                     fname = f["name"]
@@ -1129,17 +1145,68 @@ def _compute_composite_score(
                     fname = f.name
                     sign = f.sign
                 z = z_by_factor.get(fname, {}).get(sym)
+                raw_v = values_by_factor.get(fname, {}).get(sym)
                 if z is None:
+                    f_detail[fname] = {
+                        "value":    raw_v,
+                        "z":        None,
+                        "sign":     sign,
+                        "z_signed": None,
+                    }
                     continue
-                bucket_zs.append(-z if sign == "-" else z)
+                z_signed = -z if sign == "-" else z
+                bucket_zs.append(z_signed)
+                f_detail[fname] = {
+                    "value":    raw_v,
+                    "z":        z,
+                    "sign":     sign,
+                    "z_signed": z_signed,
+                }
             if not bucket_zs:
-                continue  # entire bucket missing → contributes 0
+                # Entire bucket missing for this symbol → contributes 0. Still
+                # record the bucket so the frontend can show "missing data".
+                bucket_detail[b_name] = {
+                    "score":             None,
+                    "weight":            raw_w[b_name],
+                    "weight_normalized": weights[b_name],
+                    "factors":           f_detail,
+                }
+                continue
             any_factor_seen = True
             bucket_z = sum(bucket_zs) / len(bucket_zs)
             composite += weights[b_name] * bucket_z
+            bucket_detail[b_name] = {
+                "score":             bucket_z,
+                "weight":            raw_w[b_name],
+                "weight_normalized": weights[b_name],
+                "factors":           f_detail,
+            }
         if any_factor_seen:
             scores[sym] = composite
-    return scores
+            details_by_sym[sym] = {
+                "score":   composite,
+                "buckets": bucket_detail,
+            }
+
+    # Caller is responsible for choosing how much detail to consume. We attach
+    # the full per-symbol detail dict as an attribute on the scores mapping so
+    # v2's entry path can read it without breaking the function signature.
+    # Use a thin dict subclass so isinstance(scores, dict) keeps working
+    # everywhere downstream (compute_metrics, ranking sorts, etc.).
+    return _ScoresWithDetail(scores, details_by_sym)
+
+
+class _ScoresWithDetail(dict):
+    """``{symbol: composite_score}`` plus a sidecar ``details`` dict carrying
+    every per-bucket / per-factor intermediate so the frontend (and audit
+    suite) can reproduce the score from inputs. Subclassing ``dict`` keeps
+    legacy callers (which only do ``scores[sym]``) bit-identical."""
+
+    __slots__ = ("details",)
+
+    def __init__(self, scores: dict, details: dict | None = None):
+        super().__init__(scores)
+        self.details = details or {}
 
 
 def _compute_ranking_scores(metric: str, symbols: list[str], conn, date: str,
@@ -1267,28 +1334,43 @@ def rank_candidates(candidates: list[tuple], config: dict, conn, date: str,
                     price_index: dict, pe_series: dict = None,
                     rsi_cache: dict = None,
                     composite_series: dict | None = None) -> list[tuple]:
-    """
-    Rank entry candidates by the configured ranking metric.
+    """Rank entry candidates by the configured ranking metric.
 
-    Args:
-        candidates: [(symbol, drawdown)] from signal matching
-        config: Strategy config dict
-        conn: DB connection
-        date: Current trading date
-        price_index: {symbol: {date: price}}
-        pe_series: Pre-loaded PE timeseries (optional, for pe_percentile)
-        rsi_cache: Pre-loaded RSI cache (optional)
-        composite_series: Pre-loaded composite-factor timeseries (optional,
-            for composite_score). Skips a per-day DB query per factor.
+    Returns just the sorted ``[(symbol, drawdown), ...]`` list. v1 and other
+    legacy callers use this. v2's entry path uses :func:`rank_candidates_with_detail`
+    instead to also receive per-candidate score/factor breakdown for the
+    trade ledger and the ranking explorer endpoint."""
+    sorted_, _info = rank_candidates_with_detail(
+        candidates, config, conn, date, price_index,
+        pe_series=pe_series, rsi_cache=rsi_cache,
+        composite_series=composite_series,
+    )
+    return sorted_
 
-    Returns:
-        Sorted candidates list.
-    """
+
+def rank_candidates_with_detail(
+    candidates: list[tuple], config: dict, conn, date: str,
+    price_index: dict, pe_series: dict = None, rsi_cache: dict = None,
+    composite_series: dict | None = None,
+) -> tuple[list[tuple], dict]:
+    """Like :func:`rank_candidates` but returns ``(sorted, info)`` where
+    ``info`` carries enough state to reproduce the ranking::
+
+        info = {
+          "by":           "composite_score",        # or "momentum_rank", ...
+          "order":        "desc",
+          "scores":       {symbol: composite_score},
+          "ranks":        {symbol: 1-indexed-rank},
+          "details":      {symbol: {bucket detail}},  # composite_score only
+          "n_candidates": 142,
+        }
+
+    The ``details`` block mirrors the math (see ``_compute_composite_score``)
+    so the frontend can render a "why this pick" reduction tree."""
     ranking_config = config.get("ranking")
     symbols_in_play = [c[0] for c in candidates]
 
     if not ranking_config:
-        # Default: pe_percentile asc when more candidates than slots
         metric = DEFAULT_RANKING_METRIC
         order = DEFAULT_RANKING_ORDER
     else:
@@ -1296,25 +1378,37 @@ def rank_candidates(candidates: list[tuple], config: dict, conn, date: str,
         order = ranking_config.get("order", DEFAULT_RANKING_ORDER)
 
     composite_config = config.get("composite_score") if metric == "composite_score" else None
-    scores = _compute_ranking_scores(metric, symbols_in_play, conn, date,
-                                      price_index, pe_series, rsi_cache,
-                                      composite_config=composite_config,
-                                      composite_series=composite_series)
-    
+    scores = _compute_ranking_scores(
+        metric, symbols_in_play, conn, date,
+        price_index, pe_series, rsi_cache,
+        composite_config=composite_config,
+        composite_series=composite_series,
+    )
+
+    info: dict = {
+        "by":           metric,
+        "order":        order,
+        "n_candidates": len(candidates),
+        "scores":       dict(scores) if scores else {},
+        "details":      getattr(scores, "details", {}) if scores else {},
+        "ranks":        {},
+    }
+
     if not scores:
-        # Fallback to original ordering if ranking data unavailable
-        return candidates
-    
-    # Sort: asc = lowest first, desc = highest first
+        # Score data missing entirely — keep original order, no rank info.
+        return candidates, info
+
     reverse = (order == "desc")
-    
-    # Candidates with scores get sorted; those without go to the end
     scored = [(sym, dd) for sym, dd in candidates if sym in scores]
     unscored = [(sym, dd) for sym, dd in candidates if sym not in scores]
-    
     scored.sort(key=lambda x: scores[x[0]], reverse=reverse)
-    
-    return scored + unscored
+    sorted_out = scored + unscored
+
+    # 1-indexed rank assignment among scored candidates; unscored get None.
+    for i, (sym, _) in enumerate(scored, start=1):
+        info["ranks"][sym] = i
+
+    return sorted_out, info
 
 
 def _precompute_pe_percentile(condition_config: dict, symbols: list[str], conn, start: str, end: str,

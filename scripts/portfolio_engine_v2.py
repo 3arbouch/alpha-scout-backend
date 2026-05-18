@@ -107,6 +107,7 @@ from sleeve_signals import (
     get_entry_candidates,
     get_exit_recommendations,
     get_rebalance_directives,
+    pop_ranking_event,
 )
 from stop_pricing import compute_realized_vol, compute_stop_pricing, make_sqlite_ohlc_fetcher
 
@@ -328,8 +329,14 @@ def _execute_pending_entries(
         if pricing["abort"]:
             continue
 
-        # signal_detail composition (matches v1 Portfolio.open_position)
-        if pricing["stop_record"] is None and pricing["tp_record"] is None:
+        # signal_detail composition (matches v1 Portfolio.open_position). The
+        # directive carries `signal_detail` as the raw entries list and an
+        # optional `ranking` block (per-pick score / factor reduction). We
+        # wrap them into the unified trade record so every BUY is self-
+        # describing.
+        has_ranking = d.ranking is not None
+        if (pricing["stop_record"] is None and pricing["tp_record"] is None
+                and not has_ranking):
             merged_sig = d.signal_detail
         else:
             merged_sig = {}
@@ -339,6 +346,8 @@ def _execute_pending_entries(
                 merged_sig["stop"] = pricing["stop_record"]
             if pricing["tp_record"]:
                 merged_sig["take_profit"] = pricing["tp_record"]
+            if has_ranking:
+                merged_sig["ranking"] = d.ranking
 
         trade = book.open(
             sleeve_label=sleeve.label, symbol=d.symbol, date=date,
@@ -542,6 +551,7 @@ def _run_daily_loop(
     actual broker action when the portfolio reallocates a sleeve to 0%.
     """
     all_trades: list[dict] = []
+    ranking_history: list[dict] = []   # one entry per (date, sleeve) ranking event
     last_date = trading_dates[-1] if trading_dates else None
     profile_name_by_date = profile_name_by_date or {}
     # DB-backed OHLC fetcher for vol-adaptive stops (matches v1). Built once,
@@ -722,6 +732,12 @@ def _run_daily_loop(
                 pit_members_today=_pit_today,
             )
             sleeve.pending_entries = cands
+            # Capture the ranking event (if any) for the ranking-explorer endpoint.
+            # `pop_ranking_event` returns None when fewer candidates than slots
+            # made ranking unnecessary, OR when ranking is signal-order only.
+            ev = pop_ranking_event(cands)
+            if ev is not None:
+                ranking_history.append(ev)
 
         # -------------------------------------------------------------------
         # 5. Record NAV
@@ -748,7 +764,11 @@ def _run_daily_loop(
             if t is not None:
                 all_trades.append(t)
 
-    return {"trades": all_trades, "nav_history": book.nav_history}
+    return {
+        "trades":          all_trades,
+        "nav_history":     book.nav_history,
+        "ranking_history": ranking_history,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1244,6 +1264,26 @@ def run_portfolio_backtest(
             annotated[rid] = d2
         config_out["regime_definitions"] = annotated
 
+    # --- Stamp ranking_model on every sleeve --------------------------------
+    # Presentation-ready projection of `ranking` + `composite_score` so the
+    # frontend renders a "Scoring Model" card without normalizing weights or
+    # resolving factor labels client-side. See scripts/ranking_model.py.
+    from ranking_model import build_ranking_model
+    raw_sleeves = portfolio_config.get("sleeves") or []
+    if isinstance(raw_sleeves, list) and raw_sleeves:
+        annotated_sleeves: list = []
+        for s in raw_sleeves:
+            if isinstance(s, dict):
+                s2 = dict(s)
+                scfg = s2.get("strategy_config") or {}
+                rm = build_ranking_model(scfg)
+                if rm is not None:
+                    s2["ranking_model"] = rm
+                annotated_sleeves.append(s2)
+            else:
+                annotated_sleeves.append(s)
+        config_out["sleeves"] = annotated_sleeves
+
     return {
         "portfolio": name,
         "engine_version": "v2",
@@ -1260,6 +1300,10 @@ def run_portfolio_backtest(
         "allocation_history":          allocation_history,
         # Sparse view (one row per profile transition) — back-compat with v1.
         "allocation_profile_history":  allocation_profile_history,
+        # One entry per (date, sleeve) ranking event. Each entry carries the
+        # full leaderboard (picked + not-picked candidates) so the frontend's
+        # ranking-explorer view can render alternatives next to the picks.
+        "ranking_history":             loop_result.get("ranking_history", []),
         "backtest": {"start": bt_start, "end": bt_end,
                      "initial_capital": initial_capital},
         # Benchmarks: same keys v1 emits. Each is the full compute_benchmark()
