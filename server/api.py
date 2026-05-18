@@ -1898,8 +1898,15 @@ async def get_deployment_unified(deploy_id: str, _: str = Depends(verify_api_key
         result["benchmark"] = _sanitize_floats(d["benchmark"])
     if d.get("benchmark_market"):
         result["benchmark_market"] = _sanitize_floats(d["benchmark_market"])
-    if d.get("benchmark_sector"):
-        result["benchmark_sector"] = _sanitize_floats(d["benchmark_sector"])
+    # Slim shapes for the equity-chart overlay. Always forward, even when
+    # null, so the frontend's "missing → omit line" guard fires with an
+    # explicit signal rather than a missing key.
+    result["benchmark_nav"] = (
+        _sanitize_floats(d["benchmark_nav"]) if d.get("benchmark_nav") else None
+    )
+    result["benchmark_sector"] = (
+        _sanitize_floats(d["benchmark_sector"]) if d.get("benchmark_sector") else None
+    )
     if d.get("regime_history"):
         result["regime_history"] = d["regime_history"]
     if d.get("allocation_profile_history"):
@@ -2330,8 +2337,15 @@ async def get_deployment(deploy_id: str, _: str = Depends(verify_api_key)):
         result["benchmark"] = _sanitize_floats(d["benchmark"])
     if d.get("benchmark_market"):
         result["benchmark_market"] = _sanitize_floats(d["benchmark_market"])
-    if d.get("benchmark_sector"):
-        result["benchmark_sector"] = _sanitize_floats(d["benchmark_sector"])
+    # Slim shapes for the equity-chart overlay. Always forward, even when
+    # null, so the frontend's "missing → omit line" guard fires with an
+    # explicit signal rather than a missing key.
+    result["benchmark_nav"] = (
+        _sanitize_floats(d["benchmark_nav"]) if d.get("benchmark_nav") else None
+    )
+    result["benchmark_sector"] = (
+        _sanitize_floats(d["benchmark_sector"]) if d.get("benchmark_sector") else None
+    )
     if d.get("regime_history"):
         result["regime_history"] = d["regime_history"]
     if d.get("allocation_profile_history"):

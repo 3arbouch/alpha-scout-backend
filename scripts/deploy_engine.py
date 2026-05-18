@@ -851,8 +851,34 @@ def get_deployment(deploy_id: str) -> dict | None:
             result["metrics"] = full.get("metrics", {})
             result["nav_history"] = full.get("combined_nav_history", [])
             result["benchmark"] = full.get("benchmark", {})              # legacy: primary
-            result["benchmark_market"] = full.get("benchmark_market")    # SPY time series
-            result["benchmark_sector"] = full.get("benchmark_sector")    # sector ETF (or None)
+            # `benchmark_market` keeps the full compute_benchmark() dict for any
+            # legacy consumer that read it pre-2026-05. New frontend code reads
+            # the slim shapes below (benchmark_nav + benchmark_sector).
+            result["benchmark_market"] = full.get("benchmark_market")
+
+            # Equity-chart overlay shape (what EquityCurveChart consumes):
+            #
+            #   benchmark_nav:    [{date, nav}, ...]           # SPY, same date grid + initial_capital as nav_history
+            #   benchmark_sector: {symbol, nav_history}        # sector ETF wrapper (or null when multi-sector)
+            #
+            # Both are aligned to `nav_history` so the frontend can zip them
+            # without interpolation. Null/omitted is the explicit "unavailable"
+            # signal (e.g. multi-sector portfolios won't have benchmark_sector).
+            market_bench = full.get("benchmark_market") or {}
+            sector_bench = full.get("benchmark_sector") or None
+            mkt_nav = market_bench.get("nav_history") if isinstance(market_bench, dict) else None
+            if mkt_nav:
+                result["benchmark_nav"] = [{"date": p["date"], "nav": p["nav"]} for p in mkt_nav]
+            else:
+                result["benchmark_nav"] = None
+            if isinstance(sector_bench, dict) and sector_bench.get("nav_history"):
+                result["benchmark_sector"] = {
+                    "symbol":      sector_bench.get("symbol"),
+                    "nav_history": [{"date": p["date"], "nav": p["nav"]}
+                                     for p in sector_bench["nav_history"]],
+                }
+            else:
+                result["benchmark_sector"] = None
             result["regime_history"] = full.get("regime_history", [])
             result["allocation_profile_history"] = full.get("allocation_profile_history", [])
 

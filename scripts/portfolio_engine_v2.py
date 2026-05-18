@@ -975,7 +975,12 @@ def run_portfolio_backtest(
     metrics = compute_metrics(book, initial_capital, trading_dates)
 
     # --- Benchmarks (same as v1) ---
+    # Both `market_bench` and `sector_bench` (when available) contain
+    # nav_history arrays aligned to `trading_dates`, plus per-period
+    # metrics. We expose the full dicts via the result so the API can serve
+    # benchmark NAV curves to the frontend (for the equity overlay chart).
     market_bench = compute_benchmark(trading_dates, initial_capital, sector=None)
+    sector_bench: dict | None = None
     if market_bench:
         market_total = market_bench["metrics"].get("total_return_pct")
         market_ann = market_bench["metrics"].get("annualized_return_pct")
@@ -1018,6 +1023,8 @@ def run_portfolio_backtest(
             bench_sector = distinct.pop()
 
     if bench_sector and bench_sector in SECTOR_ETF_MAP:
+        # Note: `sector_bench` was declared above so it survives this block;
+        # the result-dict assembly below reads it.
         sector_bench = compute_benchmark(trading_dates, initial_capital, sector=bench_sector)
         if sector_bench:
             sector_total = sector_bench["metrics"].get("total_return_pct")
@@ -1123,4 +1130,14 @@ def run_portfolio_backtest(
         "config": portfolio_config,
         "backtest": {"start": bt_start, "end": bt_end,
                      "initial_capital": initial_capital},
+        # Benchmarks: same keys v1 emits. Each is the full compute_benchmark()
+        # dict (with `symbol`, `nav_history`, `metrics`). `benchmark` is the
+        # primary (sector if available, else market) for legacy callers.
+        # deploy_engine reads benchmark_market / benchmark_sector when
+        # writing results.json, and the API's GET /deployments/{id} surfaces
+        # them as-is. The flat `benchmark_nav` shape the frontend equity
+        # chart consumes is derived in the API layer.
+        "benchmark":        sector_bench or market_bench,
+        "benchmark_market": market_bench,
+        "benchmark_sector": sector_bench,
     }
