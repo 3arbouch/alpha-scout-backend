@@ -23,7 +23,16 @@ from .backtest import BacktestConfig
 # Aggregator names supported on TargetMetric.aggregator. 'overall' is the
 # default and means "read the scalar straight off the training-period
 # backtest result". Anything else reads from the eval-window aggregated dict.
-Aggregator = Literal["overall", "mean", "median", "min", "max", "p25"]
+#
+# Direction note:
+#   preserve metric direction: overall, mean, median, min, max, p10, p25
+#   minimized (consistency):   stdev, iqr, range
+#   maximized (signal/noise):  snr
+Aggregator = Literal[
+    "overall",
+    "mean", "median", "min", "max", "p10", "p25",
+    "stdev", "iqr", "range", "snr",
+]
 
 
 class TargetMetric(BaseModel):

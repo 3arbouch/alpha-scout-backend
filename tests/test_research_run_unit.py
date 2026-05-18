@@ -107,6 +107,23 @@ expect_raises("p25 without eval",
                   target_metric=TargetMetric(name="alpha_ann_pct", aggregator="p25"),
               ))
 
+# New aggregators (p10, stdev, iqr, range, snr) all require eval set.
+for new_agg in ("p10", "stdev", "iqr", "range", "snr"):
+    # Valid when eval is set
+    cfg = ResearchRunConfig(
+        backtest=bt_with_eval,
+        target_metric=TargetMetric(name="sharpe_ratio", aggregator=new_agg),
+    )
+    check(f"{new_agg} aggregator with eval valid",
+          cfg.target_metric.aggregator == new_agg)
+
+    # Rejected without eval
+    expect_raises(f"{new_agg} without eval",
+                  lambda agg=new_agg: ResearchRunConfig(
+                      backtest=bt_no_eval,
+                      target_metric=TargetMetric(name="sharpe_ratio", aggregator=agg),
+                  ))
+
 # Conditions default
 check("conditions default to empty", cfg_default.conditions == [])
 

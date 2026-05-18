@@ -329,7 +329,8 @@ def _get_trade_summary(exp_id: str) -> dict | None:
     }
 
 
-def build_history_context(run_id: str, target_metric: str, limit: int = 20) -> str:
+def build_history_context(run_id: str, target_metric: str, limit: int = 20,
+                          aggregator: str = "overall") -> str:
     """Build full history of past experiments for the agent to learn from.
 
     Lessons convention: the `lessons` field stored on experiment row N is the
@@ -507,7 +508,7 @@ def build_history_context(run_id: str, target_metric: str, limit: int = 20) -> s
 
         lines.append("")
 
-    higher = METRIC_DIRECTION.get(target_metric, True)
+    higher = aggregator_higher_is_better(aggregator, target_metric)
     best = get_best_experiment(run_id, higher_is_better=higher)
     if best:
         lines.append(f"**Current best:** Experiment {best['iteration']} "
@@ -527,9 +528,17 @@ METRIC_DIRECTION = {
 VALID_METRICS = list(METRIC_DIRECTION.keys())
 
 
-def is_improvement(metric: str, new_value: float, best_value: float) -> bool:
-    """Check if new_value is an improvement over best_value for the given metric."""
-    higher_is_better = METRIC_DIRECTION.get(metric, True)
+def is_improvement(metric: str, new_value: float, best_value: float,
+                   aggregator: str = "overall") -> bool:
+    """Check if new_value is an improvement over best_value.
+
+    Direction is metric × aggregator:
+      - aggregator='overall'/'mean'/'median'/'min'/'max'/'p10'/'p25' →
+        preserve the metric's direction (e.g., higher Sharpe is better).
+      - aggregator='stdev'/'iqr'/'range' → lower is better (consistency).
+      - aggregator='snr' → higher is better (more signal per unit noise).
+    """
+    higher_is_better = aggregator_higher_is_better(aggregator, metric)
     if higher_is_better:
         return new_value > best_value
     else:
@@ -764,8 +773,28 @@ def _quantile(sorted_xs: list[float], q: float) -> float | None:
     return sorted_xs[lo] + frac * (sorted_xs[hi] - sorted_xs[lo])
 
 
+# Floor for stdev when computing snr (mean/std). At small N, std can be tiny
+# and produce explosive ratios that dominate optimization. 1e-6 is below any
+# meaningful financial dispersion; preserves sign and reasonable magnitude.
+_SNR_STD_FLOOR = 1e-6
+
+
+def _sample_stdev(xs: list[float]) -> float | None:
+    """Sample (n-1) standard deviation. Returns None for n < 2."""
+    n = len(xs)
+    if n < 2:
+        return None
+    m = sum(xs) / n
+    return (sum((x - m) ** 2 for x in xs) / (n - 1)) ** 0.5
+
+
 def _aggregate_window_metrics(windows: list[dict]) -> dict:
-    """Reduce per-window metric scalars to {mean, median, min, max, p25, count}.
+    """Reduce per-window metric scalars to a fixed set of summary stats.
+
+    Per metric, returns: {mean, median, min, max, p10, p25, stdev, iqr, range,
+    snr, count}. Some are None when the sample is too small:
+      - stdev / snr / iqr / range are None when count < 2.
+      - snr clamps stdev to _SNR_STD_FLOOR to avoid explosions; sign-preserving.
 
     Skips metrics not present in any window. Skips windows where the metric is
     None. Returns an empty dict for any metric that no window reports.
@@ -777,13 +806,23 @@ def _aggregate_window_metrics(windows: list[dict]) -> dict:
         if not vals:
             continue
         srt = sorted(vals)
+        n = len(vals)
+        mean = sum(vals) / n
+        std = _sample_stdev(vals)
+        p25 = _quantile(srt, 0.25)
+        p75 = _quantile(srt, 0.75)
         out[name] = {
-            "mean":   sum(vals) / len(vals),
+            "mean":   mean,
             "median": _quantile(srt, 0.5),
             "min":    srt[0],
             "max":    srt[-1],
-            "p25":    _quantile(srt, 0.25),
-            "count":  len(vals),
+            "p10":    _quantile(srt, 0.10),
+            "p25":    p25,
+            "stdev":  std,
+            "iqr":    (p75 - p25) if (n >= 2 and p25 is not None and p75 is not None) else None,
+            "range":  (srt[-1] - srt[0]) if n >= 2 else None,
+            "snr":    (mean / max(std, _SNR_STD_FLOOR)) if std is not None else None,
+            "count":  n,
         }
     return out
 
@@ -894,9 +933,14 @@ def _resolve_target_value(
     """Resolve the single scalar the agent climbs.
 
     aggregator='overall' → reads `target_metric_name` from training_metrics.
-    aggregator='median'|'mean'|'min'|'max'|'p25' → reads from
+    Any other aggregator → reads from
         eval_aggregated[target_metric_name][aggregator].
-    Returns None if the metric is missing.
+    Returns None if the metric or aggregator is missing/undefined (e.g. stdev
+    with only one window, or 'p10' on a metric no window reports).
+
+    Direction note: dispersion aggregators (stdev, iqr, range) are typically
+    MINIMIZED (consistency target), not maximized. Whether maximizing or
+    minimizing applies is handled by AGGREGATOR_DIRECTION below.
     """
     if aggregator == "overall":
         v = training_metrics.get(target_metric_name)
@@ -905,6 +949,36 @@ def _resolve_target_value(
     if not bucket:
         return None
     return bucket.get(aggregator)
+
+
+# Whether the agent should maximize or minimize an aggregator (independent of
+# the underlying metric). Most aggregators preserve the metric's direction —
+# higher Sharpe is better, higher median Sharpe is better. Dispersion ones are
+# usually MINIMIZED (lower stdev = more consistent). 'snr' is maximized
+# (higher mean/std = more consistent edge).
+AGGREGATOR_DIRECTION = {
+    "overall": "preserve",   # follow underlying METRIC_DIRECTION
+    "mean":    "preserve",
+    "median":  "preserve",
+    "min":     "preserve",
+    "max":     "preserve",
+    "p10":     "preserve",
+    "p25":     "preserve",
+    "stdev":   "minimize",   # consistency target
+    "iqr":     "minimize",
+    "range":   "minimize",
+    "snr":     "maximize",   # high mean / low std = consistent edge
+}
+
+
+def aggregator_higher_is_better(aggregator: str, metric_name: str) -> bool:
+    """Whether the agent should maximize the resolved scalar for this combo."""
+    direction = AGGREGATOR_DIRECTION.get(aggregator, "preserve")
+    if direction == "preserve":
+        return METRIC_DIRECTION.get(metric_name, True)
+    if direction == "maximize":
+        return True
+    return False  # "minimize"
 
 
 async def run_agent_iteration(
@@ -956,7 +1030,7 @@ async def run_agent_iteration(
 
     # Build the prompt
     program = load_program()
-    history = build_history_context(run_id, target_metric)
+    history = build_history_context(run_id, target_metric, aggregator=target_aggregator)
 
     conditions_desc = ", ".join(
         f"{c['metric']} {c['operator']} {c['value']}" for c in conditions
@@ -969,7 +1043,7 @@ async def run_agent_iteration(
     # training-period scalar or the eval-window aggregator. When eval is set
     # but aggregator='overall', the training scalar is still the target and
     # the eval block is purely informational context.
-    direction = "maximizes" if METRIC_DIRECTION.get(target_metric, True) else "minimizes"
+    direction = "maximizes" if aggregator_higher_is_better(target_aggregator, target_metric) else "minimizes"
     if eval_block and target_aggregator != "overall":
         spec = eval_block.get("spec", {})
         objective_line = (
@@ -1245,7 +1319,8 @@ Use the `query_market_data` tool for all data queries. Use `validate_portfolio` 
 
     improved = (
         target_value is not None
-        and (best_value is None or is_improvement(target_metric, target_value, best_value))
+        and (best_value is None or is_improvement(target_metric, target_value, best_value,
+                                                  aggregator=target_aggregator))
         and conditions_met
     )
     decision = "keep" if improved else "discard"
@@ -1381,9 +1456,11 @@ async def main():
                         help="Path to JSON file with walk-forward eval block: "
                              "{'start':..., 'end':..., 'spec':{'window':'2y','overlap':'1y'}}")
     parser.add_argument("--target-aggregator", type=str, default="overall",
-                        choices=("overall", "mean", "median", "min", "max", "p25"),
+                        choices=("overall", "mean", "median", "min", "max",
+                                  "p10", "p25", "stdev", "iqr", "range", "snr"),
                         help="How to reduce per-window metrics to the agent's optimization scalar. "
-                             "Non-'overall' requires --eval-file.")
+                             "Non-'overall' requires --eval-file. "
+                             "Dispersion (stdev/iqr/range) is MINIMIZED; snr (mean/stdev) is maximized.")
     args = parser.parse_args()
 
     # Load eval block from sidecar file.
@@ -1408,7 +1485,7 @@ async def main():
 
     conditions = parse_conditions(args.condition)
     run_id = args.run_id or generate_run_id()
-    direction = "maximize" if METRIC_DIRECTION[args.metric] else "minimize"
+    direction = "maximize" if aggregator_higher_is_better(args.target_aggregator, args.metric) else "minimize"
 
     # Load prompt from file if provided (API flow), else from program.md
     if args.prompt_file and Path(args.prompt_file).exists():
@@ -1451,7 +1528,7 @@ async def main():
     existing = get_experiment_history(run_id, limit=1000)
     if existing:
         start_from = max(e["iteration"] for e in existing) + 1
-        higher = METRIC_DIRECTION.get(args.metric, True)
+        higher = aggregator_higher_is_better(args.target_aggregator, args.metric)
         best_exp = get_best_experiment(run_id, higher_is_better=higher)
         if best_exp and best_exp.get("target_value") is not None:
             best_value = best_exp["target_value"]
@@ -1563,7 +1640,7 @@ async def main():
 
     # Final summary
     summary = get_run_summary(run_id)
-    best = get_best_experiment(run_id, higher_is_better=METRIC_DIRECTION.get(args.metric, True))
+    best = get_best_experiment(run_id, higher_is_better=aggregator_higher_is_better(args.target_aggregator, args.metric))
 
     print("\n" + "=" * 70)
     print("RUN COMPLETE")

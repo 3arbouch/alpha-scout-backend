@@ -306,19 +306,31 @@ class CreateRunRequest(BaseModel):
     # makes the agent climb the aggregated eval metric instead of the
     # training scalar; it requires `eval` to be set.
     eval: EvalBlockRequest | None = Field(default=None, description="Optional walk-forward eval block. Absent = single training-period backtest (today's behavior).")
-    target_aggregator: str = Field(default="overall", description="How to reduce per-window metrics to the scalar the agent climbs: overall|mean|median|min|max|p25. Non-'overall' requires `eval`.")
+    target_aggregator: str = Field(
+        default="overall",
+        description=(
+            "How to reduce per-window metrics to the scalar the agent climbs. "
+            "Central-tendency: mean | median. "
+            "Tail: min | p10 | p25 | max. "
+            "Dispersion (MINIMIZED — consistency target): stdev | iqr | range. "
+            "Signal-to-noise (mean/stdev): snr. "
+            "'overall' (default) reads the training-period scalar; everything "
+            "else requires `eval` to be set."
+        ),
+    )
 
     @model_validator(mode="after")
     def _check_aggregator_eval(self):
+        valid = {"overall", "mean", "median", "min", "max",
+                 "p10", "p25", "stdev", "iqr", "range", "snr"}
+        if self.target_aggregator not in valid:
+            raise ValueError(
+                f"target_aggregator={self.target_aggregator!r} not in {sorted(valid)}"
+            )
         if self.target_aggregator != "overall" and self.eval is None:
             raise ValueError(
                 f"target_aggregator={self.target_aggregator!r} requires `eval` to be set; "
                 f"'overall' is the only aggregator valid without an eval block"
-            )
-        if self.target_aggregator not in {"overall", "mean", "median", "min", "max", "p25"}:
-            raise ValueError(
-                f"target_aggregator={self.target_aggregator!r} not in "
-                f"{{overall, mean, median, min, max, p25}}"
             )
         return self
 

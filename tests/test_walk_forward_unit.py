@@ -140,6 +140,55 @@ agg_ns = _aggregate_window_metrics(no_sharpe)
 check("metric absent → key missing", "sharpe_ratio" not in agg_ns)
 
 
+# ---------- new aggregators: p10, stdev, iqr, range, snr ----------
+print("\n_aggregate_window_metrics — new aggregators:")
+# Sharpe values: [0.5, 1.0, 1.2, 1.8, 2.0] (from earlier `windows`).
+# Sorted: [0.5, 1.0, 1.2, 1.8, 2.0]; mean=1.30, n=5.
+agg = _aggregate_window_metrics(windows)
+sb = agg["sharpe_ratio"]
+
+# p10: pos = (5-1)*0.10 = 0.4, lo=0, hi=1, frac=0.4 → 0.5 + 0.4*(1.0-0.5) = 0.70
+check("sharpe p10 = 0.70",      abs(sb["p10"] - 0.70) < 1e-9, f"got {sb['p10']}")
+check("sharpe stdev > 0",       sb["stdev"] is not None and sb["stdev"] > 0)
+# stdev of [0.5,1.0,1.2,1.8,2.0]: variance = sum((x - 1.3)^2)/4
+# = (0.64 + 0.09 + 0.01 + 0.25 + 0.49)/4 = 1.48/4 = 0.37 → stdev ≈ 0.6083
+check("sharpe stdev ≈ 0.6083",  abs(sb["stdev"] - 0.6083) < 1e-3,
+      f"got {sb['stdev']}")
+# iqr = p75 - p25; p25=1.0, p75=1.8 → iqr=0.8
+# (verify: p25 pos = (5-1)*0.25 = 1.0 → sorted[1]=1.0; p75 pos = (5-1)*0.75=3.0 → sorted[3]=1.8)
+check("sharpe iqr = 0.80",      abs(sb["iqr"] - 0.80) < 1e-9, f"got {sb['iqr']}")
+check("sharpe range = 1.50",    abs(sb["range"] - 1.50) < 1e-9, f"got {sb['range']}")
+# snr = mean/stdev = 1.30 / 0.6083 ≈ 2.137
+check("sharpe snr ≈ 2.137",     abs(sb["snr"] - 2.137) < 1e-2, f"got {sb['snr']}")
+check("sharpe count = 5",       sb["count"] == 5)
+
+
+# Edge case: single window — stdev/iqr/range/snr all None.
+single = [{"metrics": {"sharpe_ratio": 1.5}}]
+agg_single = _aggregate_window_metrics(single)
+sb_one = agg_single["sharpe_ratio"]
+check("single-window mean = 1.5",      sb_one["mean"] == 1.5)
+check("single-window median = 1.5",    sb_one["median"] == 1.5)
+check("single-window stdev = None",    sb_one["stdev"] is None)
+check("single-window iqr = None",      sb_one["iqr"] is None)
+check("single-window range = None",    sb_one["range"] is None)
+check("single-window snr = None",      sb_one["snr"] is None)
+
+
+# Edge case: identical values across windows — stdev=0, snr enormous (capped by floor).
+identical = [{"metrics": {"sharpe_ratio": 1.0}} for _ in range(5)]
+agg_id = _aggregate_window_metrics(identical)
+sb_id = agg_id["sharpe_ratio"]
+check("identical mean = 1.0",        sb_id["mean"] == 1.0)
+check("identical stdev = 0",         sb_id["stdev"] == 0.0)
+check("identical iqr = 0",           sb_id["iqr"] == 0.0)
+check("identical range = 0",         sb_id["range"] == 0.0)
+# snr = 1.0 / max(0, 1e-6) = 1e6 — capped but finite, doesn't NaN/inf
+check("identical snr is large/finite",
+      sb_id["snr"] is not None and sb_id["snr"] >= 1e5,
+      f"got {sb_id['snr']}")
+
+
 # ---------- _resolve_target_value ----------
 print("\n_resolve_target_value:")
 
@@ -165,6 +214,36 @@ check("no eval agg + overall still works",
       _resolve_target_value(training_m, {}, "sharpe_ratio", "overall") == 1.5)
 check("no eval agg + median → None",
       _resolve_target_value(training_m, {}, "sharpe_ratio", "median") is None)
+
+
+# ---------- aggregator_higher_is_better ----------
+print("\naggregator_higher_is_better:")
+from runner import aggregator_higher_is_better, is_improvement  # noqa: E402
+
+# Preserve direction — sharpe is higher-is-better
+check("overall + sharpe → higher better",   aggregator_higher_is_better("overall", "sharpe_ratio") is True)
+check("median + sharpe → higher better",    aggregator_higher_is_better("median", "sharpe_ratio") is True)
+check("min + sharpe → higher better",       aggregator_higher_is_better("min", "sharpe_ratio") is True)
+check("p10 + sharpe → higher better",       aggregator_higher_is_better("p10", "sharpe_ratio") is True)
+
+# Preserve direction — annualized_volatility_pct is lower-is-better
+check("overall + vol → lower better",       aggregator_higher_is_better("overall", "annualized_volatility_pct") is False)
+check("median + vol → lower better",        aggregator_higher_is_better("median", "annualized_volatility_pct") is False)
+
+# Dispersion: always lower-better regardless of metric
+check("stdev + sharpe → lower better",      aggregator_higher_is_better("stdev", "sharpe_ratio") is False)
+check("iqr + alpha → lower better",         aggregator_higher_is_better("iqr", "alpha_ann_pct") is False)
+check("range + sharpe → lower better",      aggregator_higher_is_better("range", "sharpe_ratio") is False)
+
+# SNR: always higher-better regardless of metric
+check("snr + sharpe → higher better",       aggregator_higher_is_better("snr", "sharpe_ratio") is True)
+check("snr + alpha → higher better",        aggregator_higher_is_better("snr", "alpha_ann_pct") is True)
+
+# is_improvement uses the aggregator-aware direction
+check("is_improvement: median sharpe 1.5>1.2",  is_improvement("sharpe_ratio", 1.5, 1.2, "median") is True)
+check("is_improvement: stdev sharpe 0.3<0.5",   is_improvement("sharpe_ratio", 0.3, 0.5, "stdev") is True)
+check("is_improvement: stdev sharpe 0.5>0.3",   is_improvement("sharpe_ratio", 0.5, 0.3, "stdev") is False)
+check("is_improvement: snr 2.0>1.5",            is_improvement("sharpe_ratio", 2.0, 1.5, "snr") is True)
 
 
 print(f"\n{'=' * 50}\n{PASS} passed, {FAIL} failed\n{'=' * 50}")

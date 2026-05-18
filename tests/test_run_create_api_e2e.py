@@ -152,6 +152,34 @@ r5 = client.post("/auto-trader/runs", json=body5)
 check("overlap=window did not 500", r5.status_code != 500, f"got {r5.status_code}: {r5.text}")
 
 
+# ---- 6. New aggregators (p10, stdev, iqr, range, snr) accepted ----
+print("\n6. New aggregators with eval:")
+for agg in ("p10", "stdev", "iqr", "range", "snr"):
+    body = {
+        **BASE, "name": f"API smoke {agg}",
+        "eval": {"start": "2023-01-01", "end": "2025-12-31",
+                 "spec": {"window": "1y", "overlap": "6m"}},
+        "target_aggregator": agg,
+    }
+    r = client.post("/auto-trader/runs", json=body)
+    check(f"aggregator={agg} accepted (201)",
+          r.status_code == 201,
+          f"got {r.status_code}: {r.text[:200]}")
+    if r.status_code == 201:
+        check(f"aggregator={agg} persisted",
+              r.json()["config"]["target_aggregator"] == agg)
+
+
+# ---- 7. New aggregators rejected without eval ----
+print("\n7. New aggregators rejected without eval:")
+for agg in ("p10", "stdev", "iqr", "range", "snr"):
+    body = {**BASE, "name": f"Bad {agg}", "target_aggregator": agg}
+    r = client.post("/auto-trader/runs", json=body)
+    check(f"aggregator={agg} without eval rejected (4xx)",
+          400 <= r.status_code < 500,
+          f"got {r.status_code}")
+
+
 os.unlink(TMP_DB.name)
 print(f"\n{'=' * 50}\n{PASS} passed, {FAIL} failed\n{'=' * 50}")
 sys.exit(0 if FAIL == 0 else 1)
