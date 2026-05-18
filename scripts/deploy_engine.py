@@ -859,7 +859,7 @@ def get_deployment(deploy_id: str) -> dict | None:
             # Equity-chart overlay shape (what EquityCurveChart consumes):
             #
             #   benchmark_nav:    [{date, nav}, ...]           # SPY, same date grid + initial_capital as nav_history
-            #   benchmark_sector: {symbol, nav_history}        # sector ETF wrapper (or null when multi-sector)
+            #   benchmark_sector: {symbol, nav_history, metrics}  # sector ETF wrapper (or null when multi-sector)
             #
             # Both are aligned to `nav_history` so the frontend can zip them
             # without interpolation. Null/omitted is the explicit "unavailable"
@@ -876,6 +876,7 @@ def get_deployment(deploy_id: str) -> dict | None:
                     "symbol":      sector_bench.get("symbol"),
                     "nav_history": [{"date": p["date"], "nav": p["nav"]}
                                      for p in sector_bench["nav_history"]],
+                    "metrics":     sector_bench.get("metrics") or {},
                 }
             else:
                 result["benchmark_sector"] = None
