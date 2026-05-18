@@ -409,6 +409,10 @@ async def analyze_factor_library_tool(args: dict[str, Any]) -> dict[str, Any]:
     "entry_price, days_held, reason. BUY rows have those fields as null.\n\n"
     "Filters (all optional, combined with AND):\n"
     "  sleeve_label:    only trades from one sleeve (matches by_sleeve keys)\n"
+    "  window:          'training' (training-period trades) or an eval-window\n"
+    "                   label like '2017-01-01_2019-01-01' (matches the keys in\n"
+    "                   get_experiment_stats.available_windows). Omit to include\n"
+    "                   all windows. Only meaningful for experiments with eval.\n"
     "  action:          'BUY' or 'SELL' only\n"
     "  winners_only:    SELL trades with pnl > 0\n"
     "  losers_only:     SELL trades with pnl <= 0\n"
@@ -421,7 +425,7 @@ async def analyze_factor_library_tool(args: dict[str, Any]) -> dict[str, Any]:
     "  max_days_held:   only SELLs held <= this many days\n\n"
     "Results are capped at 200 rows. If truncated=true, add a narrower filter.\n"
     "Scope: experiments from the current run only. Cross-run access returns empty.",
-    {"experiment_id": str, "sleeve_label": str, "action": str,
+    {"experiment_id": str, "sleeve_label": str, "window": str, "action": str,
      "winners_only": bool, "losers_only": bool,
      "reason": str, "symbol": str,
      "start_date": str, "end_date": str,
@@ -447,6 +451,15 @@ async def get_experiment_trades_tool(args: dict[str, Any]) -> dict[str, Any]:
     if sleeve_label:
         where.append("sleeve_label = ?")
         params.append(sleeve_label)
+
+    # Eval-window filter. 'training' means window_label IS NULL.
+    window_filter = args.get("window")
+    if window_filter:
+        if window_filter == "training":
+            where.append("window_label IS NULL")
+        else:
+            where.append("window_label = ?")
+            params.append(window_filter)
 
     action = args.get("action")
     if action in ("BUY", "SELL"):
@@ -539,7 +552,13 @@ async def get_experiment_trades_tool(args: dict[str, Any]) -> dict[str, Any]:
     "to decide whether a drill-down is warranted and what to filter by.\n\n"
     "The experiment_id is the hash shown in brackets in the history header "
     "(e.g., '### Experiment 4 [id: 50e63c54f604]').\n\n"
+    "Optional `window` filter scopes to one slice of the experiment:\n"
+    "  unset:      all trades (training-period + every eval window combined)\n"
+    "  'training': only the training-period backtest (window_label IS NULL)\n"
+    "  'YYYY-MM-DD_YYYY-MM-DD': one eval window (see available_windows in the response)\n\n"
     "Returns:\n"
+    "  available_windows: list of eval window labels present (empty if no eval)\n"
+    "  filtered_by_window: echoes the window arg (or null = all)\n"
     "  totals: trade counts (buys, sells, closed), total_pnl, win_rate_pct, avg_pnl\n"
     "  pnl_distribution: min, p10, p25, p50 (median), p75, p90, max, stdev — across closed SELLs\n"
     "  by_exit_reason: {reason: {count, total_pnl, avg_pnl}}\n"
@@ -549,7 +568,7 @@ async def get_experiment_trades_tool(args: dict[str, Any]) -> dict[str, Any]:
     "  holding_days: {winners_avg, losers_avg, overall_avg}\n\n"
     "Use this tool first to spot where the experiment's P&L actually came from; only "
     "then pull specific rows via get_experiment_trades with targeted filters.",
-    {"experiment_id": str},
+    {"experiment_id": str, "window": str},
 )
 async def get_experiment_stats_tool(args: dict[str, Any]) -> dict[str, Any]:
     from auto_trader.schema import get_db
@@ -566,9 +585,28 @@ async def get_experiment_stats_tool(args: dict[str, Any]) -> dict[str, Any]:
     if _RUN_ID:
         scope_where.append("source_id IN (SELECT id FROM experiments WHERE run_id = ?)")
         scope_params.append(_RUN_ID)
+
+    # Walk-forward window filter.
+    window_filter = args.get("window")
+    if window_filter:
+        if window_filter == "training":
+            scope_where.append("window_label IS NULL")
+        else:
+            scope_where.append("window_label = ?")
+            scope_params.append(window_filter)
     scope_sql = " AND ".join(scope_where)
 
     conn = get_db()
+
+    # 0. Available eval-window labels for this experiment (so the agent
+    # knows what values are valid for window=).
+    avail = [r[0] for r in conn.execute(
+        "SELECT DISTINCT window_label FROM trades "
+        "WHERE source_type='experiment' AND source_id=? "
+        "  AND window_label IS NOT NULL "
+        "ORDER BY window_label",
+        [experiment_id],
+    ).fetchall()]
 
     # 1. Overall counts
     row = conn.execute(
@@ -706,6 +744,8 @@ async def get_experiment_stats_tool(args: dict[str, Any]) -> dict[str, Any]:
 
     result = {
         "experiment_id":                experiment_id,
+        "available_windows":            avail,
+        "filtered_by_window":           window_filter,
         "totals":                       totals,
         "pnl_distribution":             pnl_distribution,
         "by_exit_reason":               by_reason,

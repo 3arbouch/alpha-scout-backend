@@ -124,6 +124,7 @@ CREATE TABLE IF NOT EXISTS trades (
     source_id TEXT NOT NULL,
     deployment_type TEXT,
     sleeve_label TEXT,
+    window_label TEXT,                                     -- NULL = training-period trade; else 'YYYY-MM-DD_YYYY-MM-DD' eval-window label
     date TEXT NOT NULL,
     action TEXT NOT NULL,
     symbol TEXT NOT NULL,
@@ -276,9 +277,17 @@ def wrap_strategy_as_portfolio(strategy_config: dict, capital: float,
 # Trade ID helpers
 # ---------------------------------------------------------------------------
 def _trade_id(source_id: str, date: str, symbol: str, action: str,
-              sleeve_label: str = None, seq: int = 0) -> str:
-    """Deterministic trade ID. seq distinguishes multiple same-day trades."""
-    raw = f"{source_id}:{date}:{symbol}:{action}:{sleeve_label or ''}:{seq}"
+              sleeve_label: str = None, seq: int = 0,
+              window_label: str = None) -> str:
+    """Deterministic trade ID.
+
+    `seq` distinguishes multiple same-day same-direction trades.
+    `window_label` disambiguates walk-forward eval-window trades from a single
+    experiment so a BUY of AAPL on 2024-01-02 in window A doesn't collide with
+    a BUY of AAPL on 2024-01-02 in window B (both legitimately occur — each
+    eval window is an independent fresh-capital simulation).
+    """
+    raw = f"{source_id}:{window_label or ''}:{date}:{symbol}:{action}:{sleeve_label or ''}:{seq}"
     return hashlib.md5(raw.encode()).hexdigest()[:12]
 
 
@@ -293,8 +302,15 @@ def _sleeve_id(source_id: str, label: str) -> str:
 # ---------------------------------------------------------------------------
 def persist_trades(source_type: str, source_id: str, trades_list: list,
                    deployment_type: str = None, sleeve_label: str = None,
+                   window_label: str = None,
                    conn=None) -> int:
-    """Persist trades to the unified trades table. Returns count inserted."""
+    """Persist trades to the unified trades table. Returns count inserted.
+
+    `window_label` is NULL for training-period or live-deploy trades, and a
+    'YYYY-MM-DD_YYYY-MM-DD' string for walk-forward eval-window trades. It
+    participates in the trade ID hash so the same (date, symbol, action) in
+    two different windows does not collide.
+    """
     close_conn = False
     if conn is None:
         conn = get_db()
@@ -311,7 +327,7 @@ def persist_trades(source_type: str, source_id: str, trades_list: list,
         seq = action_seq.get(key, 0)
         action_seq[key] = seq + 1
         if t.get("action") == "BUY":
-            tid = _trade_id(source_id, t["date"], t["symbol"], "BUY", sleeve_label, seq)
+            tid = _trade_id(source_id, t["date"], t["symbol"], "BUY", sleeve_label, seq, window_label)
             buy_lookup[(t["symbol"], t["date"])] = tid
 
     action_seq = {}
@@ -319,7 +335,7 @@ def persist_trades(source_type: str, source_id: str, trades_list: list,
         key = (t["date"], t["symbol"], t.get("action", ""))
         seq = action_seq.get(key, 0)
         action_seq[key] = seq + 1
-        tid = _trade_id(source_id, t["date"], t["symbol"], t["action"], sleeve_label, seq)
+        tid = _trade_id(source_id, t["date"], t["symbol"], t["action"], sleeve_label, seq, window_label)
 
         linked = None
         if t.get("action") == "SELL" and t.get("entry_date"):
@@ -331,12 +347,12 @@ def persist_trades(source_type: str, source_id: str, trades_list: list,
         try:
             conn.execute(
                 """INSERT OR IGNORE INTO trades
-                   (id, source_type, source_id, deployment_type, sleeve_label,
+                   (id, source_type, source_id, deployment_type, sleeve_label, window_label,
                     date, action, symbol, shares, price, amount, reason,
                     signal_detail, entry_date, entry_price, pnl, pnl_pct,
                     days_held, linked_trade_id, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (tid, source_type, source_id, deployment_type, sleeve_label,
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (tid, source_type, source_id, deployment_type, sleeve_label, window_label,
                  t["date"], t["action"], t["symbol"], t["shares"], t["price"],
                  t.get("amount"), t.get("reason"), sig_json,
                  t.get("entry_date"), t.get("entry_price"),
@@ -354,7 +370,7 @@ def persist_trades(source_type: str, source_id: str, trades_list: list,
     for t in trades_list:
         if t.get("action") == "SELL" and t.get("entry_date"):
             buy_id = buy_lookup.get((t["symbol"], t["entry_date"]))
-            sell_id = _trade_id(source_id, t["date"], t["symbol"], "SELL", sleeve_label)
+            sell_id = _trade_id(source_id, t["date"], t["symbol"], "SELL", sleeve_label, window_label=window_label)
             if buy_id:
                 conn.execute(
                     "UPDATE trades SET linked_trade_id = ? WHERE id = ? AND linked_trade_id IS NULL",

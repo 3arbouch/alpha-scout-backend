@@ -55,6 +55,8 @@ def log_experiment(
     portfolio_id: str = None,
     lessons: str = None,
     smoothing_summary: dict = None,
+    eval_metrics_json: str = None,
+    target_aggregator: str = None,
 ) -> str:
     """Log a single experiment. Returns the experiment ID.
 
@@ -73,7 +75,8 @@ def log_experiment(
     conn.execute(
         """INSERT INTO experiments
            (id, run_id, iteration, thesis, assumptions, lessons, portfolio_id, portfolio_config,
-            target_metric, target_value, conditions, conditions_met,
+            target_metric, target_aggregator, target_value, conditions, conditions_met,
+            eval_metrics_json,
             total_return_pct, annualized_return_pct,
             sharpe_ratio, sharpe_basis, sharpe_ratio_annualized, sharpe_ratio_period,
             sortino_ratio,
@@ -86,10 +89,11 @@ def log_experiment(
             backtest_start, backtest_end, initial_capital,
             model, session_id, tokens_used, duration_seconds, error,
             smoothing_summary, created_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (exp_id, run_id, iteration,
          thesis, json.dumps(assumptions), lessons, portfolio_id, json.dumps(portfolio_config),
-         target_metric, target_value, json.dumps(conditions), 1 if conditions_met else 0,
+         target_metric, target_aggregator, target_value, json.dumps(conditions), 1 if conditions_met else 0,
+         eval_metrics_json,
          metrics.get("total_return_pct"), metrics.get("annualized_return_pct"),
          metrics.get("sharpe_ratio"),
          metrics.get("sharpe_basis"),
@@ -118,7 +122,8 @@ def get_experiment_history(run_id: str, limit: int = 20) -> list[dict]:
     conn = get_db()
     rows = conn.execute(
         """SELECT id, iteration, thesis, assumptions, portfolio_config,
-                  target_metric, target_value, conditions_met,
+                  target_metric, target_aggregator, target_value, conditions_met,
+                  eval_metrics_json,
                   sharpe_ratio, alpha_ann_pct, annualized_volatility_pct,
                   max_drawdown_pct, total_return_pct, annualized_return_pct,
                   decision, best_value_so_far, improvement_pct, error,

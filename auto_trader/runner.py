@@ -405,7 +405,46 @@ def build_history_context(run_id: str, target_metric: str, limit: int = 20) -> s
             metrics.append(f"Return={exp['total_return_pct']:.1f}%")
         if exp.get("max_drawdown_pct") is not None:
             metrics.append(f"MaxDD={exp['max_drawdown_pct']:.1f}%")
-        lines.append(f"**Metrics:** {', '.join(metrics)}")
+        lines.append(f"**Metrics (training-period):** {', '.join(metrics)}")
+
+        # Walk-forward eval block — render distribution stats so the agent
+        # sees per-period stability, not just one aggregate number.
+        eval_json = exp.get("eval_metrics_json")
+        if eval_json:
+            try:
+                ev = json.loads(eval_json) if isinstance(eval_json, str) else eval_json
+            except json.JSONDecodeError:
+                ev = None
+            if isinstance(ev, dict):
+                agg = ev.get("aggregated", {}) or {}
+                spec = ev.get("spec", {}) or {}
+                windows = ev.get("windows", []) or []
+                n = len(windows)
+                # One concise spread-stats line. Skip metrics with no data.
+                parts = []
+                for name, label in (
+                    ("sharpe_ratio",          "Sharpe"),
+                    ("alpha_ann_pct",         "Alpha"),
+                    ("max_drawdown_pct",      "MaxDD"),
+                    ("annualized_volatility_pct", "Vol"),
+                ):
+                    b = agg.get(name)
+                    if not b:
+                        continue
+                    fmt = "{:+.1f}%" if name.endswith("_pct") else "{:.2f}"
+                    mn = fmt.format(b["min"]); md = fmt.format(b["median"]); mx = fmt.format(b["max"])
+                    parts.append(f"{label} min/med/max={mn}/{md}/{mx}")
+                if parts:
+                    w_label = spec.get("window", "?")
+                    o_label = spec.get("overlap", "?")
+                    agg_name = exp.get("target_aggregator") or "overall"
+                    target_str = ""
+                    if agg_name != "overall" and exp.get("target_value") is not None:
+                        target_str = f" | target={exp['target_aggregator']}({exp['target_metric']})={exp['target_value']:.4f}"
+                    lines.append(
+                        f"**Eval ({n} windows, {w_label}/{o_label}):** "
+                        + " | ".join(parts) + target_str
+                    )
 
         # Full portfolio config
         portfolio_config = exp.get("portfolio_config")
@@ -584,17 +623,15 @@ def save_portfolio(portfolio_config: dict) -> str | None:
         return None
 
 
-def run_backtest(portfolio_config: dict, start: str, end: str, capital: float,
-                 sector: str | None = None) -> dict | None:
-    """Run a portfolio backtest.
+def _run_one_backtest(portfolio_config: dict, start: str, end: str, capital: float,
+                      sector: str | None = None) -> dict | None:
+    """Run a single backtest over one [start, end] window.
 
-    Returns:
-        {"metrics": {...}, "sleeve_trades": [{"label": str, "trades": [...]}, ...]}
-        or None on failure.
+    Returns: {"metrics": {...}, "sleeve_trades": [{"label", "trades"}, ...]}
+             or None on failure.
 
-    sleeve_trades mirrors the engine's per-sleeve grouping — each sleeve's full
-    BUY+SELL event log in chronological order. Portfolio-level trades = union of
-    all sleeve lists.
+    This is the unit of work — `run_backtest` calls this once for the training
+    period and N more times for each eval sub-window (when configured).
     """
     try:
         from portfolio_engine import run_portfolio_backtest
@@ -621,7 +658,6 @@ def run_backtest(portfolio_config: dict, start: str, end: str, capital: float,
         nav_history = result.get("combined_nav_history", [])
         if nav_history:
             trading_dates = [p["date"] for p in nav_history]
-            final_nav = nav_history[-1]["nav"]
             ann_return = metrics.get("annualized_return_pct", 0)
 
             # Market benchmark (SPY) — always compute
@@ -660,6 +696,217 @@ def run_backtest(portfolio_config: dict, start: str, end: str, capital: float,
         return None
 
 
+# ---------------------------------------------------------------------------
+# Walk-forward window generation + aggregation
+# ---------------------------------------------------------------------------
+
+
+def _generate_eval_windows(eval_block) -> list[tuple[str, str, str]]:
+    """Generate [(start_iso, end_iso, label), ...] from an EvalBlock.
+
+    First window starts at eval.start. Step = window - overlap. A final
+    partial window (would extend past eval.end) is DROPPED. Result may be
+    empty if window > eval span.
+    """
+    from datetime import date
+
+    spec = eval_block.spec
+    window_delta = spec.window_delta()
+    step_delta = spec.step_delta()
+
+    cur_start = date.fromisoformat(eval_block.start)
+    end_cap = date.fromisoformat(eval_block.end)
+
+    windows: list[tuple[str, str, str]] = []
+    # Safety: bound the loop to prevent any pathological infinite loop on a
+    # zero-step relativedelta (validator already disallows overlap >= window).
+    for _ in range(1024):
+        cur_end = cur_start + window_delta
+        if cur_end > end_cap:
+            break
+        label = f"{cur_start.isoformat()}_{cur_end.isoformat()}"
+        windows.append((cur_start.isoformat(), cur_end.isoformat(), label))
+        next_start = cur_start + step_delta
+        if next_start <= cur_start:  # safety; should be unreachable
+            break
+        cur_start = next_start
+    return windows
+
+
+# Metric names whose distribution we aggregate across eval windows.
+_AGG_METRIC_NAMES = (
+    "sharpe_ratio",
+    "sortino_ratio",
+    "calmar_ratio",
+    "alpha_ann_pct",
+    "alpha_vs_market_pct",
+    "alpha_vs_sector_pct",
+    "annualized_return_pct",
+    "annualized_volatility_pct",
+    "total_return_pct",
+    "max_drawdown_pct",
+    "win_rate_pct",
+    "profit_factor",
+)
+
+
+def _quantile(sorted_xs: list[float], q: float) -> float | None:
+    """Linear-interp quantile (type-7, R default)."""
+    if not sorted_xs:
+        return None
+    n = len(sorted_xs)
+    if n == 1:
+        return sorted_xs[0]
+    pos = (n - 1) * q
+    lo = int(pos)
+    hi = min(lo + 1, n - 1)
+    frac = pos - lo
+    return sorted_xs[lo] + frac * (sorted_xs[hi] - sorted_xs[lo])
+
+
+def _aggregate_window_metrics(windows: list[dict]) -> dict:
+    """Reduce per-window metric scalars to {mean, median, min, max, p25, count}.
+
+    Skips metrics not present in any window. Skips windows where the metric is
+    None. Returns an empty dict for any metric that no window reports.
+    """
+    out: dict[str, dict] = {}
+    for name in _AGG_METRIC_NAMES:
+        vals = [w["metrics"].get(name) for w in windows if w.get("metrics")]
+        vals = [v for v in vals if v is not None]
+        if not vals:
+            continue
+        srt = sorted(vals)
+        out[name] = {
+            "mean":   sum(vals) / len(vals),
+            "median": _quantile(srt, 0.5),
+            "min":    srt[0],
+            "max":    srt[-1],
+            "p25":    _quantile(srt, 0.25),
+            "count":  len(vals),
+        }
+    return out
+
+
+def run_backtest(
+    portfolio_config: dict,
+    start: str | None = None,
+    end: str | None = None,
+    capital: float | None = None,
+    sector: str | None = None,
+    config: "BacktestConfig | None" = None,  # noqa: F821 (forward-ref string)
+) -> dict | None:
+    """Run a backtest (single training period, optionally + walk-forward eval).
+
+    Two calling conventions:
+
+      1. Legacy flat args:
+         run_backtest(portfolio_config, start, end, capital, sector=sector)
+         → single training-period backtest, returns
+           {"metrics": {...}, "sleeve_trades": [...]}.
+
+      2. BacktestConfig:
+         run_backtest(portfolio_config, config=bt_cfg)
+         → training-period backtest + N eval-window backtests if cfg.eval set.
+           Returns
+             {
+               "metrics": {...},           # training-period
+               "sleeve_trades": [...],     # training-period
+               "eval": {
+                 "windows":    [{"label","start","end","metrics","sleeve_trades"}, ...],
+                 "aggregated": {<metric>: {mean, median, min, max, p25, count}, ...},
+                 "spec":       {"window": "...", "overlap": "..."},
+               }   # absent when cfg.eval is None
+             }
+
+    Eval windows each run a fresh-capital backtest at cfg.initial_capital; no
+    state rolls between windows. Partial trailing window (extends past
+    eval.end) is dropped. Failed eval windows are logged and skipped.
+    """
+    # Resolve the call style.
+    if config is None:
+        from server.models.backtest import BacktestConfig
+        if start is None or end is None or capital is None:
+            raise ValueError(
+                "run_backtest requires either `config=BacktestConfig(...)` "
+                "or all of (start, end, capital)"
+            )
+        config = BacktestConfig.from_legacy_args(start, end, capital, sector=sector)
+    # When both styles are provided, BacktestConfig wins (sector arg ignored).
+
+    # 1. Training-period backtest (mandatory).
+    training = _run_one_backtest(
+        portfolio_config,
+        config.training_start, config.training_end,
+        config.initial_capital, config.sector,
+    )
+    if training is None:
+        return None
+
+    # 2. If no eval block, done — preserve today's shape exactly.
+    if config.eval is None:
+        return training
+
+    # 3. Walk-forward eval windows.
+    window_specs = _generate_eval_windows(config.eval)
+    if not window_specs:
+        # Eval configured but produced zero windows (window > span). Surface
+        # warning, return training with empty eval block.
+        print(f"  [warn] eval block produced 0 windows (window {config.eval.spec.window} > span)")
+        training["eval"] = {
+            "windows": [],
+            "aggregated": {},
+            "spec": {"window": config.eval.spec.window, "overlap": config.eval.spec.overlap},
+        }
+        return training
+
+    print(f"  Running {len(window_specs)} eval window(s)...")
+    eval_windows: list[dict] = []
+    for w_start, w_end, w_label in window_specs:
+        res = _run_one_backtest(
+            portfolio_config, w_start, w_end,
+            config.initial_capital, config.sector,
+        )
+        if res is None:
+            print(f"  [warn] eval window {w_label} failed; skipping")
+            continue
+        eval_windows.append({
+            "label":  w_label,
+            "start":  w_start,
+            "end":    w_end,
+            "metrics": res["metrics"],
+            "sleeve_trades": res["sleeve_trades"],
+        })
+
+    aggregated = _aggregate_window_metrics(eval_windows)
+
+    training["eval"] = {
+        "windows": eval_windows,
+        "aggregated": aggregated,
+        "spec": {"window": config.eval.spec.window, "overlap": config.eval.spec.overlap},
+    }
+    return training
+
+
+def _resolve_target_value(
+    training_metrics: dict, eval_aggregated: dict, target_metric_name: str, aggregator: str,
+) -> float | None:
+    """Resolve the single scalar the agent climbs.
+
+    aggregator='overall' → reads `target_metric_name` from training_metrics.
+    aggregator='median'|'mean'|'min'|'max'|'p25' → reads from
+        eval_aggregated[target_metric_name][aggregator].
+    Returns None if the metric is missing.
+    """
+    if aggregator == "overall":
+        v = training_metrics.get(target_metric_name)
+        return v if v is not None else None
+    bucket = (eval_aggregated or {}).get(target_metric_name)
+    if not bucket:
+        return None
+    return bucket.get(aggregator)
+
+
 async def run_agent_iteration(
     run_id: str,
     iteration: int,
@@ -672,8 +919,23 @@ async def run_agent_iteration(
     model: str,
     sector: str | None = None,
     alpha_benchmark: str = "market",
+    eval_block: dict | None = None,
+    target_aggregator: str = "overall",
 ) -> dict:
-    """Run a single agent iteration. Returns experiment result."""
+    """Run a single agent iteration. Returns experiment result.
+
+    `eval_block` (optional) and `target_aggregator` enable walk-forward eval:
+        eval_block = {
+            "start": "YYYY-MM-DD",
+            "end":   "YYYY-MM-DD",
+            "spec":  {"window": "Ny|Nm|Nd", "overlap": "..."},
+        }
+        target_aggregator ∈ {"overall","mean","median","min","max","p25"}
+
+    When `eval_block` is None, behavior is identical to legacy single-period
+    backtest. When set, the backtest runs N+1 simulations (training + each
+    eval sub-window) and the agent's "best so far" climbs the aggregator.
+    """
     from claude_agent_sdk import query, ClaudeAgentOptions
     from backtest_engine import clear_precompute_cache
 
@@ -703,14 +965,58 @@ async def run_agent_iteration(
     sector_desc = f"\n**Sector:** {sector} — All data queries are restricted to {sector} stocks only. Alpha is measured against the {sector} sector ETF." if sector else ""
     benchmark_desc = f"sector ETF" if alpha_benchmark == "sector" else "S&P 500 (SPY)"
 
+    # Frame the objective so the agent knows whether it's climbing the
+    # training-period scalar or the eval-window aggregator. When eval is set
+    # but aggregator='overall', the training scalar is still the target and
+    # the eval block is purely informational context.
+    direction = "maximizes" if METRIC_DIRECTION.get(target_metric, True) else "minimizes"
+    if eval_block and target_aggregator != "overall":
+        spec = eval_block.get("spec", {})
+        objective_line = (
+            f"**Objective:** Design a portfolio that {direction} the "
+            f"**{target_aggregator} of `{target_metric}` across walk-forward eval windows** "
+            f"({spec.get('window','?')} window, {spec.get('overlap','?')} overlap, "
+            f"{eval_block.get('start','?')} → {eval_block.get('end','?')})."
+        )
+        period_line = (
+            f"**Training period (informational; the eval aggregator is the target):** "
+            f"{backtest_start} to {backtest_end}\n"
+            f"**Eval period:** {eval_block.get('start','?')} to {eval_block.get('end','?')} "
+            f"({spec.get('window','?')} windows, {spec.get('overlap','?')} overlap)"
+        )
+    elif eval_block:
+        # eval set but aggregator='overall' — eval is supporting evidence only.
+        spec = eval_block.get("spec", {})
+        objective_line = (
+            f"**Objective (portfolio level):** Design a portfolio that {direction} `{target_metric}` "
+            f"over the training period. Eval windows are reported as supporting evidence."
+        )
+        period_line = (
+            f"**Training period (target):** {backtest_start} to {backtest_end}\n"
+            f"**Eval period (informational):** {eval_block.get('start','?')} to {eval_block.get('end','?')} "
+            f"({spec.get('window','?')} windows, {spec.get('overlap','?')} overlap)"
+        )
+    else:
+        objective_line = (
+            f"**Objective (portfolio level):** Design a portfolio that {direction} `{target_metric}`."
+        )
+        period_line = f"**Backtest period:** {backtest_start} to {backtest_end}"
+
+    best_label = f"{target_aggregator} {target_metric}" if target_aggregator != "overall" else target_metric
+    best_line = (
+        f"**Current best {best_label}:** {best_value:.4f}"
+        if best_value is not None
+        else "**No best yet — this is the first experiment.**"
+    )
+
     prompt = f"""You are on experiment {iteration} of an autonomous research loop.
 
-**Objective (portfolio level):** Design a portfolio that {"maximizes" if METRIC_DIRECTION.get(target_metric, True) else "minimizes"} `{target_metric}`.
+{objective_line}
 **Conditions (portfolio level):** {conditions_desc if conditions else 'None'}
-**Backtest period:** {backtest_start} to {backtest_end}
+{period_line}
 **Capital:** ${initial_capital:,.0f}
 **Alpha benchmark:** {benchmark_desc}{sector_desc}
-{"**Current best " + target_metric + ":** " + f"{best_value:.4f}" if best_value is not None else "**No best yet — this is the first experiment.**"}
+{best_line}
 
 **Knowledge cutoff: {backtest_end}**
 You are researching as of {backtest_end}. You do not know what happens after this date.
@@ -874,16 +1180,32 @@ Use the `query_market_data` tool for all data queries. Use `validate_portfolio` 
         "sleeves": len(portfolio_config.get("sleeves", [])),
     })
 
-    # Run backtest
+    # Run backtest — single training period if no eval_block, else N+1 backtests.
     print(f"  Running backtest ({backtest_start} to {backtest_end})...")
     emit_event(run_id, "backtest_started", {"experiment_number": iteration})
-    bt_result = run_backtest(portfolio_config, backtest_start, backtest_end, initial_capital, sector=sector)
+
+    # Build BacktestConfig (with optional eval) and run.
+    from server.models.backtest import BacktestConfig, EvalBlock, WindowSpec
+    bt_cfg_kwargs = dict(
+        training_start=backtest_start, training_end=backtest_end,
+        initial_capital=initial_capital, sector=sector,
+        benchmark="sector" if alpha_benchmark == "sector" else "market",
+    )
+    if eval_block:
+        bt_cfg_kwargs["eval"] = EvalBlock(
+            start=eval_block["start"], end=eval_block["end"],
+            spec=WindowSpec(**eval_block.get("spec", {})),
+        )
+    bt_cfg = BacktestConfig(**bt_cfg_kwargs)
+    bt_result = run_backtest(portfolio_config, config=bt_cfg)
 
     if bt_result is None:
         metrics = None
+        eval_data = None
     else:
         metrics = bt_result["metrics"]
         sleeve_trades = bt_result["sleeve_trades"]
+        eval_data = bt_result.get("eval")  # None or {"windows", "aggregated", "spec"}
 
     if metrics is None:
         exp_id = log_experiment(
@@ -904,9 +1226,21 @@ Use the `query_market_data` tool for all data queries. Use `validate_portfolio` 
         metrics["alpha_ann_pct"] = metrics["alpha_vs_sector_pct"]
     elif "alpha_vs_market_pct" in metrics:
         metrics["alpha_ann_pct"] = metrics["alpha_vs_market_pct"]
+    # Mirror the same alpha mapping inside each eval window so per-window
+    # alpha_ann_pct is consistent with the agent's chosen benchmark.
+    if eval_data:
+        for w in eval_data.get("windows", []):
+            wm = w.get("metrics", {})
+            if alpha_benchmark == "sector" and "alpha_vs_sector_pct" in wm:
+                wm["alpha_ann_pct"] = wm["alpha_vs_sector_pct"]
+            elif "alpha_vs_market_pct" in wm:
+                wm["alpha_ann_pct"] = wm["alpha_vs_market_pct"]
+        # Rebuild aggregated dict to reflect the alpha remap above.
+        eval_data["aggregated"] = _aggregate_window_metrics(eval_data["windows"])
 
-    # Score
-    target_value = metrics.get(target_metric)
+    # Score — resolve the single scalar the agent climbs.
+    eval_aggregated = (eval_data or {}).get("aggregated", {})
+    target_value = _resolve_target_value(metrics, eval_aggregated, target_metric, target_aggregator)
     conditions_met, conditions_detail = check_conditions(metrics, conditions)
 
     improved = (
@@ -921,6 +1255,21 @@ Use the `query_market_data` tool for all data queries. Use `validate_portfolio` 
     # Save portfolio to portfolios table (idempotent) — links experiment → portfolio
     portfolio_id = save_portfolio(portfolio_config)
 
+    # Persist the eval block as JSON. Strip per-window sleeve_trades from the
+    # JSON blob to keep the row size bounded — trades are persisted separately
+    # in the trades table with window_label, queryable via get_experiment_trades.
+    eval_metrics_json = None
+    if eval_data is not None:
+        eval_compact = {
+            "spec": eval_data.get("spec"),
+            "aggregated": eval_data.get("aggregated"),
+            "windows": [
+                {"label": w["label"], "start": w["start"], "end": w["end"], "metrics": w["metrics"]}
+                for w in eval_data.get("windows", [])
+            ],
+        }
+        eval_metrics_json = json.dumps(eval_compact)
+
     exp_id = log_experiment(
         run_id=run_id, iteration=iteration,
         thesis=thesis, assumptions=assumptions, portfolio_config=portfolio_config,
@@ -932,17 +1281,32 @@ Use the `query_market_data` tool for all data queries. Use `validate_portfolio` 
         session_id=session_id, duration_seconds=duration_total,
         portfolio_id=portfolio_id,
         lessons=lessons,
+        eval_metrics_json=eval_metrics_json,
+        target_aggregator=target_aggregator,
     )
 
     # Persist trades per sleeve under source_type='experiment'.
+    # Training-period trades have window_label=NULL; eval-window trades carry
+    # their window label so get_experiment_trades can filter by window.
     # Failure here is enrichment loss only — the experiment row is already saved.
     try:
         from deploy_engine import persist_trades
         total = 0
+        # Training-period trades (window_label=NULL).
         for sleeve in sleeve_trades:
             if sleeve["trades"]:
                 total += persist_trades("experiment", exp_id, sleeve["trades"],
                                         sleeve_label=sleeve["label"])
+        # Eval-window trades (window_label = window's label).
+        if eval_data is not None:
+            for w in eval_data.get("windows", []):
+                w_label = w["label"]
+                for sleeve in w.get("sleeve_trades", []):
+                    if sleeve["trades"]:
+                        total += persist_trades(
+                            "experiment", exp_id, sleeve["trades"],
+                            sleeve_label=sleeve["label"], window_label=w_label,
+                        )
         if total:
             print(f"  💾 {total} trade(s) persisted for {exp_id}")
     except Exception as e:
@@ -1013,7 +1377,30 @@ async def main():
     parser.add_argument("--starting-portfolio", type=str, default=None, help="Path to starting portfolio config JSON")
     parser.add_argument("--sector", type=str, default=None, help="Restrict data queries to this sector")
     parser.add_argument("--alpha-benchmark", type=str, default="market", help="Benchmark: sector or market")
+    parser.add_argument("--eval-file", type=str, default=None,
+                        help="Path to JSON file with walk-forward eval block: "
+                             "{'start':..., 'end':..., 'spec':{'window':'2y','overlap':'1y'}}")
+    parser.add_argument("--target-aggregator", type=str, default="overall",
+                        choices=("overall", "mean", "median", "min", "max", "p25"),
+                        help="How to reduce per-window metrics to the agent's optimization scalar. "
+                             "Non-'overall' requires --eval-file.")
     args = parser.parse_args()
+
+    # Load eval block from sidecar file.
+    eval_block = None
+    if args.eval_file:
+        eval_path = Path(args.eval_file)
+        if not eval_path.exists():
+            print(f"--eval-file not found: {args.eval_file}")
+            return
+        try:
+            eval_block = json.loads(eval_path.read_text())
+        except json.JSONDecodeError as e:
+            print(f"Invalid --eval-file JSON: {e}")
+            return
+    if args.target_aggregator != "overall" and eval_block is None:
+        print(f"--target-aggregator={args.target_aggregator!r} requires --eval-file to be set")
+        return
 
     if args.metric not in VALID_METRICS:
         print(f"Invalid metric: '{args.metric}'. Valid: {VALID_METRICS}")
@@ -1162,6 +1549,8 @@ async def main():
             model=args.model,
             sector=args.sector,
             alpha_benchmark=args.alpha_benchmark,
+            eval_block=eval_block,
+            target_aggregator=args.target_aggregator,
         )
 
         if result["decision"] == "keep" and result.get("target_value") is not None:
