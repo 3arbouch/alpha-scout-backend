@@ -56,12 +56,58 @@ from regime import evaluate_regime_series_with_stats
 # run_portfolio_backtest at lines 272-273)
 _DEFAULT_ENTRY_PERSIST = 3
 _DEFAULT_EXIT_PERSIST = 3
+
+
+# Acronyms / domain terms that should stay uppercase or get a specific casing
+# when we humanize snake_case macro series codes for the frontend. Anything not
+# in this map falls through to plain title-case.
+_HUMANIZE_TOKEN_OVERRIDES = {
+    "hy":    "HY",       "ig":  "IG",     "spx":  "SPX",    "vix": "VIX",
+    "cpi":   "CPI",      "pce": "PCE",    "ppi":  "PPI",    "ism": "ISM",
+    "yoy":   "YoY",      "mom": "MoM",    "qoq":  "QoQ",    "fy":  "FY",
+    "ytd":   "YTD",      "dma": "DMA",    "ema":  "EMA",    "sma": "SMA",
+    "ma":    "MA",       "wti": "WTI",    "fx":   "FX",     "ust": "UST",
+    "10y":   "10Y",      "2y":  "2Y",     "30y":  "30Y",    "zscore": "Z-Score",
+    "pct":   "(%)",      "vs":  "vs",     "of":   "of",     "and": "and",
+    "the":   "the",      "to":  "to",     "natgas": "NatGas",
+}
+
+# Tokens that mix digits and letters in the source (e.g. "200dma", "50dma") get
+# split at the digit→letter boundary so each side can be humanized independently.
+import re as _re
+_DIGIT_LETTER_SPLIT = _re.compile(r"(\d+)([a-zA-Z]+)")
+
+
+def _humanize_token(tok: str) -> str:
+    """Single-token humanizer: lowercase token → presentation form."""
+    lo = tok.lower()
+    if lo in _HUMANIZE_TOKEN_OVERRIDES:
+        return _HUMANIZE_TOKEN_OVERRIDES[lo]
+    m = _DIGIT_LETTER_SPLIT.fullmatch(tok)
+    if m:
+        # "200dma" → "200-DMA"; "50ema" → "50-EMA"
+        return f"{m.group(1)}-{_humanize_token(m.group(2))}"
+    return tok.capitalize()
+
+
+def _humanize_series_code(code: str) -> str:
+    """Turn a macro series code like ``hy_spread_zscore`` into a display label
+    like ``HY Spread Z-Score``. Used to stamp ``series_label`` on regime
+    conditions so the frontend can render readable trigger strings without
+    maintaining a parallel code→label table."""
+    return " ".join(_humanize_token(t) for t in code.split("_") if t)
+
+
+def _humanize_regime_id(rid: str) -> str:
+    """Same idea but for regime IDs (``macro_defensive`` → ``Macro Defensive``)."""
+    return " ".join(_humanize_token(t) for t in rid.split("_") if t)
 from position_book import PositionBook
 from sleeve_signals import (
     SleeveRuntimeState,
     get_entry_candidates,
     get_exit_recommendations,
     get_rebalance_directives,
+    pop_ranking_event,
 )
 from stop_pricing import compute_realized_vol, compute_stop_pricing, make_sqlite_ohlc_fetcher
 
@@ -283,8 +329,14 @@ def _execute_pending_entries(
         if pricing["abort"]:
             continue
 
-        # signal_detail composition (matches v1 Portfolio.open_position)
-        if pricing["stop_record"] is None and pricing["tp_record"] is None:
+        # signal_detail composition (matches v1 Portfolio.open_position). The
+        # directive carries `signal_detail` as the raw entries list and an
+        # optional `ranking` block (per-pick score / factor reduction). We
+        # wrap them into the unified trade record so every BUY is self-
+        # describing.
+        has_ranking = d.ranking is not None
+        if (pricing["stop_record"] is None and pricing["tp_record"] is None
+                and not has_ranking):
             merged_sig = d.signal_detail
         else:
             merged_sig = {}
@@ -294,6 +346,8 @@ def _execute_pending_entries(
                 merged_sig["stop"] = pricing["stop_record"]
             if pricing["tp_record"]:
                 merged_sig["take_profit"] = pricing["tp_record"]
+            if has_ranking:
+                merged_sig["ranking"] = d.ranking
 
         trade = book.open(
             sleeve_label=sleeve.label, symbol=d.symbol, date=date,
@@ -497,6 +551,7 @@ def _run_daily_loop(
     actual broker action when the portfolio reallocates a sleeve to 0%.
     """
     all_trades: list[dict] = []
+    ranking_history: list[dict] = []   # one entry per (date, sleeve) ranking event
     last_date = trading_dates[-1] if trading_dates else None
     profile_name_by_date = profile_name_by_date or {}
     # DB-backed OHLC fetcher for vol-adaptive stops (matches v1). Built once,
@@ -677,6 +732,12 @@ def _run_daily_loop(
                 pit_members_today=_pit_today,
             )
             sleeve.pending_entries = cands
+            # Capture the ranking event (if any) for the ranking-explorer endpoint.
+            # `pop_ranking_event` returns None when fewer candidates than slots
+            # made ranking unnecessary, OR when ranking is signal-order only.
+            ev = pop_ranking_event(cands)
+            if ev is not None:
+                ranking_history.append(ev)
 
         # -------------------------------------------------------------------
         # 5. Record NAV
@@ -703,7 +764,11 @@ def _run_daily_loop(
             if t is not None:
                 all_trades.append(t)
 
-    return {"trades": all_trades, "nav_history": book.nav_history}
+    return {
+        "trades":          all_trades,
+        "nav_history":     book.nav_history,
+        "ranking_history": ranking_history,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -975,11 +1040,17 @@ def run_portfolio_backtest(
     metrics = compute_metrics(book, initial_capital, trading_dates)
 
     # --- Benchmarks (same as v1) ---
+    # Both `market_bench` and `sector_bench` (when available) contain
+    # nav_history arrays aligned to `trading_dates`, plus per-period
+    # metrics. We expose the full dicts via the result so the API can serve
+    # benchmark NAV curves to the frontend (for the equity overlay chart).
     market_bench = compute_benchmark(trading_dates, initial_capital, sector=None)
+    sector_bench: dict | None = None
     if market_bench:
         market_total = market_bench["metrics"].get("total_return_pct")
         market_ann = market_bench["metrics"].get("annualized_return_pct")
         metrics["market_benchmark_return_pct"] = market_total
+        metrics["market_benchmark_ann_return_pct"] = market_ann
         # v1 also writes a generic `benchmark_return_pct` alias (defaults to
         # the market benchmark). deploy_engine.py reads that key when it
         # updates `last_benchmark_return_pct` on the deployments row, which
@@ -1002,6 +1073,44 @@ def run_portfolio_backtest(
         if strat_total is not None and market_total is not None:
             metrics["alpha_vs_market_pct_period"] = round(strat_total - market_total, 2)
             metrics["alpha_ann_pct"] = metrics.get("alpha_vs_market_pct")
+
+    # Sector benchmarks — one buy-and-hold ETF per sector represented in the
+    # universe. Multi-sector portfolios (e.g. Tech + Comm Services) get
+    # multiple overlays so the frontend can show each sector ETF as its own
+    # line. The singular `benchmark_sector` (primary = most-represented
+    # sector) is preserved for back-compat with existing FE consumers.
+    from portfolio_engine import _infer_sleeve_sectors_with_counts
+    sector_counts: dict[str, int] = {}
+    for ctx in sleeve_ctxs:
+        for sec, n in _infer_sleeve_sectors_with_counts(ctx.config).items():
+            sector_counts[sec] = sector_counts.get(sec, 0) + n
+    # Most-represented first; drop sectors we have no ETF mapping for.
+    ordered_sectors = sorted(
+        (s for s in sector_counts if s in SECTOR_ETF_MAP),
+        key=lambda s: -sector_counts[s],
+    )
+    benchmark_sectors: list[dict] = []
+    for sec in ordered_sectors:
+        b = compute_benchmark(trading_dates, initial_capital, sector=sec)
+        if b:
+            b["sector"] = sec  # tag so the FE can label each line
+            benchmark_sectors.append(b)
+    sector_bench = benchmark_sectors[0] if benchmark_sectors else None
+
+    if sector_bench:
+        sector_total = sector_bench["metrics"].get("total_return_pct")
+        sector_ann = sector_bench["metrics"].get("annualized_return_pct")
+        metrics["sector_benchmark_return_pct"] = sector_total
+        metrics["sector_benchmark_ann_return_pct"] = sector_ann
+        metrics["alpha_vs_sector_pct"] = (
+            metrics["annualized_return_pct"] - sector_ann
+            if metrics.get("annualized_return_pct") is not None and sector_ann is not None
+            else None
+        )
+        strat_total = metrics.get("total_return_pct")
+        if strat_total is not None and sector_total is not None:
+            metrics["alpha_vs_sector_pct_period"] = round(strat_total - sector_total, 2)
+            metrics["period_excess_vs_sector_pct"] = metrics["alpha_vs_sector_pct_period"]
 
     print(f"\n  Total Return: {metrics.get('total_return_pct', 0):+.2f}%")
     print(f"  Final NAV:    ${metrics.get('final_nav', initial_capital):,.2f}")
@@ -1080,6 +1189,107 @@ def run_portfolio_backtest(
         "regime_gate": ctx.regime_gate,
     } for ctx in sleeve_ctxs]
 
+    # --- Dense regime + allocation timelines for frontend rendering ---------
+    # Both series are aligned to `trading_dates` so the frontend can zip them
+    # against `nav_history` without interpolation (same pattern as benchmark_nav).
+    #
+    # regime_history[i].active_regimes is empty when no regime is firing — that
+    # is information ("calm"), not absence. Always emit one row per trading day
+    # so the frontend gets a guaranteed-aligned series.
+    sleeve_labels_set = {ctx.label for ctx in sleeve_ctxs}
+    regime_history: list[dict] = []
+    allocation_history: list[dict] = []
+    for d in trading_dates:
+        active = list(regime_series.get(d, []))
+        regime_history.append({"date": d, "active_regimes": active})
+
+        if profile_weights_by_date:
+            pname = profile_name_by_date.get(d)
+            raw_w = profile_weights_by_date.get(d, {}) or {}
+            # Normalize: surface every sleeve label explicitly, drop unknown
+            # keys (except Cash), compute Cash = 1 - sum(sleeve_weights) so the
+            # row always sums to 1.0 and the frontend never has to guess.
+            tw: dict[str, float] = {}
+            for lbl in sleeve_labels_set:
+                tw[lbl] = float(raw_w.get(lbl, 0.0) or 0.0)
+            sleeve_sum = sum(tw.values())
+            tw["Cash"] = max(0.0, round(1.0 - sleeve_sum, 6))
+            allocation_history.append({
+                "date": d,
+                "profile_name": pname,
+                "target_weights": tw,
+            })
+
+    # Derived sparse view (one row per profile *change*) — back-compat with v1's
+    # `allocation_profile_history` consumers. Empty when no allocation_profiles
+    # are configured.
+    allocation_profile_history: list[dict] = []
+    prev_profile = None
+    prev_weights: dict | None = None
+    for row in allocation_history:
+        pname = row["profile_name"]
+        tw = row["target_weights"]
+        if pname != prev_profile:
+            entry = {"date": row["date"], "profile_name": pname, "weights": tw}
+            if prev_weights is not None:
+                entry["from_weights"] = prev_weights
+                entry["transition"] = "instant"  # v2 doesn't smooth yet
+            else:
+                entry["transition"] = "instant (initial)"
+            allocation_profile_history.append(entry)
+            prev_profile = pname
+            prev_weights = tw
+
+    # --- Annotate regime_definitions with display labels --------------------
+    # The raw config carries series codes (e.g. "hy_spread_zscore"). We stamp
+    # human-readable labels next to them so the frontend can render the trigger
+    # string ("HY Spread Z-Score > 2.0 OR ...") without maintaining a parallel
+    # code→label mapping. Done on a shallow copy so the caller's config dict
+    # isn't mutated.
+    config_out = dict(portfolio_config)
+    raw_defs = portfolio_config.get("regime_definitions") or {}
+    if isinstance(raw_defs, dict) and raw_defs:
+        annotated: dict = {}
+        for rid, defn in raw_defs.items():
+            if not isinstance(defn, dict):
+                annotated[rid] = defn
+                continue
+            d2 = dict(defn)
+            d2.setdefault("label", _humanize_regime_id(rid))
+            conds_out = []
+            for c in defn.get("conditions", []) or []:
+                if isinstance(c, dict):
+                    c2 = dict(c)
+                    series_code = c2.get("series")
+                    if series_code and "series_label" not in c2:
+                        c2["series_label"] = _humanize_series_code(series_code)
+                    conds_out.append(c2)
+                else:
+                    conds_out.append(c)
+            d2["conditions"] = conds_out
+            annotated[rid] = d2
+        config_out["regime_definitions"] = annotated
+
+    # --- Stamp ranking_model on every sleeve --------------------------------
+    # Presentation-ready projection of `ranking` + `composite_score` so the
+    # frontend renders a "Scoring Model" card without normalizing weights or
+    # resolving factor labels client-side. See scripts/ranking_model.py.
+    from ranking_model import build_ranking_model
+    raw_sleeves = portfolio_config.get("sleeves") or []
+    if isinstance(raw_sleeves, list) and raw_sleeves:
+        annotated_sleeves: list = []
+        for s in raw_sleeves:
+            if isinstance(s, dict):
+                s2 = dict(s)
+                scfg = s2.get("strategy_config") or {}
+                rm = build_ranking_model(scfg)
+                if rm is not None:
+                    s2["ranking_model"] = rm
+                annotated_sleeves.append(s2)
+            else:
+                annotated_sleeves.append(s)
+        config_out["sleeves"] = annotated_sleeves
+
     return {
         "portfolio": name,
         "engine_version": "v2",
@@ -1089,7 +1299,32 @@ def run_portfolio_backtest(
         "combined_nav_history": loop_result["nav_history"],   # alias for compat
         "sleeve_results": sleeve_results,
         "per_sleeve": per_sleeve,
-        "config": portfolio_config,
+        "config": config_out,
+        # Dense daily series (one row per trading_date) — frontend zips these
+        # against `nav_history` to render the regime + allocation overlay.
+        "regime_history":              regime_history,
+        "allocation_history":          allocation_history,
+        # Sparse view (one row per profile transition) — back-compat with v1.
+        "allocation_profile_history":  allocation_profile_history,
+        # One entry per (date, sleeve) ranking event. Each entry carries the
+        # full leaderboard (picked + not-picked candidates) so the frontend's
+        # ranking-explorer view can render alternatives next to the picks.
+        "ranking_history":             loop_result.get("ranking_history", []),
         "backtest": {"start": bt_start, "end": bt_end,
                      "initial_capital": initial_capital},
+        # Benchmarks: same keys v1 emits. Each is the full compute_benchmark()
+        # dict (with `symbol`, `nav_history`, `metrics`). `benchmark` is the
+        # primary (sector if available, else market) for legacy callers.
+        # deploy_engine reads benchmark_market / benchmark_sector when
+        # writing results.json, and the API's GET /deployments/{id} surfaces
+        # them as-is. The flat `benchmark_nav` shape the frontend equity
+        # chart consumes is derived in the API layer.
+        "benchmark":         sector_bench or market_bench,
+        "benchmark_market":  market_bench,
+        "benchmark_sector":  sector_bench,
+        # Per-sector list — one entry per sector touched by the universe (each
+        # with its own ETF buy-and-hold curve). Single-sector portfolios get
+        # a one-element list mirroring `benchmark_sector`; multi-sector
+        # portfolios get N entries the FE can render as separate overlay lines.
+        "benchmark_sectors": benchmark_sectors,
     }

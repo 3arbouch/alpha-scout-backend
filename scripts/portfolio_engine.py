@@ -108,6 +108,49 @@ def _infer_sleeve_sector(sleeve_config: dict) -> str | None:
     return None
 
 
+def _lookup_symbols_sectors_with_counts(symbols: list[str]) -> dict[str, int]:
+    """Map each symbol to its sector and return {sector_name: count}.
+
+    Unlike _lookup_symbols_sector (which only returns a value when ALL symbols
+    share one sector), this enumerates every sector touched by the universe.
+    Symbols missing from universe_profiles or with NULL sector are dropped.
+    """
+    if not symbols:
+        return {}
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        placeholders = ",".join("?" * len(symbols))
+        rows = conn.execute(
+            f"SELECT symbol, sector FROM universe_profiles WHERE symbol IN ({placeholders})",
+            list(symbols),
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return {}
+    counts: dict[str, int] = {}
+    for _sym, sec in rows:
+        if sec:
+            counts[sec] = counts.get(sec, 0) + 1
+    return counts
+
+
+def _infer_sleeve_sectors_with_counts(sleeve_config: dict) -> dict[str, int]:
+    """Per-sleeve sector counts across the universe.
+
+    - type='sector' → {declared_sector: 1}
+    - type='symbols' → counts of each sector across symbols (via universe_profiles)
+    - type='all'/'index'/other → {} (we don't enumerate; multi-sector benchmark skipped)
+    """
+    universe = sleeve_config.get("universe", {}) or {}
+    utype = universe.get("type")
+    if utype == "sector":
+        sec = universe.get("sector")
+        return {sec: 1} if sec else {}
+    if utype == "symbols":
+        return _lookup_symbols_sectors_with_counts(universe.get("symbols") or [])
+    return {}
+
+
 def _infer_portfolio_sector(sleeves: list[dict]) -> str | None:
     """Determine a portfolio's effective sector by combining per-sleeve sectors.
 

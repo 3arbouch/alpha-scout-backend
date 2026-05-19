@@ -124,6 +124,7 @@ CREATE TABLE IF NOT EXISTS trades (
     source_id TEXT NOT NULL,
     deployment_type TEXT,
     sleeve_label TEXT,
+    window_label TEXT,                                     -- NULL = training-period trade; else 'YYYY-MM-DD_YYYY-MM-DD' eval-window label
     date TEXT NOT NULL,
     action TEXT NOT NULL,
     symbol TEXT NOT NULL,
@@ -276,9 +277,17 @@ def wrap_strategy_as_portfolio(strategy_config: dict, capital: float,
 # Trade ID helpers
 # ---------------------------------------------------------------------------
 def _trade_id(source_id: str, date: str, symbol: str, action: str,
-              sleeve_label: str = None, seq: int = 0) -> str:
-    """Deterministic trade ID. seq distinguishes multiple same-day trades."""
-    raw = f"{source_id}:{date}:{symbol}:{action}:{sleeve_label or ''}:{seq}"
+              sleeve_label: str = None, seq: int = 0,
+              window_label: str = None) -> str:
+    """Deterministic trade ID.
+
+    `seq` distinguishes multiple same-day same-direction trades.
+    `window_label` disambiguates walk-forward eval-window trades from a single
+    experiment so a BUY of AAPL on 2024-01-02 in window A doesn't collide with
+    a BUY of AAPL on 2024-01-02 in window B (both legitimately occur — each
+    eval window is an independent fresh-capital simulation).
+    """
+    raw = f"{source_id}:{window_label or ''}:{date}:{symbol}:{action}:{sleeve_label or ''}:{seq}"
     return hashlib.md5(raw.encode()).hexdigest()[:12]
 
 
@@ -293,8 +302,15 @@ def _sleeve_id(source_id: str, label: str) -> str:
 # ---------------------------------------------------------------------------
 def persist_trades(source_type: str, source_id: str, trades_list: list,
                    deployment_type: str = None, sleeve_label: str = None,
+                   window_label: str = None,
                    conn=None) -> int:
-    """Persist trades to the unified trades table. Returns count inserted."""
+    """Persist trades to the unified trades table. Returns count inserted.
+
+    `window_label` is NULL for training-period or live-deploy trades, and a
+    'YYYY-MM-DD_YYYY-MM-DD' string for walk-forward eval-window trades. It
+    participates in the trade ID hash so the same (date, symbol, action) in
+    two different windows does not collide.
+    """
     close_conn = False
     if conn is None:
         conn = get_db()
@@ -311,7 +327,7 @@ def persist_trades(source_type: str, source_id: str, trades_list: list,
         seq = action_seq.get(key, 0)
         action_seq[key] = seq + 1
         if t.get("action") == "BUY":
-            tid = _trade_id(source_id, t["date"], t["symbol"], "BUY", sleeve_label, seq)
+            tid = _trade_id(source_id, t["date"], t["symbol"], "BUY", sleeve_label, seq, window_label)
             buy_lookup[(t["symbol"], t["date"])] = tid
 
     action_seq = {}
@@ -319,7 +335,7 @@ def persist_trades(source_type: str, source_id: str, trades_list: list,
         key = (t["date"], t["symbol"], t.get("action", ""))
         seq = action_seq.get(key, 0)
         action_seq[key] = seq + 1
-        tid = _trade_id(source_id, t["date"], t["symbol"], t["action"], sleeve_label, seq)
+        tid = _trade_id(source_id, t["date"], t["symbol"], t["action"], sleeve_label, seq, window_label)
 
         linked = None
         if t.get("action") == "SELL" and t.get("entry_date"):
@@ -331,12 +347,12 @@ def persist_trades(source_type: str, source_id: str, trades_list: list,
         try:
             conn.execute(
                 """INSERT OR IGNORE INTO trades
-                   (id, source_type, source_id, deployment_type, sleeve_label,
+                   (id, source_type, source_id, deployment_type, sleeve_label, window_label,
                     date, action, symbol, shares, price, amount, reason,
                     signal_detail, entry_date, entry_price, pnl, pnl_pct,
                     days_held, linked_trade_id, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (tid, source_type, source_id, deployment_type, sleeve_label,
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (tid, source_type, source_id, deployment_type, sleeve_label, window_label,
                  t["date"], t["action"], t["symbol"], t["shares"], t["price"],
                  t.get("amount"), t.get("reason"), sig_json,
                  t.get("entry_date"), t.get("entry_price"),
@@ -354,7 +370,7 @@ def persist_trades(source_type: str, source_id: str, trades_list: list,
     for t in trades_list:
         if t.get("action") == "SELL" and t.get("entry_date"):
             buy_id = buy_lookup.get((t["symbol"], t["entry_date"]))
-            sell_id = _trade_id(source_id, t["date"], t["symbol"], "SELL", sleeve_label)
+            sell_id = _trade_id(source_id, t["date"], t["symbol"], "SELL", sleeve_label, window_label=window_label)
             if buy_id:
                 conn.execute(
                     "UPDATE trades SET linked_trade_id = ? WHERE id = ? AND linked_trade_id IS NULL",
@@ -531,12 +547,13 @@ def evaluate_one(deploy_id: str) -> dict | None:
     (deploy_dir / "config.json").write_text(json.dumps(config, indent=2))
 
     try:
-        # Engine-version routing: opt in to v2 by setting
-        # engine_version="v2" on the portfolio config. v1 is the default.
-        if config.get("engine_version") == "v2":
-            from portfolio_engine_v2 import run_portfolio_backtest
-        else:
+        # Engine-version routing: v2 is the default (unified-position-book
+        # engine, what all live deployments run). Set engine_version="v1" on
+        # the portfolio config to opt back into the legacy engine.
+        if config.get("engine_version") == "v1":
             from portfolio_engine import run_portfolio_backtest
+        else:
+            from portfolio_engine_v2 import run_portfolio_backtest
         result = run_portfolio_backtest(config, force_close_at_end=False)
 
         # Save full results to disk
@@ -834,10 +851,71 @@ def get_deployment(deploy_id: str) -> dict | None:
             result["metrics"] = full.get("metrics", {})
             result["nav_history"] = full.get("combined_nav_history", [])
             result["benchmark"] = full.get("benchmark", {})              # legacy: primary
-            result["benchmark_market"] = full.get("benchmark_market")    # SPY time series
-            result["benchmark_sector"] = full.get("benchmark_sector")    # sector ETF (or None)
+            # `benchmark_market` keeps the full compute_benchmark() dict for any
+            # legacy consumer that read it pre-2026-05. New frontend code reads
+            # the slim shapes below (benchmark_nav + benchmark_sector).
+            result["benchmark_market"] = full.get("benchmark_market")
+
+            # Equity-chart overlay shape (what EquityCurveChart consumes):
+            #
+            #   benchmark_nav:    [{date, nav}, ...]           # SPY, same date grid + initial_capital as nav_history
+            #   benchmark_sector: {symbol, nav_history, metrics}  # sector ETF wrapper (or null when multi-sector)
+            #
+            # Both are aligned to `nav_history` so the frontend can zip them
+            # without interpolation. Null/omitted is the explicit "unavailable"
+            # signal (e.g. multi-sector portfolios won't have benchmark_sector).
+            market_bench = full.get("benchmark_market") or {}
+            sector_bench = full.get("benchmark_sector") or None
+            mkt_nav = market_bench.get("nav_history") if isinstance(market_bench, dict) else None
+            if mkt_nav:
+                result["benchmark_nav"] = [{"date": p["date"], "nav": p["nav"]} for p in mkt_nav]
+            else:
+                result["benchmark_nav"] = None
+            if isinstance(sector_bench, dict) and sector_bench.get("nav_history"):
+                result["benchmark_sector"] = {
+                    "symbol":      sector_bench.get("symbol"),
+                    "sector":      sector_bench.get("sector"),
+                    "nav_history": [{"date": p["date"], "nav": p["nav"]}
+                                     for p in sector_bench["nav_history"]],
+                    "metrics":     sector_bench.get("metrics") or {},
+                }
+            else:
+                result["benchmark_sector"] = None
+            # Slim per-sector list — same shape per element as benchmark_sector
+            # above. Multi-sector portfolios get N entries; single-sector get 1
+            # (mirroring benchmark_sector); empty list when no ETF mapping
+            # exists (e.g. type='all' or 'index' universes).
+            sector_benches = full.get("benchmark_sectors") or []
+            result["benchmark_sectors"] = [
+                {
+                    "symbol":      b.get("symbol"),
+                    "sector":      b.get("sector"),
+                    "nav_history": [{"date": p["date"], "nav": p["nav"]}
+                                     for p in (b.get("nav_history") or [])],
+                    "metrics":     b.get("metrics") or {},
+                }
+                for b in sector_benches
+                if isinstance(b, dict) and b.get("nav_history")
+            ]
             result["regime_history"] = full.get("regime_history", [])
             result["allocation_profile_history"] = full.get("allocation_profile_history", [])
+            # Dense daily allocation timeline (one row per trading day). v2 emits
+            # this; v1 results stay empty. Frontend pairs with regime_history and
+            # nav_history (same date grid) to render the allocation overlay chart.
+            result["allocation_history"] = full.get("allocation_history", [])
+            # One entry per (date, sleeve) ranking event. NOT included in the
+            # default GET /deployments/{id} response (can be large); served by
+            # dedicated endpoints in the API layer. We pass it through here so
+            # those endpoints can read from get_deployment's return.
+            result["ranking_history"] = full.get("ranking_history", [])
+
+            # Prefer the engine's emitted config over the DB-stored config_json
+            # so the frontend gets annotations (regime_definitions[].label,
+            # condition.series_label) that the engine stamps at run time. The DB
+            # row remains the immutable record of what the user originally deployed.
+            full_config = full.get("config")
+            if isinstance(full_config, dict) and full_config:
+                result["config_json"] = json.dumps(full_config)
 
             # Per-sleeve detail
             sleeve_results = full.get("sleeve_results", [])

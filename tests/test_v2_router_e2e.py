@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-V2 engine_version router (Phase 2 Step 4).
+V2 engine_version router.
 
-The API + deploy_engine route a portfolio backtest to v1 or v2 based on
-`config.engine_version`. Default is v1 (no behavior change for any
-existing deployment). Setting "v2" opts in to the unified-position-book
-executor.
+The API + deploy_engine + agent loop route a portfolio backtest to v1 or v2
+based on `config.engine_version`. Default is **v2** (the unified-position-book
+engine, what all live deployments and the agent loop run). Set
+engine_version="v1" to opt back into the legacy engine.
 
 This test verifies:
-  - Default routing (no engine_version, or engine_version="v1") → v1
-  - engine_version="v2" → v2
+  - Default routing (no engine_version) → v2
+  - engine_version="v1" explicit → v1
+  - engine_version="v2" explicit → v2
   - Both engines accept the same input shape
   - Both return the same top-level response shape (trades, metrics,
     sleeve_results, etc) so downstream UI code doesn't break
@@ -59,10 +60,10 @@ from portfolio_engine_v2 import run_portfolio_backtest as run_v2
 
 
 def routed_run(config: dict, force_close_at_end: bool = True):
-    """Mirror server/api.py:_run_portfolio_bt routing."""
-    if (config or {}).get("engine_version") == "v2":
-        return run_v2(config, force_close_at_end=force_close_at_end)
-    return run_v1(config, force_close_at_end=force_close_at_end)
+    """Mirror server/api.py:_run_portfolio_bt routing — v2 default, v1 opt-out."""
+    if (config or {}).get("engine_version") == "v1":
+        return run_v1(config, force_close_at_end=force_close_at_end)
+    return run_v2(config, force_close_at_end=force_close_at_end)
 
 
 # ---------------------------------------------------------------------------
@@ -102,29 +103,29 @@ def base_cfg(engine_version=None):
 
 
 # ---------------------------------------------------------------------------
-# 1. Default config (no engine_version) → v1
+# 1. Default config (no engine_version) → V2 (new default)
 # ---------------------------------------------------------------------------
-print("\n=== 1. Default (no engine_version) routes to V1 ===")
+print("\n=== 1. Default (no engine_version) routes to V2 ===")
 r_default = routed_run(base_cfg(engine_version=None))
 check("default response has 'sleeve_results'", "sleeve_results" in r_default)
-check("default response missing 'engine_version' field (legacy v1)",
-      "engine_version" not in r_default,
-      "v1 doesn't tag its response — that's how we identify routing")
+check("default response includes engine_version=v2 tag (default is v2)",
+      r_default.get("engine_version") == "v2",
+      f"got engine_version={r_default.get('engine_version')}")
 
 
 # ---------------------------------------------------------------------------
-# 2. engine_version="v1" explicit → v1
+# 2. engine_version="v1" explicit → v1 (opt-out)
 # ---------------------------------------------------------------------------
-print("\n=== 2. engine_version='v1' explicit routes to V1 ===")
+print("\n=== 2. engine_version='v1' explicit routes to V1 (opt-out) ===")
 r_v1 = routed_run(base_cfg(engine_version="v1"))
 check("explicit v1 missing 'engine_version' in response (v1 doesn't tag)",
       "engine_version" not in r_v1)
 
 
 # ---------------------------------------------------------------------------
-# 3. engine_version="v2" → v2
+# 3. engine_version="v2" explicit → V2 (matches default)
 # ---------------------------------------------------------------------------
-print("\n=== 3. engine_version='v2' routes to V2 ===")
+print("\n=== 3. engine_version='v2' explicit routes to V2 ===")
 r_v2 = routed_run(base_cfg(engine_version="v2"))
 check("v2 response includes engine_version=v2 tag",
       r_v2.get("engine_version") == "v2",
@@ -137,16 +138,19 @@ check("v2 response includes engine_version=v2 tag",
 print("\n=== 4. Response shape compatibility ===")
 required_shared = ["metrics", "sleeve_results", "per_sleeve", "config"]
 for k in required_shared:
-    check(f"v1 response has '{k}'", k in r_default, f"keys: {sorted(r_default.keys())[:6]}")
-    check(f"v2 response has '{k}'", k in r_v2, f"keys: {sorted(r_v2.keys())[:6]}")
+    check(f"default(v2) response has '{k}'", k in r_default,
+          f"keys: {sorted(r_default.keys())[:6]}")
+    check(f"explicit-v1 response has '{k}'", k in r_v1,
+          f"keys: {sorted(r_v1.keys())[:6]}")
 # v2-specific top-level convenience block; v1 lives inside config["backtest"]
-check("v2 response has 'backtest' top-level convenience", "backtest" in r_v2)
+check("default(v2) response has 'backtest' top-level convenience",
+      "backtest" in r_default)
 check("v1 has backtest info via config.backtest",
-      r_default.get("config", {}).get("backtest") is not None)
+      r_v1.get("config", {}).get("backtest") is not None)
 
 check("both responses have len(sleeve_results) == 1",
       len(r_default.get("sleeve_results", [])) == 1
-      and len(r_v2.get("sleeve_results", [])) == 1)
+      and len(r_v1.get("sleeve_results", [])) == 1)
 
 
 # ---------------------------------------------------------------------------

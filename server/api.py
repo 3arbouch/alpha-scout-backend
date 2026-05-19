@@ -1229,9 +1229,41 @@ def _normalize_config(config: dict) -> dict:
     """
     from models.strategy import StrategyConfig
     try:
-        return StrategyConfig.model_validate(config).model_dump(mode="json")
+        out = StrategyConfig.model_validate(config).model_dump(mode="json")
     except Exception:
-        return config  # return as-is if validation fails (e.g. incomplete config)
+        out = config  # return as-is if validation fails (e.g. incomplete config)
+    return _stamp_ranking_model(out)
+
+
+def _stamp_ranking_model(config: dict) -> dict:
+    """Add the presentation-ready `ranking_model` block to a strategy config
+    (flat) or every sleeve of a portfolio config. No-op when the config has
+    no ranking section. See scripts/ranking_model.py for the shape."""
+    if not isinstance(config, dict):
+        return config
+    sys.path.insert(0, str(WORKSPACE / "scripts"))
+    from ranking_model import build_ranking_model
+    if "sleeves" in config and isinstance(config["sleeves"], list):
+        # Portfolio shape — stamp on each sleeve's wrapper.
+        new_sleeves = []
+        for s in config["sleeves"]:
+            if isinstance(s, dict):
+                s2 = dict(s)
+                rm = build_ranking_model(s.get("strategy_config") or {})
+                if rm is not None:
+                    s2["ranking_model"] = rm
+                new_sleeves.append(s2)
+            else:
+                new_sleeves.append(s)
+        config = dict(config)
+        config["sleeves"] = new_sleeves
+    else:
+        # Strategy shape — stamp at top level when the config IS a strategy.
+        rm = build_ranking_model(config)
+        if rm is not None:
+            config = dict(config)
+            config["ranking_model"] = rm
+    return config
 
 
 def _compute_strategy_id(config: dict) -> str:
@@ -1898,12 +1930,27 @@ async def get_deployment_unified(deploy_id: str, _: str = Depends(verify_api_key
         result["benchmark"] = _sanitize_floats(d["benchmark"])
     if d.get("benchmark_market"):
         result["benchmark_market"] = _sanitize_floats(d["benchmark_market"])
-    if d.get("benchmark_sector"):
-        result["benchmark_sector"] = _sanitize_floats(d["benchmark_sector"])
+    # Slim shapes for the equity-chart overlay. Always forward, even when
+    # null, so the frontend's "missing → omit line" guard fires with an
+    # explicit signal rather than a missing key.
+    result["benchmark_nav"] = (
+        _sanitize_floats(d["benchmark_nav"]) if d.get("benchmark_nav") else None
+    )
+    result["benchmark_sector"] = (
+        _sanitize_floats(d["benchmark_sector"]) if d.get("benchmark_sector") else None
+    )
+    # Per-sector benchmark list — one entry per sector touched by the universe.
+    # Single-sector portfolios get one element (mirroring benchmark_sector);
+    # multi-sector portfolios get N for separate FE chart overlays.
+    result["benchmark_sectors"] = (
+        _sanitize_floats(d["benchmark_sectors"]) if d.get("benchmark_sectors") else []
+    )
     if d.get("regime_history"):
         result["regime_history"] = d["regime_history"]
     if d.get("allocation_profile_history"):
         result["allocation_profile_history"] = d["allocation_profile_history"]
+    if d.get("allocation_history"):
+        result["allocation_history"] = d["allocation_history"]
 
     return result
 
@@ -1923,6 +1970,80 @@ async def evaluate_deployment_unified(deploy_id: str, _: str = Depends(verify_ap
         "return_pct": metrics.get("total_return_pct"),
         "total_trades": metrics.get("total_trades"),
     })
+
+
+# ---------------------------------------------------------------------------
+# Ranking-explorer endpoints
+#
+# `ranking_history` (in results.json) is one entry per (date, sleeve) ranking
+# event — the engine's full leaderboard at the moment of selection. We split
+# it across two endpoints so the index ("which events exist") is cheap to
+# fetch and the detail ("show me 2026-05-04 for the Core sleeve") is loaded
+# on demand. Both endpoints share the same shape philosophy as the rest of
+# the deployment payload: stable schema, factor labels resolved server-side,
+# math reproducible from inputs.
+# ---------------------------------------------------------------------------
+@app.get("/deployments/{deploy_id}/rankings", tags=["Deployments (Unified)"])
+async def list_deployment_rankings(deploy_id: str, _: str = Depends(verify_api_key)):
+    """Index of ranking events for this deployment. Cheap — one row per event
+    with date + sleeve + size, no per-candidate detail. Pair with
+    ``/rankings/{date}/{sleeve_label}`` for the full leaderboard."""
+    from deploy_engine import get_deployment as _get
+    d = await _run_sync(_get, deploy_id)
+    if not d:
+        raise HTTPException(404, f"Deployment '{deploy_id}' not found")
+    rh = d.get("ranking_history") or []
+    return _sanitize_floats({
+        "deploy_id": deploy_id,
+        "n_events":  len(rh),
+        "events": [
+            {
+                "date":         ev.get("date"),
+                "sleeve_label": ev.get("sleeve_label"),
+                "by":           ev.get("by"),
+                "n_candidates": ev.get("n_candidates"),
+                "n_selected":   ev.get("n_selected"),
+                "top_n_cutoff": ev.get("top_n_cutoff"),
+            }
+            for ev in rh
+        ],
+    })
+
+
+@app.get("/deployments/{deploy_id}/rankings/{date}/{sleeve_label}",
+         tags=["Deployments (Unified)"])
+async def get_deployment_ranking_event(
+    deploy_id: str, date: str, sleeve_label: str,
+    _: str = Depends(verify_api_key),
+):
+    """Full leaderboard for one (date, sleeve) ranking event.
+
+    Returns every candidate the engine considered that day — picked **and**
+    not-picked — with per-bucket / per-factor breakdown so the frontend can
+    render "why this pick" + "who was just below the cut" side by side.
+
+    Math invariant guaranteed by tests::
+
+        score = Σ_buckets weight_normalized · mean(factor.z_signed for factor in bucket)
+
+    Verifiable client-side from the returned `buckets` block.
+    """
+    from deploy_engine import get_deployment as _get
+    d = await _run_sync(_get, deploy_id)
+    if not d:
+        raise HTTPException(404, f"Deployment '{deploy_id}' not found")
+    rh = d.get("ranking_history") or []
+    ev = next(
+        (e for e in rh
+         if e.get("date") == date and e.get("sleeve_label") == sleeve_label),
+        None,
+    )
+    if ev is None:
+        raise HTTPException(
+            404,
+            f"No ranking event for date={date} sleeve_label={sleeve_label}",
+        )
+    return _sanitize_floats(ev)
 
 
 def _build_position_book(sleeves: list[dict], initial_capital: float) -> dict:
@@ -2330,12 +2451,27 @@ async def get_deployment(deploy_id: str, _: str = Depends(verify_api_key)):
         result["benchmark"] = _sanitize_floats(d["benchmark"])
     if d.get("benchmark_market"):
         result["benchmark_market"] = _sanitize_floats(d["benchmark_market"])
-    if d.get("benchmark_sector"):
-        result["benchmark_sector"] = _sanitize_floats(d["benchmark_sector"])
+    # Slim shapes for the equity-chart overlay. Always forward, even when
+    # null, so the frontend's "missing → omit line" guard fires with an
+    # explicit signal rather than a missing key.
+    result["benchmark_nav"] = (
+        _sanitize_floats(d["benchmark_nav"]) if d.get("benchmark_nav") else None
+    )
+    result["benchmark_sector"] = (
+        _sanitize_floats(d["benchmark_sector"]) if d.get("benchmark_sector") else None
+    )
+    # Per-sector benchmark list — one entry per sector touched by the universe.
+    # Single-sector portfolios get one element (mirroring benchmark_sector);
+    # multi-sector portfolios get N for separate FE chart overlays.
+    result["benchmark_sectors"] = (
+        _sanitize_floats(d["benchmark_sectors"]) if d.get("benchmark_sectors") else []
+    )
     if d.get("regime_history"):
         result["regime_history"] = d["regime_history"]
     if d.get("allocation_profile_history"):
         result["allocation_profile_history"] = d["allocation_profile_history"]
+    if d.get("allocation_history"):
+        result["allocation_history"] = d["allocation_history"]
 
     return result
 
@@ -3013,15 +3149,15 @@ from portfolio_engine_v2 import run_portfolio_backtest as _run_portfolio_bt_v2
 def _run_portfolio_bt(config: dict, force_close_at_end: bool = True):
     """Route the portfolio backtest to v1 or v2 based on config.engine_version.
 
-    Default: v1 (engine_version absent or != "v2"). Opt-in to v2 by setting
-    engine_version="v2" on the portfolio config. v2 produces a clean
-    broker-equivalent trade ledger for regime/allocation_profile configs
-    (no dual-bookkeeping); v1 keeps current behavior including the
-    9d0fead reconciliation patch.
+    Default: v2 (the unified-position-book engine — what all live deployments
+    and the agent loop run). Set engine_version="v1" on the portfolio config
+    to opt back into the legacy engine, which keeps the 9d0fead reconciliation
+    patch but produces dual-bookkeeping artifacts for regime/allocation_profile
+    configs.
     """
-    if (config or {}).get("engine_version") == "v2":
-        return _run_portfolio_bt_v2(config, force_close_at_end=force_close_at_end)
-    return _run_portfolio_bt_v1(config, force_close_at_end=force_close_at_end)
+    if (config or {}).get("engine_version") == "v1":
+        return _run_portfolio_bt_v1(config, force_close_at_end=force_close_at_end)
+    return _run_portfolio_bt_v2(config, force_close_at_end=force_close_at_end)
 
 
 # PortfolioCreate uses the domain PortfolioConfig directly.
@@ -3693,7 +3829,7 @@ async def get_portfolio(portfolio_id: str, _: str = Depends(verify_api_key)):
     return {
         "portfolio_id": row["portfolio_id"],
         "name": row["name"],
-        "config": json.loads(row["config"]),
+        "config": _stamp_ranking_model(json.loads(row["config"])),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
         "experiments": experiments,

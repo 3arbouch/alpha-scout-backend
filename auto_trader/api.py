@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, Depends
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from auto_trader.schema import (
     get_db, get_experiment_history, get_best_experiment,
@@ -277,6 +277,17 @@ class UpdateAgentRequest(BaseModel):
     )
 
 
+class EvalWindowSpec(BaseModel):
+    window: str = Field(description="Window length, e.g. '2y', '12m', '180d'.")
+    overlap: str = Field(default="0d", description="Overlap between successive windows. '0d' = contiguous. Must be < window.")
+
+
+class EvalBlockRequest(BaseModel):
+    start: str = Field(description="Eval period start (YYYY-MM-DD). May be inside, outside, or partly overlapping the training period.")
+    end: str = Field(description="Eval period end (YYYY-MM-DD).")
+    spec: EvalWindowSpec
+
+
 class CreateRunRequest(BaseModel):
     name: str = Field(description="Human-readable run name")
     agent_id: str = Field(default="default", description="Agent ID to use for this run")
@@ -290,6 +301,38 @@ class CreateRunRequest(BaseModel):
     sector: str | None = Field(default=None, description="Restrict to a sector (e.g. 'Energy', 'Technology'). If set, data queries only return stocks in this sector.")
     alpha_benchmark: str = Field(default="auto", description="Benchmark for alpha: 'sector' (sector ETF), 'market' (SPY), 'auto' (sector if sector is set, else market)")
     starting_portfolio: dict | None = Field(default=None, description="Optional starting portfolio config.")
+    # Walk-forward eval — both optional. Setting `eval` runs N+1 backtests per
+    # iteration (training + each eval window). `target_aggregator != "overall"`
+    # makes the agent climb the aggregated eval metric instead of the
+    # training scalar; it requires `eval` to be set.
+    eval: EvalBlockRequest | None = Field(default=None, description="Optional walk-forward eval block. Absent = single training-period backtest (today's behavior).")
+    target_aggregator: str = Field(
+        default="overall",
+        description=(
+            "How to reduce per-window metrics to the scalar the agent climbs. "
+            "Central-tendency: mean | median. "
+            "Tail: min | p10 | p25 | max. "
+            "Dispersion (MINIMIZED — consistency target): stdev | iqr | range. "
+            "Signal-to-noise (mean/stdev): snr. "
+            "'overall' (default) reads the training-period scalar; everything "
+            "else requires `eval` to be set."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _check_aggregator_eval(self):
+        valid = {"overall", "mean", "median", "min", "max",
+                 "p10", "p25", "stdev", "iqr", "range", "snr"}
+        if self.target_aggregator not in valid:
+            raise ValueError(
+                f"target_aggregator={self.target_aggregator!r} not in {sorted(valid)}"
+            )
+        if self.target_aggregator != "overall" and self.eval is None:
+            raise ValueError(
+                f"target_aggregator={self.target_aggregator!r} requires `eval` to be set; "
+                f"'overall' is the only aggregator valid without an eval block"
+            )
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +409,19 @@ async def list_tools():
     from auto_trader.tools import list_available_tools
     tools = list_available_tools()
     return {"total": len(tools), "data": tools}
+
+
+@router.get("/aggregators")
+async def list_aggregators():
+    """Return the catalog of walk-forward eval aggregators.
+
+    Each entry has: id, label, group, direction, requires_eval, recommended,
+    description. The frontend should use this to populate the aggregator
+    dropdown in the run-creation form so that new aggregators auto-flow to
+    the UI without a frontend deploy.
+    """
+    from server.models.research_run import AGGREGATOR_CATALOG
+    return {"total": len(AGGREGATOR_CATALOG), "data": AGGREGATOR_CATALOG}
 
 
 @router.get("/config")
@@ -628,9 +684,16 @@ async def create_run(body: CreateRunRequest):
         "max_experiments": body.max_experiments,
         "sector": body.sector,
         "alpha_benchmark": alpha_benchmark,
+        "target_aggregator": body.target_aggregator,
     }
     if body.starting_portfolio:
         config["starting_portfolio"] = body.starting_portfolio
+    if body.eval:
+        config["eval"] = {
+            "start": body.eval.start,
+            "end":   body.eval.end,
+            "spec":  {"window": body.eval.spec.window, "overlap": body.eval.spec.overlap},
+        }
 
     conn = get_db()
     conn.execute(
@@ -716,6 +779,15 @@ async def start_run(run_id: str, body: StartRunRequest = StartRunRequest()):
         sp_file = PROJECT_ROOT / "auto_trader" / f".starting_{run_id}.json"
         sp_file.write_text(json.dumps(config["starting_portfolio"]))
         cmd.extend(["--starting-portfolio", str(sp_file)])
+
+    # Walk-forward eval — write to a sidecar file (multi-line JSON) and pass
+    # the path so we don't fight argv quoting on the eval JSON.
+    if config.get("eval"):
+        eval_file = PROJECT_ROOT / "auto_trader" / f".eval_{run_id}.json"
+        eval_file.write_text(json.dumps(config["eval"]))
+        cmd.extend(["--eval-file", str(eval_file)])
+    if config.get("target_aggregator") and config["target_aggregator"] != "overall":
+        cmd.extend(["--target-aggregator", config["target_aggregator"]])
 
     # Spawn as background process
     env = os.environ.copy()

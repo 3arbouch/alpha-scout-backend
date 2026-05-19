@@ -288,6 +288,7 @@ CREATE TABLE IF NOT EXISTS trades (
     source_id           TEXT NOT NULL,
     deployment_type     TEXT,
     sleeve_label        TEXT,
+    window_label        TEXT,                              -- NULL = training-period or live-deploy trade; else 'YYYY-MM-DD_YYYY-MM-DD' eval-window label
     date                TEXT NOT NULL,
     action              TEXT NOT NULL,
     symbol              TEXT NOT NULL,
@@ -460,9 +461,13 @@ CREATE TABLE IF NOT EXISTS experiments (
     portfolio_config                TEXT,              -- legacy: will be phased out, use portfolio_id instead
     -- Optimization target
     target_metric                   TEXT,
-    target_value                    REAL,
+    target_aggregator               TEXT,             -- overall|mean|median|min|max|p25; how target_value was reduced from a walk-forward eval
+    target_value                    REAL,             -- the scalar agent climbs (aggregator-resolved)
     conditions                      TEXT,
     conditions_met                  INTEGER,
+    -- Walk-forward eval block: per-window metrics + aggregates as JSON.
+    -- NULL when no eval was configured for the run.
+    eval_metrics_json               TEXT,
     -- Backtest metrics
     total_return_pct                REAL,
     annualized_return_pct           REAL,
@@ -499,6 +504,7 @@ CREATE TABLE IF NOT EXISTS experiments (
     tokens_used                     INTEGER,
     duration_seconds                REAL,
     error                           TEXT,
+    smoothing_summary               TEXT,
     created_at                      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_experiments_run ON experiments(run_id, iteration);
@@ -646,6 +652,14 @@ def _apply_migrations(conn: sqlite3.Connection):
         _add_column_if_missing(conn, "experiments", "sharpe_ratio_annualized", "REAL")
         _add_column_if_missing(conn, "experiments", "sharpe_ratio_period", "REAL")
         _add_column_if_missing(conn, "experiments", "smoothing_summary", "TEXT")
+        # Walk-forward eval persistence — full per-window dict + aggregates as JSON,
+        # plus the aggregator name so target_value semantics are recoverable.
+        _add_column_if_missing(conn, "experiments", "eval_metrics_json", "TEXT")
+        _add_column_if_missing(conn, "experiments", "target_aggregator", "TEXT")
+    if "trades" in existing_tables:
+        # NULL = training-period trade (today's behavior). Non-null =
+        # 'YYYY-MM-DD_YYYY-MM-DD' label of the eval window this trade belongs to.
+        _add_column_if_missing(conn, "trades", "window_label", "TEXT")
     if "deployments" in existing_tables:
         _add_column_if_missing(conn, "deployments", "portfolio_id", "TEXT")
         _add_column_if_missing(conn, "deployments", "last_sharpe_basis", "TEXT")
