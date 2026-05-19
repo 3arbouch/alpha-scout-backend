@@ -1074,37 +1074,43 @@ def run_portfolio_backtest(
             metrics["alpha_vs_market_pct_period"] = round(strat_total - market_total, 2)
             metrics["alpha_ann_pct"] = metrics.get("alpha_vs_market_pct")
 
-    # Sector benchmark — compute when the portfolio is effectively single-sector.
-    # Mirrors v1's behavior at portfolio_engine.py:1422-1430. Without this,
-    # `sector_benchmark_return_pct` and `alpha_vs_sector_pct` are None on every
-    # v2-executed backtest, which leaves the frontend's sector-benchmark fields
-    # empty.
-    from portfolio_engine import _infer_sleeve_sector
-    per_sleeve_sectors = [_infer_sleeve_sector(ctx.config) for ctx in sleeve_ctxs]
-    bench_sector = None
-    if per_sleeve_sectors and all(s is not None for s in per_sleeve_sectors):
-        distinct = set(per_sleeve_sectors)
-        if len(distinct) == 1:
-            bench_sector = distinct.pop()
+    # Sector benchmarks — one buy-and-hold ETF per sector represented in the
+    # universe. Multi-sector portfolios (e.g. Tech + Comm Services) get
+    # multiple overlays so the frontend can show each sector ETF as its own
+    # line. The singular `benchmark_sector` (primary = most-represented
+    # sector) is preserved for back-compat with existing FE consumers.
+    from portfolio_engine import _infer_sleeve_sectors_with_counts
+    sector_counts: dict[str, int] = {}
+    for ctx in sleeve_ctxs:
+        for sec, n in _infer_sleeve_sectors_with_counts(ctx.config).items():
+            sector_counts[sec] = sector_counts.get(sec, 0) + n
+    # Most-represented first; drop sectors we have no ETF mapping for.
+    ordered_sectors = sorted(
+        (s for s in sector_counts if s in SECTOR_ETF_MAP),
+        key=lambda s: -sector_counts[s],
+    )
+    benchmark_sectors: list[dict] = []
+    for sec in ordered_sectors:
+        b = compute_benchmark(trading_dates, initial_capital, sector=sec)
+        if b:
+            b["sector"] = sec  # tag so the FE can label each line
+            benchmark_sectors.append(b)
+    sector_bench = benchmark_sectors[0] if benchmark_sectors else None
 
-    if bench_sector and bench_sector in SECTOR_ETF_MAP:
-        # Note: `sector_bench` was declared above so it survives this block;
-        # the result-dict assembly below reads it.
-        sector_bench = compute_benchmark(trading_dates, initial_capital, sector=bench_sector)
-        if sector_bench:
-            sector_total = sector_bench["metrics"].get("total_return_pct")
-            sector_ann = sector_bench["metrics"].get("annualized_return_pct")
-            metrics["sector_benchmark_return_pct"] = sector_total
-            metrics["sector_benchmark_ann_return_pct"] = sector_ann
-            metrics["alpha_vs_sector_pct"] = (
-                metrics["annualized_return_pct"] - sector_ann
-                if metrics.get("annualized_return_pct") is not None and sector_ann is not None
-                else None
-            )
-            strat_total = metrics.get("total_return_pct")
-            if strat_total is not None and sector_total is not None:
-                metrics["alpha_vs_sector_pct_period"] = round(strat_total - sector_total, 2)
-                metrics["period_excess_vs_sector_pct"] = metrics["alpha_vs_sector_pct_period"]
+    if sector_bench:
+        sector_total = sector_bench["metrics"].get("total_return_pct")
+        sector_ann = sector_bench["metrics"].get("annualized_return_pct")
+        metrics["sector_benchmark_return_pct"] = sector_total
+        metrics["sector_benchmark_ann_return_pct"] = sector_ann
+        metrics["alpha_vs_sector_pct"] = (
+            metrics["annualized_return_pct"] - sector_ann
+            if metrics.get("annualized_return_pct") is not None and sector_ann is not None
+            else None
+        )
+        strat_total = metrics.get("total_return_pct")
+        if strat_total is not None and sector_total is not None:
+            metrics["alpha_vs_sector_pct_period"] = round(strat_total - sector_total, 2)
+            metrics["period_excess_vs_sector_pct"] = metrics["alpha_vs_sector_pct_period"]
 
     print(f"\n  Total Return: {metrics.get('total_return_pct', 0):+.2f}%")
     print(f"  Final NAV:    ${metrics.get('final_nav', initial_capital):,.2f}")
@@ -1313,7 +1319,12 @@ def run_portfolio_backtest(
         # writing results.json, and the API's GET /deployments/{id} surfaces
         # them as-is. The flat `benchmark_nav` shape the frontend equity
         # chart consumes is derived in the API layer.
-        "benchmark":        sector_bench or market_bench,
-        "benchmark_market": market_bench,
-        "benchmark_sector": sector_bench,
+        "benchmark":         sector_bench or market_bench,
+        "benchmark_market":  market_bench,
+        "benchmark_sector":  sector_bench,
+        # Per-sector list — one entry per sector touched by the universe (each
+        # with its own ETF buy-and-hold curve). Single-sector portfolios get
+        # a one-element list mirroring `benchmark_sector`; multi-sector
+        # portfolios get N entries the FE can render as separate overlay lines.
+        "benchmark_sectors": benchmark_sectors,
     }

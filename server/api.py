@@ -1939,6 +1939,12 @@ async def get_deployment_unified(deploy_id: str, _: str = Depends(verify_api_key
     result["benchmark_sector"] = (
         _sanitize_floats(d["benchmark_sector"]) if d.get("benchmark_sector") else None
     )
+    # Per-sector benchmark list — one entry per sector touched by the universe.
+    # Single-sector portfolios get one element (mirroring benchmark_sector);
+    # multi-sector portfolios get N for separate FE chart overlays.
+    result["benchmark_sectors"] = (
+        _sanitize_floats(d["benchmark_sectors"]) if d.get("benchmark_sectors") else []
+    )
     if d.get("regime_history"):
         result["regime_history"] = d["regime_history"]
     if d.get("allocation_profile_history"):
@@ -2453,6 +2459,12 @@ async def get_deployment(deploy_id: str, _: str = Depends(verify_api_key)):
     )
     result["benchmark_sector"] = (
         _sanitize_floats(d["benchmark_sector"]) if d.get("benchmark_sector") else None
+    )
+    # Per-sector benchmark list — one entry per sector touched by the universe.
+    # Single-sector portfolios get one element (mirroring benchmark_sector);
+    # multi-sector portfolios get N for separate FE chart overlays.
+    result["benchmark_sectors"] = (
+        _sanitize_floats(d["benchmark_sectors"]) if d.get("benchmark_sectors") else []
     )
     if d.get("regime_history"):
         result["regime_history"] = d["regime_history"]

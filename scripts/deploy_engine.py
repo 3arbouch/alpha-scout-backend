@@ -874,12 +874,29 @@ def get_deployment(deploy_id: str) -> dict | None:
             if isinstance(sector_bench, dict) and sector_bench.get("nav_history"):
                 result["benchmark_sector"] = {
                     "symbol":      sector_bench.get("symbol"),
+                    "sector":      sector_bench.get("sector"),
                     "nav_history": [{"date": p["date"], "nav": p["nav"]}
                                      for p in sector_bench["nav_history"]],
                     "metrics":     sector_bench.get("metrics") or {},
                 }
             else:
                 result["benchmark_sector"] = None
+            # Slim per-sector list — same shape per element as benchmark_sector
+            # above. Multi-sector portfolios get N entries; single-sector get 1
+            # (mirroring benchmark_sector); empty list when no ETF mapping
+            # exists (e.g. type='all' or 'index' universes).
+            sector_benches = full.get("benchmark_sectors") or []
+            result["benchmark_sectors"] = [
+                {
+                    "symbol":      b.get("symbol"),
+                    "sector":      b.get("sector"),
+                    "nav_history": [{"date": p["date"], "nav": p["nav"]}
+                                     for p in (b.get("nav_history") or [])],
+                    "metrics":     b.get("metrics") or {},
+                }
+                for b in sector_benches
+                if isinstance(b, dict) and b.get("nav_history")
+            ]
             result["regime_history"] = full.get("regime_history", [])
             result["allocation_profile_history"] = full.get("allocation_profile_history", [])
             # Dense daily allocation timeline (one row per trading day). v2 emits
