@@ -447,6 +447,25 @@ def build_history_context(run_id: str, target_metric: str, limit: int = 20,
                         + " | ".join(parts) + target_str
                     )
 
+                # Per-window detail — labels match the get_experiment_trades/
+                # get_experiment_stats `window=` filter so the agent can drill
+                # into any individual window via existing tools.
+                if windows:
+                    lines.append("**Per-window:**")
+                    for w in windows:
+                        m = w.get("metrics", {}) or {}
+                        bits = []
+                        if m.get("sharpe_ratio") is not None:
+                            bits.append(f"Sharpe={m['sharpe_ratio']:.2f}")
+                        if m.get("alpha_ann_pct") is not None:
+                            bits.append(f"Alpha={m['alpha_ann_pct']:+.1f}%")
+                        if m.get("max_drawdown_pct") is not None:
+                            bits.append(f"MaxDD={m['max_drawdown_pct']:+.1f}%")
+                        if m.get("annualized_volatility_pct") is not None:
+                            bits.append(f"Vol={m['annualized_volatility_pct']:.1f}%")
+                        if bits:
+                            lines.append(f"- {w.get('label','?')}: {', '.join(bits)}")
+
         # Full portfolio config
         portfolio_config = exp.get("portfolio_config")
         if portfolio_config:
