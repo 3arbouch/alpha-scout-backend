@@ -1136,8 +1136,6 @@ You are researching as of {backtest_end}. You do not know what happens after thi
 - Form your thesis based only on data you query and patterns you observe within the allowed period
 - Pretend today is {backtest_end}
 
-Use the `query_market_data` tool for all data queries. Use `validate_portfolio` to check your config before outputting.
-
 {history}"""
 
     # Run the agent with skill discovery + query_market_data + validate_portfolio

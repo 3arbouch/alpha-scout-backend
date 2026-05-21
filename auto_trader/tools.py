@@ -33,6 +33,35 @@ _START_DATE: str | None = None
 _SECTOR: str | None = None
 _RUN_ID: str | None = None
 
+# Canonical factor set for portfolio exposure analysis. Pulled from
+# features_daily — the 13 factors most commonly used for risk/style attribution.
+# Each entry: (column_name, direction) where direction declares the natural sign
+# of the bet: "higher" means a high z-score = more of the named bet; "lower"
+# means high z-score = LESS of the named bet (e.g. high pe = LESS value tilt).
+# The tool flips the sign for "lower" factors when rolling up to bet_summary so
+# +bet always means "more of the category bet."
+CANONICAL_FACTORS: dict[str, list[tuple[str, str]]] = {
+    "momentum":  [("ret_12_1m", "higher"), ("ret_3m", "higher"), ("ret_1m", "higher")],
+    "value":     [("pe", "lower"), ("ev_ebitda", "lower")],
+    "yield":     [("fcf_yield", "higher")],
+    "growth":    [("rev_yoy", "higher"), ("eps_yoy", "higher"), ("rev_yoy_accel", "higher")],
+    "quality":   [("roe", "higher"), ("gross_margin", "higher"), ("debt_to_equity", "lower")],
+    "sentiment": [("analyst_net_upgrades_90d", "higher")],
+}
+
+# Flat list of factor column names (kept in insertion order for stable output).
+CANONICAL_FACTOR_COLUMNS: list[str] = [
+    col for factors in CANONICAL_FACTORS.values() for (col, _) in factors
+]
+
+# {factor_col: (category, direction)}
+FACTOR_META: dict[str, tuple[str, str]] = {
+    col: (cat, direction)
+    for cat, factors in CANONICAL_FACTORS.items()
+    for (col, direction) in factors
+}
+
+
 # Tables that have a date column (for silent filtering)
 DATE_COLUMN_MAP = {
     "prices": "date",
@@ -753,6 +782,381 @@ async def get_experiment_stats_tool(args: dict[str, Any]) -> dict[str, Any]:
         "top_symbols_by_contribution":  top_symbols,
         "monthly_pnl":                  monthly,
         "holding_days":                 holding_days,
+    }
+    return {"content": [{"type": "text", "text": json.dumps(result, default=str)}]}
+
+
+# ---------------------------------------------------------------------------
+# Portfolio factor exposure analysis
+# ---------------------------------------------------------------------------
+
+def _market_db() -> sqlite3.Connection:
+    """Open a read-only connection to market.db."""
+    conn = sqlite3.connect(f"file:{MARKET_DB_PATH}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _resolve_trading_date(conn: sqlite3.Connection, as_of: str) -> str | None:
+    """Return the most recent trading date ≤ as_of (uses features_daily as the
+    calendar). None if no data on/before that date."""
+    row = conn.execute(
+        "SELECT MAX(date) FROM features_daily WHERE date <= ?", (as_of,)
+    ).fetchone()
+    return row[0] if row and row[0] else None
+
+
+def _resolve_experiment_holdings(
+    experiment_id: str,
+    as_of_date: str | None,
+) -> tuple[dict[str, float], str, str | None]:
+    """Reconstruct open holdings for an experiment at `as_of_date`.
+
+    Returns ({symbol: weight}, resolved_date, error_or_None).
+    Weights are dollar-value share weights using close on resolved_date.
+    """
+    from auto_trader.schema import get_db
+
+    app_conn = get_db()
+    where = ["source_type = 'experiment'", "source_id = ?"]
+    params: list[Any] = [experiment_id]
+    if _RUN_ID:
+        where.append("source_id IN (SELECT id FROM experiments WHERE run_id = ?)")
+        params.append(_RUN_ID)
+
+    # Fall back to experiment.backtest_end if as_of_date not given
+    if not as_of_date:
+        row = app_conn.execute(
+            "SELECT backtest_end FROM experiments WHERE id = ?", (experiment_id,)
+        ).fetchone()
+        if not row or not row["backtest_end"]:
+            app_conn.close()
+            return {}, "", f"experiment {experiment_id} not found or has no backtest_end"
+        as_of_date = row["backtest_end"]
+
+    where.append("date <= ?")
+    params.append(as_of_date)
+
+    rows = app_conn.execute(
+        f"""SELECT symbol,
+                   SUM(CASE WHEN action='BUY' THEN shares ELSE -shares END) AS net_shares
+            FROM trades
+            WHERE {' AND '.join(where)}
+            GROUP BY symbol
+            HAVING net_shares > 1e-9""",
+        params,
+    ).fetchall()
+    app_conn.close()
+
+    if not rows:
+        return {}, as_of_date, "no open holdings at as_of_date"
+
+    symbols = [r["symbol"] for r in rows]
+    net_shares = {r["symbol"]: float(r["net_shares"]) for r in rows}
+
+    # Get closing prices on resolved trading date (≤ as_of_date)
+    mkt = _market_db()
+    trading_date = _resolve_trading_date(mkt, as_of_date)
+    if not trading_date:
+        mkt.close()
+        return {}, as_of_date, f"no market data on/before {as_of_date}"
+
+    placeholders = ",".join("?" * len(symbols))
+    prows = mkt.execute(
+        f"""SELECT symbol, close FROM prices
+            WHERE symbol IN ({placeholders}) AND date = ?""",
+        (*symbols, trading_date),
+    ).fetchall()
+    mkt.close()
+
+    prices = {r["symbol"]: float(r["close"]) for r in prows if r["close"] is not None}
+    values = {s: net_shares[s] * prices[s] for s in symbols if s in prices}
+    if not values:
+        return {}, trading_date, "no price data for holdings on as_of_date"
+
+    total = sum(values.values())
+    weights = {s: v / total for s, v in values.items()}
+    return weights, trading_date, None
+
+
+def _compute_zscores(
+    conn: sqlite3.Connection,
+    as_of_date: str,
+    factors: list[str],
+    universe_symbols: list[str] | None,
+) -> tuple[dict[str, dict[str, float]], dict[str, tuple[float | None, float | None, int]]]:
+    """Compute z-scores for `factors` at `as_of_date` over a universe.
+
+    Universe = `universe_symbols` if provided, else all symbols in features_daily.
+
+    Returns:
+        per_symbol: {symbol: {factor: z_score_or_None}}
+        stats:     {factor: (mean, std, n)}  — for diagnostics
+    """
+    factor_cols = ",".join(factors)
+    if universe_symbols:
+        placeholders = ",".join("?" * len(universe_symbols))
+        rows = conn.execute(
+            f"""SELECT symbol, {factor_cols} FROM features_daily
+                WHERE date = ? AND symbol IN ({placeholders})""",
+            (as_of_date, *universe_symbols),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            f"""SELECT symbol, {factor_cols} FROM features_daily WHERE date = ?""",
+            (as_of_date,),
+        ).fetchall()
+
+    raw: dict[str, dict[str, float]] = {}
+    for r in rows:
+        sym = r["symbol"]
+        d: dict[str, float] = {}
+        for f in factors:
+            v = r[f]
+            if v is not None:
+                d[f] = float(v)
+        raw[sym] = d
+
+    # Per-factor mean/std over the universe (ignoring NULLs)
+    import statistics
+    stats: dict[str, tuple[float | None, float | None, int]] = {}
+    for f in factors:
+        vals = [raw[s][f] for s in raw if f in raw[s]]
+        if len(vals) < 5:
+            stats[f] = (None, None, len(vals))
+            continue
+        m = statistics.fmean(vals)
+        sd = statistics.pstdev(vals)
+        stats[f] = (m, sd if sd > 0 else None, len(vals))
+
+    z_per_symbol: dict[str, dict[str, float]] = {}
+    for sym, d in raw.items():
+        zs: dict[str, float] = {}
+        for f in factors:
+            val = d.get(f)
+            m, sd, _ = stats.get(f, (None, None, 0))
+            if val is None or m is None or sd is None:
+                continue
+            zs[f] = (val - m) / sd
+        z_per_symbol[sym] = zs
+
+    return z_per_symbol, stats
+
+
+def _aggregate_exposure(
+    weights: dict[str, float],
+    z_per_symbol: dict[str, dict[str, float]],
+    factors: list[str],
+) -> tuple[dict[str, float], dict[str, list[dict]]]:
+    """Position-weighted aggregation across holdings.
+
+    Returns:
+        exposures: {factor: weighted_avg_z}
+        contributors: {factor: [{symbol, weight, z, contribution_pct}, ...]} top 5
+    """
+    exposures: dict[str, float] = {}
+    contributors: dict[str, list[dict]] = {}
+
+    for f in factors:
+        # Renormalize weights across symbols that actually have data for this factor.
+        # Otherwise a NULL z drags the average toward zero.
+        usable = [(s, w) for s, w in weights.items() if f in z_per_symbol.get(s, {})]
+        if not usable:
+            continue
+        wsum = sum(w for _, w in usable)
+        if wsum <= 0:
+            continue
+        exposure = sum((w / wsum) * z_per_symbol[s][f] for s, w in usable)
+        exposures[f] = exposure
+
+        # Top contributors by |signed contribution| (w/wsum × z)
+        contribs = []
+        for s, w in usable:
+            z = z_per_symbol[s][f]
+            contrib = (w / wsum) * z
+            contribs.append((s, w, z, contrib))
+        contribs.sort(key=lambda t: abs(t[3]), reverse=True)
+        contributors[f] = [
+            {
+                "symbol": s,
+                "weight": round(w, 4),
+                "z": round(z, 3),
+                "contribution_pct": round(100 * (contrib / exposure) if exposure else 0, 1),
+            }
+            for (s, w, z, contrib) in contribs[:5]
+        ]
+
+    return exposures, contributors
+
+
+def _roll_up_bets(exposures: dict[str, float]) -> dict[str, float]:
+    """Roll up per-factor z-scores into per-category 'bet' scores.
+
+    Sign-flips factors with direction='lower' so + always means MORE of the
+    category bet (e.g., -pe contributes positively to 'value' bet).
+    """
+    bets: dict[str, float] = {}
+    for cat, factors in CANONICAL_FACTORS.items():
+        signed: list[float] = []
+        for col, direction in factors:
+            if col not in exposures:
+                continue
+            sign = 1.0 if direction == "higher" else -1.0
+            signed.append(sign * exposures[col])
+        if signed:
+            bets[cat] = sum(signed) / len(signed)
+    return bets
+
+
+def _concentration_stats(weights: dict[str, float]) -> dict[str, float]:
+    """Herfindahl + effective N + max position."""
+    if not weights:
+        return {}
+    ws = list(weights.values())
+    herfindahl = sum(w * w for w in ws)
+    return {
+        "n_positions": len(ws),
+        "max_single_position_pct": round(max(ws), 4),
+        "herfindahl": round(herfindahl, 4),
+        "effective_n_positions": round(1.0 / herfindahl, 2) if herfindahl > 0 else 0,
+    }
+
+
+@tool(
+    "analyze_portfolio_exposures",
+    "Decompose a portfolio's actual factor exposures — what bets the realized "
+    "holdings express, not just what the screening rules intended.\n\n"
+    "Unlike analyze_factor_library (which describes the universe), this tool "
+    "introspects YOUR portfolio: position-weighted z-scores across momentum, "
+    "value, quality, growth, yield, sentiment. Useful for:\n"
+    "  - sanity-check that the screen produced the bets you intended\n"
+    "  - detect hidden tilts (size, momentum, vol leakage from correlated screens)\n"
+    "  - compare two sleeves to see if they overlap in factor space\n"
+    "  - attribute eval-window losses to factor moves\n\n"
+    "Inputs (provide EITHER experiment_id OR positions+as_of_date):\n"
+    "  experiment_id:  hash from history header ([id: 50e63c54f604]). Holdings\n"
+    "                  reconstructed from trade log; as_of_date defaults to\n"
+    "                  experiment.backtest_end if not given.\n"
+    "  positions:      {symbol: weight} dict, weights need not sum to 1 (renormalized)\n"
+    "  as_of_date:     YYYY-MM-DD (required if using positions)\n\n"
+    "Returns:\n"
+    "  exposures: per-factor sector-relative AND full-universe z-scores\n"
+    "  bet_summary: rolled-up per-category 'bet' (sign-corrected so + = more of bet)\n"
+    "  top_contributors: which 1-5 names drive each factor tilt\n"
+    "  concentration: herfindahl, effective N, max position\n\n"
+    "Interpretation of z-scores:\n"
+    "  |z| < 0.3   neutral, no real bet on this factor\n"
+    "  0.3-1.0     mild tilt\n"
+    "  1.0-2.0     strong, deliberate bet\n"
+    "  > 2.0       aggressive concentration",
+    {"experiment_id": str, "positions": dict, "as_of_date": str,
+     "sector": str, "factors": list},
+)
+async def analyze_portfolio_exposures_tool(args: dict[str, Any]) -> dict[str, Any]:
+    experiment_id = (args.get("experiment_id") or "").strip()
+    positions = args.get("positions") or {}
+    as_of_date = args.get("as_of_date")
+    sector_arg = args.get("sector") or _SECTOR
+    factor_arg = args.get("factors")
+
+    factors = factor_arg if isinstance(factor_arg, list) and factor_arg else CANONICAL_FACTOR_COLUMNS
+
+    # Resolve holdings
+    if experiment_id:
+        weights, resolved_date, err = _resolve_experiment_holdings(experiment_id, as_of_date)
+        if err:
+            return {"content": [{"type": "text", "text": json.dumps({"error": err})}]}
+        as_of_date = resolved_date
+    elif positions and as_of_date:
+        if not isinstance(positions, dict):
+            return {"content": [{"type": "text", "text": json.dumps({"error": "positions must be {symbol: weight}"})}]}
+        total = sum(float(v) for v in positions.values())
+        if total <= 0:
+            return {"content": [{"type": "text", "text": json.dumps({"error": "positions weights sum to 0"})}]}
+        weights = {s: float(v) / total for s, v in positions.items()}
+        # Snap as_of_date to trading day
+        mkt = _market_db()
+        snapped = _resolve_trading_date(mkt, as_of_date)
+        mkt.close()
+        if not snapped:
+            return {"content": [{"type": "text", "text": json.dumps({"error": f"no market data on/before {as_of_date}"})}]}
+        as_of_date = snapped
+    else:
+        return {"content": [{"type": "text", "text": json.dumps({"error": "Provide either experiment_id, or positions + as_of_date"})}]}
+
+    holding_symbols = sorted(weights.keys())
+
+    # Resolve sector for sector-relative comparison
+    mkt = _market_db()
+    if sector_arg:
+        sector = sector_arg
+    else:
+        # Infer from the modal sector of the holdings
+        ph = ",".join("?" * len(holding_symbols))
+        srows = mkt.execute(
+            f"SELECT sector, COUNT(*) c FROM universe_profiles "
+            f"WHERE symbol IN ({ph}) GROUP BY sector ORDER BY c DESC LIMIT 1",
+            holding_symbols,
+        ).fetchall()
+        sector = srows[0]["sector"] if srows else None
+
+    sector_universe: list[str] | None = None
+    if sector:
+        urows = mkt.execute(
+            "SELECT symbol FROM universe_profiles WHERE sector = ?", (sector,)
+        ).fetchall()
+        sector_universe = sorted({r["symbol"] for r in urows})
+
+    # Compute z-scores both ways
+    z_sector, stats_sector = ({}, {})
+    if sector_universe and len(sector_universe) >= 5:
+        z_sector, stats_sector = _compute_zscores(mkt, as_of_date, factors, sector_universe)
+
+    z_full, stats_full = _compute_zscores(mkt, as_of_date, factors, None)
+    mkt.close()
+
+    # Aggregate (twice — once per z-frame)
+    exposures_sector, contributors_sector = _aggregate_exposure(weights, z_sector, factors) if z_sector else ({}, {})
+    exposures_full, contributors_full = _aggregate_exposure(weights, z_full, factors)
+
+    bet_summary_sector = _roll_up_bets(exposures_sector) if exposures_sector else {}
+    bet_summary_full = _roll_up_bets(exposures_full)
+
+    # Build factors block — pair sector + full z per factor
+    factors_block: dict[str, dict] = {}
+    for f in factors:
+        cat, direction = FACTOR_META.get(f, ("custom", "higher"))
+        entry: dict[str, Any] = {
+            "category": cat,
+            "direction": "higher = more of factor" if direction == "higher" else "lower = more of named bet (sign-flipped in bet_summary)",
+        }
+        if f in exposures_sector:
+            entry["z_sector"] = round(exposures_sector[f], 3)
+        if f in exposures_full:
+            entry["z_universe"] = round(exposures_full[f], 3)
+        if f in contributors_sector:
+            entry["top_contributors_sector"] = contributors_sector[f]
+        elif f in contributors_full:
+            entry["top_contributors_universe"] = contributors_full[f]
+        # Only include factors with at least one z computed
+        if "z_sector" in entry or "z_universe" in entry:
+            factors_block[f] = entry
+
+    result = {
+        "as_of_date": as_of_date,
+        "sector": sector,
+        "n_positions": len(weights),
+        "weights": {s: round(w, 4) for s, w in sorted(weights.items(), key=lambda kv: -kv[1])},
+        "factors": factors_block,
+        "bet_summary": {
+            "sector_relative": {k: round(v, 3) for k, v in bet_summary_sector.items()},
+            "universe": {k: round(v, 3) for k, v in bet_summary_full.items()},
+        },
+        "concentration": _concentration_stats(weights),
+        "diagnostics": {
+            "factor_coverage": {f: stats_full[f][2] for f in factors if f in stats_full},
+            "sector_universe_size": len(sector_universe) if sector_universe else 0,
+        },
     }
     return {"content": [{"type": "text", "text": json.dumps(result, default=str)}]}
 
