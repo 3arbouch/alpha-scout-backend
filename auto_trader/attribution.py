@@ -47,6 +47,8 @@ from auto_trader.tools import (
     _resolve_trading_date,
 )
 from auto_trader.schema import get_db
+from auto_trader.factor_returns import compute_factor_returns_adhoc
+from auto_trader.universe import resolve_experiment_universe
 
 
 KAPPA_DEFAULT: dict[str, float] = {f: 1.0 for f in CANONICAL_FACTOR_COLUMNS}
@@ -102,48 +104,9 @@ def _period_factor_log_returns(market_conn: sqlite3.Connection,
     return cum_log, n_days
 
 
-# Concentration threshold for single-sector attribution. If the modal sector
-# of holdings carries ≥ this share of weight, attribute against that sector's
-# factor returns (and sector-relative z-scores). Else use 'all'.
-SECTOR_CONCENTRATION_FOR_SECTOR_ATTRIB = 0.80
-
-
-def _resolve_attribution_universe(weights: dict[str, float],
-                                   market_conn: sqlite3.Connection,
-                                   ) -> tuple[str, list[str] | None]:
-    """Pick (universe_id, universe_symbols) for attribution.
-
-    - If holdings are concentrated (≥80% by weight) in one sector, use that
-      sector's factor returns + the sector's symbols for z-score computation.
-    - Else use 'all' (broad market) — and z-scores against the full
-      features_daily universe.
-    """
-    if not weights:
-        return "all", None
-    syms = sorted(weights.keys())
-    ph = ",".join("?" * len(syms))
-    rows = market_conn.execute(
-        f"SELECT symbol, sector FROM universe_profiles WHERE symbol IN ({ph})",
-        syms,
-    ).fetchall()
-    sym_sector = {r["symbol"]: r["sector"] for r in rows}
-    sector_weight: dict[str, float] = {}
-    for sym, w in weights.items():
-        sec = sym_sector.get(sym)
-        if not sec:
-            continue
-        sector_weight[sec] = sector_weight.get(sec, 0.0) + w
-    if not sector_weight:
-        return "all", None
-    top_sector, top_w = max(sector_weight.items(), key=lambda kv: kv[1])
-    if top_w >= SECTOR_CONCENTRATION_FOR_SECTOR_ATTRIB:
-        # Sector universe = all symbols in that sector in features_daily, not
-        # just the portfolio's holdings (we want the broad sector-relative z).
-        urows = market_conn.execute(
-            "SELECT symbol FROM universe_profiles WHERE sector = ?", (top_sector,)
-        ).fetchall()
-        return top_sector, sorted({r["symbol"] for r in urows})
-    return "all", None
+# Universe resolution is delegated to auto_trader.universe — driven by the
+# strategy's declared config, not realized holdings. See that module for the
+# decision tree.
 
 
 def _position_weighted_exposure(weights: dict[str, float],
@@ -234,10 +197,12 @@ def compute_attribution(experiment_id: str,
             mkt.close()
             return {"error": f"could not reconstruct holdings: {err}"}
 
-    # Pick attribution universe based on holdings concentration. Sector if a
-    # single sector carries ≥80% of weight; else 'all'. Same universe is used
-    # for both sides of c_f = z_f × R_f so they're consistent.
-    universe_id, universe_symbols = _resolve_attribution_universe(weights, mkt)
+    # Pick attribution universe from the strategy's DECLARED config (not
+    # realized holdings). Same universe is used for both sides of
+    # c_f = z_f × R_f so they're consistent.
+    universe_id, universe_symbols, sleeve_kinds = resolve_experiment_universe(
+        experiment_id, mkt,
+    )
 
     z_per_symbol, z_stats = _compute_zscores(
         mkt, snap_date, CANONICAL_FACTOR_COLUMNS,
@@ -249,9 +214,17 @@ def compute_attribution(experiment_id: str,
 
     exposures = _position_weighted_exposure(weights, z_per_symbol, CANONICAL_FACTOR_COLUMNS)
 
-    factor_returns_log, factor_n_days = _period_factor_log_returns(
-        mkt, start, end, CANONICAL_FACTOR_COLUMNS, universe_id=universe_id,
-    )
+    # Factor-return lookup:
+    #   - 'all' / sector → precomputed table (fast)
+    #   - 'custom'       → on-the-fly compute against exact symbol set
+    if universe_id == "custom":
+        factor_returns_log, factor_n_days = compute_factor_returns_adhoc(
+            mkt, universe_symbols, start, end,
+        )
+    else:
+        factor_returns_log, factor_n_days = _period_factor_log_returns(
+            mkt, start, end, CANONICAL_FACTOR_COLUMNS, universe_id=universe_id,
+        )
     mkt.close()
 
     # ---- annualization scale ----
@@ -316,12 +289,16 @@ def compute_attribution(experiment_id: str,
         "residual_ann_pp": round(residual_log / years, 4),
         "fraction_explained": round(fraction_explained, 4),
         "attribution_universe": universe_id,
+        "attribution_universe_size": (len(universe_symbols) if universe_symbols
+                                       else None),
         "diagnostics": {
             "kappa_calibrated": False,
             "exposure_snapshot_policy": "window_midpoint",
             "lhs": f"log(1+r_p) - log(1+r_{bench_label})",
             "z_score_universe": universe_id,
             "factor_return_universe": universe_id,
+            "factor_return_path": "adhoc" if universe_id == "custom" else "precomputed",
+            "sleeve_universe_kinds": sleeve_kinds,
             "factor_coverage": {f: z_stats[f][2] for f in CANONICAL_FACTOR_COLUMNS if f in z_stats},
         },
     }

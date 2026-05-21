@@ -1086,26 +1086,46 @@ async def analyze_portfolio_exposures_tool(args: dict[str, Any]) -> dict[str, An
 
     holding_symbols = sorted(weights.keys())
 
-    # Resolve sector for sector-relative comparison
+    # Resolve the reference universe for the "declared" z-score comparison.
+    # Priority:
+    #   1. explicit `sector` argument from the caller (escape hatch)
+    #   2. strategy's declared eligible universe (single source of truth)
+    #   3. modal sector of the holdings (legacy fallback)
     mkt = _market_db()
+    sector: str | None = None
+    sector_universe: list[str] | None = None
+    declared_universe_label: str | None = None
+
     if sector_arg:
         sector = sector_arg
-    else:
-        # Infer from the modal sector of the holdings
+        urows = mkt.execute(
+            "SELECT symbol FROM universe_profiles WHERE sector = ?", (sector,)
+        ).fetchall()
+        sector_universe = sorted({r["symbol"] for r in urows})
+        declared_universe_label = sector
+    elif experiment_id:
+        from auto_trader.universe import resolve_experiment_universe
+        uid, syms, _kinds = resolve_experiment_universe(experiment_id, mkt)
+        if uid != "all" and syms:
+            sector_universe = syms
+            declared_universe_label = uid  # sector name or 'custom'
+            sector = uid if uid != "custom" else None
+
+    if not sector_universe:
+        # Last-resort fallback: modal sector of holdings
         ph = ",".join("?" * len(holding_symbols))
         srows = mkt.execute(
             f"SELECT sector, COUNT(*) c FROM universe_profiles "
             f"WHERE symbol IN ({ph}) GROUP BY sector ORDER BY c DESC LIMIT 1",
             holding_symbols,
         ).fetchall()
-        sector = srows[0]["sector"] if srows else None
-
-    sector_universe: list[str] | None = None
-    if sector:
-        urows = mkt.execute(
-            "SELECT symbol FROM universe_profiles WHERE sector = ?", (sector,)
-        ).fetchall()
-        sector_universe = sorted({r["symbol"] for r in urows})
+        if srows:
+            sector = srows[0]["sector"]
+            urows = mkt.execute(
+                "SELECT symbol FROM universe_profiles WHERE sector = ?", (sector,)
+            ).fetchall()
+            sector_universe = sorted({r["symbol"] for r in urows})
+            declared_universe_label = f"inferred:{sector}"
 
     # Compute z-scores both ways
     z_sector, stats_sector = ({}, {})
@@ -1145,6 +1165,7 @@ async def analyze_portfolio_exposures_tool(args: dict[str, Any]) -> dict[str, An
     result = {
         "as_of_date": as_of_date,
         "sector": sector,
+        "declared_universe": declared_universe_label,
         "n_positions": len(weights),
         "weights": {s: round(w, 4) for s, w in sorted(weights.items(), key=lambda kv: -kv[1])},
         "factors": factors_block,
@@ -1155,7 +1176,12 @@ async def analyze_portfolio_exposures_tool(args: dict[str, Any]) -> dict[str, An
         "concentration": _concentration_stats(weights),
         "diagnostics": {
             "factor_coverage": {f: stats_full[f][2] for f in factors if f in stats_full},
-            "sector_universe_size": len(sector_universe) if sector_universe else 0,
+            "declared_universe_size": len(sector_universe) if sector_universe else 0,
+            "declared_universe_source": (
+                "explicit_sector" if sector_arg
+                else "strategy_config" if declared_universe_label and not declared_universe_label.startswith("inferred:")
+                else "inferred_modal_sector"
+            ),
         },
     }
     return {"content": [{"type": "text", "text": json.dumps(result, default=str)}]}

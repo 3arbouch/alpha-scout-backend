@@ -32,29 +32,19 @@ from pathlib import Path
 
 import numpy as np
 
+# Shared compute kernel (also used by attribution's on-the-fly path).
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from auto_trader.factor_returns import (
+    CANONICAL_FACTORS,
+    FACTOR_DIRECTION,
+    compute_spread_for_date,
+    load_factor_panel,
+    load_forward_returns,
+)
 
-CANONICAL_FACTORS: list[str] = [
-    "ret_12_1m", "ret_3m", "ret_1m",
-    "pe", "ev_ebitda",
-    "fcf_yield",
-    "rev_yoy", "eps_yoy", "rev_yoy_accel",
-    "roe", "gross_margin", "debt_to_equity",
-    "analyst_net_upgrades_90d",
-]
-
-# Direction: "lower" factors flip sign so Q5−Q1 represents "the named bet pays."
-FACTOR_DIRECTION: dict[str, str] = {
-    "ret_12_1m": "higher", "ret_3m": "higher", "ret_1m": "higher",
-    "pe": "lower", "ev_ebitda": "lower",
-    "fcf_yield": "higher",
-    "rev_yoy": "higher", "eps_yoy": "higher", "rev_yoy_accel": "higher",
-    "roe": "higher", "gross_margin": "higher", "debt_to_equity": "lower",
-    "analyst_net_upgrades_90d": "higher",
-}
 
 MIN_SYMBOLS_PER_DATE = 50           # for the broad 'all' universe
 MIN_SYMBOLS_PER_DATE_SECTOR = 20    # sector universes are smaller (20-90 names)
-N_BUCKETS = 5
 
 # The 11 GICS-aligned sectors we precompute against, plus 'all' for the
 # multi-sector / broad-market case. Sector names match `universe_profiles.sector`.
@@ -93,114 +83,6 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def _load_forward_returns(conn: sqlite3.Connection, since: str | None
-                          ) -> dict[tuple[str, str], float]:
-    """Return {(date, symbol): fwd_ret_pp}. Computes next-trading-day return
-    per-symbol (handles delisting/IPO gaps cleanly because each symbol uses
-    its own next available trading day)."""
-    where = "WHERE date >= ?" if since else ""
-    args = (since,) if since else ()
-    rows = conn.execute(
-        f"SELECT symbol, date, close FROM prices {where} "
-        f"ORDER BY symbol, date",
-        args,
-    ).fetchall()
-    fwd: dict[tuple[str, str], float] = {}
-    if not rows:
-        return fwd
-    cur_sym = None
-    buf: list[tuple[str, float]] = []  # (date, close) for current symbol
-    for sym, d, c in rows:
-        if sym != cur_sym:
-            _flush_fwd(buf, cur_sym, fwd)
-            cur_sym = sym
-            buf = []
-        if c is not None and c > 0:
-            buf.append((d, float(c)))
-    _flush_fwd(buf, cur_sym, fwd)
-    return fwd
-
-
-def _flush_fwd(buf: list[tuple[str, float]], sym: str | None,
-               fwd: dict[tuple[str, str], float]) -> None:
-    if not sym or len(buf) < 2:
-        return
-    for i in range(len(buf) - 1):
-        d, c0 = buf[i]
-        _, c1 = buf[i + 1]
-        fwd[(d, sym)] = (c1 / c0 - 1.0) * 100.0
-
-
-def _load_factor_panel(conn: sqlite3.Connection, since: str | None
-                       ) -> dict[str, dict[str, dict[str, float]]]:
-    """Return panel[factor][date][symbol] = factor_value."""
-    where = "WHERE date >= ?" if since else ""
-    args = (since,) if since else ()
-    fcols = ", ".join(CANONICAL_FACTORS)
-    rows = conn.execute(
-        f"SELECT date, symbol, {fcols} FROM features_daily {where}",
-        args,
-    ).fetchall()
-    panel: dict[str, dict[str, dict[str, float]]] = {f: {} for f in CANONICAL_FACTORS}
-    for row in rows:
-        d, sym = row[0], row[1]
-        for i, f in enumerate(CANONICAL_FACTORS, start=2):
-            v = row[i]
-            if v is None:
-                continue
-            try:
-                vf = float(v)
-            except (TypeError, ValueError):
-                continue
-            if not np.isfinite(vf):
-                continue
-            panel[f].setdefault(d, {})[sym] = vf
-    return panel
-
-
-def _compute_spread_for_date(values_by_symbol: dict[str, float],
-                              fwd_by_symbol: dict[tuple[str, str], float],
-                              date: str, direction: str,
-                              min_symbols: int = MIN_SYMBOLS_PER_DATE,
-                              symbol_filter: set[str] | None = None,
-                              ) -> tuple[float, float, float, int] | None:
-    """Return (spread_pp, q1_mean, q5_mean, n_symbols) or None if insufficient.
-
-    `symbol_filter` restricts ranking to that subset (used for per-sector runs).
-    """
-    pairs: list[tuple[float, float]] = []
-    for sym, v in values_by_symbol.items():
-        if symbol_filter is not None and sym not in symbol_filter:
-            continue
-        ret = fwd_by_symbol.get((date, sym))
-        if ret is None:
-            continue
-        pairs.append((v, ret))
-    n = len(pairs)
-    if n < min_symbols:
-        return None
-
-    arr = np.array(pairs, dtype=np.float64)  # cols: factor_value, fwd_ret
-    factor_vals = arr[:, 0]
-    fwd_vals = arr[:, 1]
-
-    # Equal-count quintile assignment via argsort. Ties: stable sort, then
-    # split — bucket counts may differ by 1 across buckets.
-    order = np.argsort(factor_vals, kind="stable")
-    sorted_returns = fwd_vals[order]
-    edges = np.linspace(0, n, N_BUCKETS + 1, dtype=int)
-    q1 = sorted_returns[edges[0]:edges[1]]
-    q5 = sorted_returns[edges[N_BUCKETS - 1]:edges[N_BUCKETS]]
-    if q1.size == 0 or q5.size == 0:
-        return None
-    q1_mean = float(q1.mean())
-    q5_mean = float(q5.mean())
-    spread = q5_mean - q1_mean
-    if direction == "lower":
-        spread = -spread
-    return spread, q1_mean, q5_mean, n
-
-
 def _load_sector_symbols(conn: sqlite3.Connection) -> dict[str, set[str]]:
     """{sector: {symbols}} for the 11 sector universes."""
     out: dict[str, set[str]] = {}
@@ -229,7 +111,7 @@ def _compute_all_spreads(panel, fwd, universe_id: str,
             continue
         kept = 0
         for date, values_by_symbol in dates_for_factor.items():
-            result = _compute_spread_for_date(
+            result = compute_spread_for_date(
                 values_by_symbol, fwd, date, direction,
                 min_symbols=min_symbols, symbol_filter=symbol_filter,
             )
@@ -295,10 +177,10 @@ def main() -> None:
 
     _ensure_schema(conn)
     print("loading forward returns...")
-    fwd = _load_forward_returns(conn, args.since)
+    fwd = load_forward_returns(conn, since=args.since)
     print(f"  {len(fwd):,} (date, symbol) fwd-ret cells")
     print("loading factor panel...")
-    panel = _load_factor_panel(conn, args.since)
+    panel = load_factor_panel(conn, since=args.since)
     print(f"  factor coverage: " +
           ", ".join(f"{f}={len(panel[f])}d" for f in CANONICAL_FACTORS[:3]) + ", ...")
 
