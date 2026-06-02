@@ -1086,26 +1086,46 @@ async def analyze_portfolio_exposures_tool(args: dict[str, Any]) -> dict[str, An
 
     holding_symbols = sorted(weights.keys())
 
-    # Resolve sector for sector-relative comparison
+    # Resolve the reference universe for the "declared" z-score comparison.
+    # Priority:
+    #   1. explicit `sector` argument from the caller (escape hatch)
+    #   2. strategy's declared eligible universe (single source of truth)
+    #   3. modal sector of the holdings (legacy fallback)
     mkt = _market_db()
+    sector: str | None = None
+    sector_universe: list[str] | None = None
+    declared_universe_label: str | None = None
+
     if sector_arg:
         sector = sector_arg
-    else:
-        # Infer from the modal sector of the holdings
+        urows = mkt.execute(
+            "SELECT symbol FROM universe_profiles WHERE sector = ?", (sector,)
+        ).fetchall()
+        sector_universe = sorted({r["symbol"] for r in urows})
+        declared_universe_label = sector
+    elif experiment_id:
+        from auto_trader.universe import resolve_experiment_universe
+        uid, syms, _kinds = resolve_experiment_universe(experiment_id, mkt)
+        if uid != "all" and syms:
+            sector_universe = syms
+            declared_universe_label = uid  # sector name or 'custom'
+            sector = uid if uid != "custom" else None
+
+    if not sector_universe:
+        # Last-resort fallback: modal sector of holdings
         ph = ",".join("?" * len(holding_symbols))
         srows = mkt.execute(
             f"SELECT sector, COUNT(*) c FROM universe_profiles "
             f"WHERE symbol IN ({ph}) GROUP BY sector ORDER BY c DESC LIMIT 1",
             holding_symbols,
         ).fetchall()
-        sector = srows[0]["sector"] if srows else None
-
-    sector_universe: list[str] | None = None
-    if sector:
-        urows = mkt.execute(
-            "SELECT symbol FROM universe_profiles WHERE sector = ?", (sector,)
-        ).fetchall()
-        sector_universe = sorted({r["symbol"] for r in urows})
+        if srows:
+            sector = srows[0]["sector"]
+            urows = mkt.execute(
+                "SELECT symbol FROM universe_profiles WHERE sector = ?", (sector,)
+            ).fetchall()
+            sector_universe = sorted({r["symbol"] for r in urows})
+            declared_universe_label = f"inferred:{sector}"
 
     # Compute z-scores both ways
     z_sector, stats_sector = ({}, {})
@@ -1145,6 +1165,7 @@ async def analyze_portfolio_exposures_tool(args: dict[str, Any]) -> dict[str, An
     result = {
         "as_of_date": as_of_date,
         "sector": sector,
+        "declared_universe": declared_universe_label,
         "n_positions": len(weights),
         "weights": {s: round(w, 4) for s, w in sorted(weights.items(), key=lambda kv: -kv[1])},
         "factors": factors_block,
@@ -1155,10 +1176,78 @@ async def analyze_portfolio_exposures_tool(args: dict[str, Any]) -> dict[str, An
         "concentration": _concentration_stats(weights),
         "diagnostics": {
             "factor_coverage": {f: stats_full[f][2] for f in factors if f in stats_full},
-            "sector_universe_size": len(sector_universe) if sector_universe else 0,
+            "declared_universe_size": len(sector_universe) if sector_universe else 0,
+            "declared_universe_source": (
+                "explicit_sector" if sector_arg
+                else "strategy_config" if declared_universe_label and not declared_universe_label.startswith("inferred:")
+                else "inferred_modal_sector"
+            ),
         },
     }
     return {"content": [{"type": "text", "text": json.dumps(result, default=str)}]}
+
+
+@tool(
+    "recall_memo_items",
+    "Search the analyst's library of distilled claims from prior experiments "
+    "in this run. Returns forward-looking claims (predictions a future "
+    "experiment could falsify) by default — backward-looking observations "
+    "are excluded unless you set forward_looking_only=false.\n\n"
+    "Filters compose with AND. Defaults: this run, all kinds, forward-only, "
+    "non-falsified, ordered by promotion_count DESC.\n\n"
+    "Use this BEFORE designing a new iteration to surface insights you'd "
+    "otherwise rediscover the hard way (e.g. 'tight stops whipsaw on PAYC' "
+    "or 'macro gates + tight entry filters starve the book').\n\n"
+    "Args:\n"
+    "  experiment_id: only items extracted from this experiment.\n"
+    "  universe:      'global' or a sector slug. Auto-scopes to the session "
+    "sector if not set.\n"
+    "  kind:          one of {factor_observation, trade_pattern, "
+    "risk_observation, thesis_validation, regime_observation, anomaly}.\n"
+    "  scope_level:   'run' (default), 'universe', or 'global' — the "
+    "promotion-ladder level.\n"
+    "  forward_looking_only: default true.\n"
+    "  include_falsified:    default false.\n"
+    "  limit:                default 20, max 100.",
+    {"experiment_id": str, "universe": str, "kind": str,
+     "scope_level": str, "forward_looking_only": bool,
+     "include_falsified": bool, "limit": int},
+)
+async def recall_memo_items_tool(args: dict[str, Any]) -> dict[str, Any]:
+    from auto_trader.analyst import recall_memo_items
+    items = recall_memo_items(
+        run_id=_RUN_ID,
+        experiment_id=args.get("experiment_id") or None,
+        universe=args.get("universe") or _SECTOR,
+        kind=args.get("kind") or None,
+        scope_level=args.get("scope_level") or None,
+        forward_looking_only=args.get("forward_looking_only", True),
+        include_falsified=args.get("include_falsified", False),
+        limit=min(int(args.get("limit") or 20), 100),
+    )
+    return {"content": [{"type": "text", "text": json.dumps(
+        {"n_items": len(items), "items": items}, default=str)}]}
+
+
+@tool(
+    "read_memo",
+    "Read the full markdown post-mortem memo for a specific experiment. "
+    "Use when recall_memo_items surfaces an interesting claim and you want "
+    "the full context — the narrative around the claim, the numbers, the "
+    "thesis comparison.\n\n"
+    "Args:\n"
+    "  experiment_id: hash from a history header ([id: 50e63c54f604]) or "
+    "from a recall_memo_items result.",
+    {"experiment_id": str},
+)
+async def read_memo_tool(args: dict[str, Any]) -> dict[str, Any]:
+    from auto_trader.analyst import read_memo
+    eid = (args.get("experiment_id") or "").strip()
+    if not eid:
+        return {"content": [{"type": "text", "text": json.dumps(
+            {"error": "experiment_id required"})}]}
+    memo = read_memo(eid)
+    return {"content": [{"type": "text", "text": json.dumps(memo, default=str)}]}
 
 
 def create_auto_trader_tools(stop_date: str | None = None, sector: str | None = None,
