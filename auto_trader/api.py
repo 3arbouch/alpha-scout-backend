@@ -460,6 +460,7 @@ async def get_config():
             "end": "2024-12-31",
             "sector": None,
             "alpha_benchmark": "auto",
+            "include_analyst_notes": True,
         },
     }
 
