@@ -166,6 +166,9 @@ _custom_prompt = None
 # Explicit allowlist for this run. None means the API/CLI didn't supply one,
 # in which case we fall back to the full current catalog (CLI convenience).
 _allowed_tools: list[str] | None = None
+# When False, analyst notes are kept out of the agent's history context.
+# Memos are still generated; the agent just doesn't see them.
+_include_analyst_notes: bool = True
 
 
 def _resolve_allowed_mcp_tools() -> list[str]:
@@ -204,6 +207,7 @@ def _resolve_model_api_id(model_id: str) -> str:
         "sonnet": "claude-sonnet-4-6",
         "opus": "claude-opus-4-6",
         "opus-4-7": "claude-opus-4-7",
+        "opus-4-8": "claude-opus-4-8",
     }
     return mapping.get(model_id, model_id)
 
@@ -330,7 +334,8 @@ def _get_trade_summary(exp_id: str) -> dict | None:
 
 
 def build_history_context(run_id: str, target_metric: str, limit: int = 20,
-                          aggregator: str = "overall") -> str:
+                          aggregator: str = "overall",
+                          include_analyst_notes: bool = True) -> str:
     """Build full history of past experiments for the agent to learn from.
 
     Lessons convention: the `lessons` field stored on experiment row N is the
@@ -374,6 +379,27 @@ def build_history_context(run_id: str, target_metric: str, limit: int = 20,
     )
 
     lines = [f"## Past Experiments ({len(history)} most recent)\n"]
+    reflection_note = (
+        "- **Your reflection** — a free-text lesson you wrote at the start of "
+        "the next iteration. Your own narrative, not independently verified. "
+        "Only the 3 most-recently-written are shown (older self-reflections "
+        "are dropped to avoid anchoring on stale interpretations).\n"
+    )
+    if include_analyst_notes:
+        lines.append(
+            "Each experiment below carries two memory streams — treat them as "
+            "different kinds of evidence:\n"
+            + reflection_note +
+            "- **Analyst observations** — forward-looking claims extracted by an "
+            "independent post-trade analyst that reviewed the actual trade "
+            "ledger, realized P&L, NAV, and factor attribution after each "
+            "experiment. Third-party, data-grounded. The analyst sees what "
+            "actually happened in the books, not what your thesis predicted.\n"
+        )
+    else:
+        lines.append(
+            "Each experiment below carries a memory stream:\n" + reflection_note
+        )
     for exp in history_asc:
         status = "KEEP" if exp["decision"] == "keep" else "DISCARD"
         lines.append(f"### Experiment {exp['iteration']} [id: {exp['id']}] — {status}")
@@ -520,10 +546,19 @@ def build_history_context(run_id: str, target_metric: str, limit: int = 20,
         if lesson_pair is not None:
             writing_iter, lesson_text = lesson_pair
             lines.append(
-                f"**Lessons about Experiment {exp['iteration']} "
-                f"(written at start of iter {writing_iter}):**"
+                f"**Your reflection (written at start of iter {writing_iter}):**"
             )
             lines.append(lesson_text)
+
+        # Analyst observations for this specific experiment.
+        if include_analyst_notes:
+            try:
+                from auto_trader.analyst import render_memo_items_for_experiment
+                analyst_block = render_memo_items_for_experiment(exp["id"])
+                if analyst_block:
+                    lines.append(analyst_block)
+            except Exception:
+                pass
 
         lines.append("")
 
@@ -1067,7 +1102,8 @@ async def run_agent_iteration(
 
     # Build the prompt
     program = load_program()
-    history = build_history_context(run_id, target_metric, aggregator=target_aggregator)
+    history = build_history_context(run_id, target_metric, aggregator=target_aggregator,
+                                    include_analyst_notes=_include_analyst_notes)
 
     conditions_desc = ", ".join(
         f"{c['metric']} {c['operator']} {c['value']}" for c in conditions
@@ -1136,8 +1172,6 @@ You are researching as of {backtest_end}. You do not know what happens after thi
 - Form your thesis based only on data you query and patterns you observe within the allowed period
 - Pretend today is {backtest_end}
 
-Use the `query_market_data` tool for all data queries. Use `validate_portfolio` to check your config before outputting.
-
 {history}"""
 
     # Run the agent with skill discovery + query_market_data + validate_portfolio
@@ -1166,8 +1200,8 @@ Use the `query_market_data` tool for all data queries. Use `validate_portfolio` 
         permission_mode="acceptEdits",
         max_turns=50,
     )
-    # Opus 4.7 rejects the legacy thinking.type='enabled' shape the CLI
-    # defaults to. Force adaptive thinking for 4.7 only; leave other
+    # Opus 4.7+ reject the legacy thinking.type='enabled' shape the CLI
+    # defaults to. Force adaptive thinking for 4.7/4.8 only; leave other
     # models on their defaults so we don't alter working behavior.
     #
     # Note: Opus 4.7's thinking blocks return with empty `thinking` text
@@ -1177,7 +1211,7 @@ Use the `query_market_data` tool for all data queries. Use `validate_portfolio` 
     # `type` from this dict (see subprocess_cli.py:305-312) and the
     # bundled CLI binary has no --display flag. Until the SDK plumbs
     # this through, the value is not actually configurable here.
-    if resolved_model == "claude-opus-4-7":
+    if resolved_model in ("claude-opus-4-7", "claude-opus-4-8"):
         agent_opts["thinking"] = {"type": "adaptive"}
 
     try:
@@ -1424,6 +1458,20 @@ Use the `query_market_data` tool for all data queries. Use `validate_portfolio` 
     except Exception as e:
         print(f"  ⚠ Trade persist failed for {exp_id}: {e}")
 
+    # Auto-run the post-trade analyst. Failure is enrichment loss only — the
+    # experiment row + trades are already saved.
+    try:
+        from auto_trader.analyst import analyst_pass
+        analyst_result = await analyst_pass(exp_id)
+        if analyst_result.get("error"):
+            print(f"  ⚠ analyst_pass returned error for {exp_id}: {analyst_result['error']}")
+        else:
+            print(f"  📝 analyst: {analyst_result['n_items']} items, "
+                  f"{analyst_result['memo_chars']} chars, "
+                  f"{analyst_result['duration_seconds']}s")
+    except Exception as e:
+        print(f"  ⚠ analyst_pass failed for {exp_id}: {e}")
+
     print(f"  {target_metric}: {target_value:.4f}" if target_value else f"  {target_metric}: N/A")
     print(f"  Conditions met: {conditions_met}")
     for d in conditions_detail:
@@ -1498,6 +1546,9 @@ async def main():
                         help="How to reduce per-window metrics to the agent's optimization scalar. "
                              "Non-'overall' requires --eval-file. "
                              "Dispersion (stdev/iqr/range) is MINIMIZED; snr (mean/stdev) is maximized.")
+    parser.add_argument("--no-analyst-notes", action="store_true",
+                        help="Don't surface analyst notes in the agent's history context. "
+                             "Memos are still generated; the agent just doesn't see them.")
     args = parser.parse_args()
 
     # Load eval block from sidecar file.
@@ -1541,6 +1592,10 @@ async def main():
             print(f"--allowed-tools must be a JSON array of strings; got {parsed!r}")
             return
         _allowed_tools = parsed
+
+    if args.no_analyst_notes:
+        global _include_analyst_notes
+        _include_analyst_notes = False
 
     # Stop flag path
     stop_flag = PROJECT_ROOT / "auto_trader" / f".stop_{run_id}"
@@ -1617,6 +1672,19 @@ async def main():
                                            sleeve_label=sleeve["label"])
                 except Exception as e:
                     print(f"  ⚠ Trade persist failed for {exp_id}: {e}")
+
+                # Auto-run the post-trade analyst on the starting portfolio.
+                try:
+                    from auto_trader.analyst import analyst_pass
+                    analyst_result = await analyst_pass(exp_id)
+                    if analyst_result.get("error"):
+                        print(f"  ⚠ analyst_pass returned error for {exp_id}: {analyst_result['error']}")
+                    else:
+                        print(f"  📝 analyst: {analyst_result['n_items']} items, "
+                              f"{analyst_result['memo_chars']} chars, "
+                              f"{analyst_result['duration_seconds']}s")
+                except Exception as e:
+                    print(f"  ⚠ analyst_pass failed for {exp_id}: {e}")
 
                 if decision == "keep":
                     best_value = target_value

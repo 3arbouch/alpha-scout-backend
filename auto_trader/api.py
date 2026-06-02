@@ -31,7 +31,8 @@ AVAILABLE_MODELS = [
     {"id": "haiku", "name": "Claude Haiku 4.5", "api_id": "claude-haiku-4-5-20251001", "speed": "fast", "cost": "$1/$5 per MTok", "description": "Fastest. ~2-3 min per experiment. Good for quick experiments."},
     {"id": "sonnet", "name": "Claude Sonnet 4.6", "api_id": "claude-sonnet-4-6", "speed": "medium", "cost": "$3/$15 per MTok", "description": "Best balance of speed and quality. ~5-10 min per experiment."},
     {"id": "opus", "name": "Claude Opus 4.6", "api_id": "claude-opus-4-6", "speed": "slow", "cost": "$5/$25 per MTok", "description": "Most intelligent (4.6). ~10-20 min per experiment. Deepest research."},
-    {"id": "opus-4-7", "name": "Claude Opus 4.7", "api_id": "claude-opus-4-7", "speed": "slow", "cost": "$5/$25 per MTok", "description": "Latest Opus (4.7). Stronger reasoning than 4.6 at similar speed. Best for hardest research."},
+    {"id": "opus-4-7", "name": "Claude Opus 4.7", "api_id": "claude-opus-4-7", "speed": "slow", "cost": "$5/$25 per MTok", "description": "Opus 4.7. Stronger reasoning than 4.6 at similar speed."},
+    {"id": "opus-4-8", "name": "Claude Opus 4.8", "api_id": "claude-opus-4-8", "speed": "slow", "cost": "$5/$25 per MTok", "description": "Latest Opus (4.8). Best reasoning available. ~10-20 min per experiment. Best for hardest research."},
 ]
 
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -301,6 +302,7 @@ class CreateRunRequest(BaseModel):
     sector: str | None = Field(default=None, description="Restrict to a sector (e.g. 'Energy', 'Technology'). If set, data queries only return stocks in this sector.")
     alpha_benchmark: str = Field(default="auto", description="Benchmark for alpha: 'sector' (sector ETF), 'market' (SPY), 'auto' (sector if sector is set, else market)")
     starting_portfolio: dict | None = Field(default=None, description="Optional starting portfolio config.")
+    include_analyst_notes: bool = Field(default=True, description="Feed the post-trade analyst's notes to the trader agent in its history context. Memos are still generated either way (visible in the UI / analyst endpoint); this only controls whether the agent sees them.")
     # Walk-forward eval — both optional. Setting `eval` runs N+1 backtests per
     # iteration (training + each eval window). `target_aggregator != "overall"`
     # makes the agent climb the aggregated eval metric instead of the
@@ -459,6 +461,7 @@ async def get_config():
             "end": "2024-12-31",
             "sector": None,
             "alpha_benchmark": "auto",
+            "include_analyst_notes": True,
         },
     }
 
@@ -685,6 +688,7 @@ async def create_run(body: CreateRunRequest):
         "sector": body.sector,
         "alpha_benchmark": alpha_benchmark,
         "target_aggregator": body.target_aggregator,
+        "include_analyst_notes": body.include_analyst_notes,
     }
     if body.starting_portfolio:
         config["starting_portfolio"] = body.starting_portfolio
@@ -788,6 +792,8 @@ async def start_run(run_id: str, body: StartRunRequest = StartRunRequest()):
         cmd.extend(["--eval-file", str(eval_file)])
     if config.get("target_aggregator") and config["target_aggregator"] != "overall":
         cmd.extend(["--target-aggregator", config["target_aggregator"]])
+    if not config.get("include_analyst_notes", True):
+        cmd.append("--no-analyst-notes")
 
     # Spawn as background process
     env = os.environ.copy()
@@ -1354,6 +1360,42 @@ async def get_experiment_session(run_id: str, experiment_id: str):
 
     except Exception as e:
         raise HTTPException(500, f"Failed to read session: {e}")
+
+
+@router.get("/runs/{run_id}/experiments/{experiment_id}/analyst")
+async def get_experiment_analyst(run_id: str, experiment_id: str):
+    """Post-trade analyst memo + extracted items for an experiment.
+
+    Returns the markdown memo (one per experiment) and every memo_item — both
+    forward-looking and backward-looking, including falsified ones (with their
+    reason and the experiment that falsified them). Frontend can filter.
+
+    `memo` is null if the analyst hasn't reviewed this experiment yet.
+    """
+    conn = get_db()
+    exp_row = conn.execute(
+        "SELECT id FROM experiments WHERE id = ? AND run_id = ?",
+        (experiment_id, run_id),
+    ).fetchone()
+    conn.close()
+    if not exp_row:
+        raise HTTPException(404, f"Experiment '{experiment_id}' not found in run '{run_id}'")
+
+    from auto_trader.analyst import read_memo, recall_memo_items
+    memo_row = read_memo(experiment_id)
+    memo = None if memo_row.get("error") else memo_row
+    items = recall_memo_items(
+        experiment_id=experiment_id,
+        forward_looking_only=False,
+        include_falsified=True,
+        limit=500,
+    )
+    return {
+        "run_id": run_id,
+        "experiment_id": experiment_id,
+        "memo": memo,
+        "items": items,
+    }
 
 
 @router.get("/runs/{run_id}/prompt")
