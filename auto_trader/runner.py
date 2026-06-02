@@ -207,6 +207,7 @@ def _resolve_model_api_id(model_id: str) -> str:
         "sonnet": "claude-sonnet-4-6",
         "opus": "claude-opus-4-6",
         "opus-4-7": "claude-opus-4-7",
+        "opus-4-8": "claude-opus-4-8",
     }
     return mapping.get(model_id, model_id)
 
@@ -1199,8 +1200,8 @@ You are researching as of {backtest_end}. You do not know what happens after thi
         permission_mode="acceptEdits",
         max_turns=50,
     )
-    # Opus 4.7 rejects the legacy thinking.type='enabled' shape the CLI
-    # defaults to. Force adaptive thinking for 4.7 only; leave other
+    # Opus 4.7+ reject the legacy thinking.type='enabled' shape the CLI
+    # defaults to. Force adaptive thinking for 4.7/4.8 only; leave other
     # models on their defaults so we don't alter working behavior.
     #
     # Note: Opus 4.7's thinking blocks return with empty `thinking` text
@@ -1210,7 +1211,7 @@ You are researching as of {backtest_end}. You do not know what happens after thi
     # `type` from this dict (see subprocess_cli.py:305-312) and the
     # bundled CLI binary has no --display flag. Until the SDK plumbs
     # this through, the value is not actually configurable here.
-    if resolved_model == "claude-opus-4-7":
+    if resolved_model in ("claude-opus-4-7", "claude-opus-4-8"):
         agent_opts["thinking"] = {"type": "adaptive"}
 
     try:

@@ -31,7 +31,8 @@ AVAILABLE_MODELS = [
     {"id": "haiku", "name": "Claude Haiku 4.5", "api_id": "claude-haiku-4-5-20251001", "speed": "fast", "cost": "$1/$5 per MTok", "description": "Fastest. ~2-3 min per experiment. Good for quick experiments."},
     {"id": "sonnet", "name": "Claude Sonnet 4.6", "api_id": "claude-sonnet-4-6", "speed": "medium", "cost": "$3/$15 per MTok", "description": "Best balance of speed and quality. ~5-10 min per experiment."},
     {"id": "opus", "name": "Claude Opus 4.6", "api_id": "claude-opus-4-6", "speed": "slow", "cost": "$5/$25 per MTok", "description": "Most intelligent (4.6). ~10-20 min per experiment. Deepest research."},
-    {"id": "opus-4-7", "name": "Claude Opus 4.7", "api_id": "claude-opus-4-7", "speed": "slow", "cost": "$5/$25 per MTok", "description": "Latest Opus (4.7). Stronger reasoning than 4.6 at similar speed. Best for hardest research."},
+    {"id": "opus-4-7", "name": "Claude Opus 4.7", "api_id": "claude-opus-4-7", "speed": "slow", "cost": "$5/$25 per MTok", "description": "Opus 4.7. Stronger reasoning than 4.6 at similar speed."},
+    {"id": "opus-4-8", "name": "Claude Opus 4.8", "api_id": "claude-opus-4-8", "speed": "slow", "cost": "$5/$25 per MTok", "description": "Latest Opus (4.8). Best reasoning available. ~10-20 min per experiment. Best for hardest research."},
 ]
 
 PROJECT_ROOT = Path(__file__).parent.parent
