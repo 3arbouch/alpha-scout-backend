@@ -1187,6 +1187,69 @@ async def analyze_portfolio_exposures_tool(args: dict[str, Any]) -> dict[str, An
     return {"content": [{"type": "text", "text": json.dumps(result, default=str)}]}
 
 
+@tool(
+    "recall_memo_items",
+    "Search the analyst's library of distilled claims from prior experiments "
+    "in this run. Returns forward-looking claims (predictions a future "
+    "experiment could falsify) by default — backward-looking observations "
+    "are excluded unless you set forward_looking_only=false.\n\n"
+    "Filters compose with AND. Defaults: this run, all kinds, forward-only, "
+    "non-falsified, ordered by promotion_count DESC.\n\n"
+    "Use this BEFORE designing a new iteration to surface insights you'd "
+    "otherwise rediscover the hard way (e.g. 'tight stops whipsaw on PAYC' "
+    "or 'macro gates + tight entry filters starve the book').\n\n"
+    "Args:\n"
+    "  experiment_id: only items extracted from this experiment.\n"
+    "  universe:      'global' or a sector slug. Auto-scopes to the session "
+    "sector if not set.\n"
+    "  kind:          one of {factor_observation, trade_pattern, "
+    "risk_observation, thesis_validation, regime_observation, anomaly}.\n"
+    "  scope_level:   'run' (default), 'universe', or 'global' — the "
+    "promotion-ladder level.\n"
+    "  forward_looking_only: default true.\n"
+    "  include_falsified:    default false.\n"
+    "  limit:                default 20, max 100.",
+    {"experiment_id": str, "universe": str, "kind": str,
+     "scope_level": str, "forward_looking_only": bool,
+     "include_falsified": bool, "limit": int},
+)
+async def recall_memo_items_tool(args: dict[str, Any]) -> dict[str, Any]:
+    from auto_trader.analyst import recall_memo_items
+    items = recall_memo_items(
+        run_id=_RUN_ID,
+        experiment_id=args.get("experiment_id") or None,
+        universe=args.get("universe") or _SECTOR,
+        kind=args.get("kind") or None,
+        scope_level=args.get("scope_level") or None,
+        forward_looking_only=args.get("forward_looking_only", True),
+        include_falsified=args.get("include_falsified", False),
+        limit=min(int(args.get("limit") or 20), 100),
+    )
+    return {"content": [{"type": "text", "text": json.dumps(
+        {"n_items": len(items), "items": items}, default=str)}]}
+
+
+@tool(
+    "read_memo",
+    "Read the full markdown post-mortem memo for a specific experiment. "
+    "Use when recall_memo_items surfaces an interesting claim and you want "
+    "the full context — the narrative around the claim, the numbers, the "
+    "thesis comparison.\n\n"
+    "Args:\n"
+    "  experiment_id: hash from a history header ([id: 50e63c54f604]) or "
+    "from a recall_memo_items result.",
+    {"experiment_id": str},
+)
+async def read_memo_tool(args: dict[str, Any]) -> dict[str, Any]:
+    from auto_trader.analyst import read_memo
+    eid = (args.get("experiment_id") or "").strip()
+    if not eid:
+        return {"content": [{"type": "text", "text": json.dumps(
+            {"error": "experiment_id required"})}]}
+    memo = read_memo(eid)
+    return {"content": [{"type": "text", "text": json.dumps(memo, default=str)}]}
+
+
 def create_auto_trader_tools(stop_date: str | None = None, sector: str | None = None,
                              start_date: str | None = None, run_id: str | None = None,
                              allowed_tool_names: list[str] | None = None):

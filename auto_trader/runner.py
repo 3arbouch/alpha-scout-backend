@@ -374,6 +374,19 @@ def build_history_context(run_id: str, target_metric: str, limit: int = 20,
     )
 
     lines = [f"## Past Experiments ({len(history)} most recent)\n"]
+    lines.append(
+        "Each experiment below carries two memory streams — treat them as "
+        "different kinds of evidence:\n"
+        "- **Your reflection** — a free-text lesson you wrote at the start of "
+        "the next iteration. Your own narrative, not independently verified. "
+        "Only the 3 most-recently-written are shown (older self-reflections "
+        "are dropped to avoid anchoring on stale interpretations).\n"
+        "- **Analyst observations** — forward-looking claims extracted by an "
+        "independent post-trade analyst that reviewed the actual trade "
+        "ledger, realized P&L, NAV, and factor attribution after each "
+        "experiment. Third-party, data-grounded. The analyst sees what "
+        "actually happened in the books, not what your thesis predicted.\n"
+    )
     for exp in history_asc:
         status = "KEEP" if exp["decision"] == "keep" else "DISCARD"
         lines.append(f"### Experiment {exp['iteration']} [id: {exp['id']}] — {status}")
@@ -520,10 +533,18 @@ def build_history_context(run_id: str, target_metric: str, limit: int = 20,
         if lesson_pair is not None:
             writing_iter, lesson_text = lesson_pair
             lines.append(
-                f"**Lessons about Experiment {exp['iteration']} "
-                f"(written at start of iter {writing_iter}):**"
+                f"**Your reflection (written at start of iter {writing_iter}):**"
             )
             lines.append(lesson_text)
+
+        # Analyst observations for this specific experiment.
+        try:
+            from auto_trader.analyst import render_memo_items_for_experiment
+            analyst_block = render_memo_items_for_experiment(exp["id"])
+            if analyst_block:
+                lines.append(analyst_block)
+        except Exception:
+            pass
 
         lines.append("")
 
@@ -1422,6 +1443,20 @@ You are researching as of {backtest_end}. You do not know what happens after thi
     except Exception as e:
         print(f"  ⚠ Trade persist failed for {exp_id}: {e}")
 
+    # Auto-run the post-trade analyst. Failure is enrichment loss only — the
+    # experiment row + trades are already saved.
+    try:
+        from auto_trader.analyst import analyst_pass
+        analyst_result = await analyst_pass(exp_id)
+        if analyst_result.get("error"):
+            print(f"  ⚠ analyst_pass returned error for {exp_id}: {analyst_result['error']}")
+        else:
+            print(f"  📝 analyst: {analyst_result['n_items']} items, "
+                  f"{analyst_result['memo_chars']} chars, "
+                  f"{analyst_result['duration_seconds']}s")
+    except Exception as e:
+        print(f"  ⚠ analyst_pass failed for {exp_id}: {e}")
+
     print(f"  {target_metric}: {target_value:.4f}" if target_value else f"  {target_metric}: N/A")
     print(f"  Conditions met: {conditions_met}")
     for d in conditions_detail:
@@ -1615,6 +1650,19 @@ async def main():
                                            sleeve_label=sleeve["label"])
                 except Exception as e:
                     print(f"  ⚠ Trade persist failed for {exp_id}: {e}")
+
+                # Auto-run the post-trade analyst on the starting portfolio.
+                try:
+                    from auto_trader.analyst import analyst_pass
+                    analyst_result = await analyst_pass(exp_id)
+                    if analyst_result.get("error"):
+                        print(f"  ⚠ analyst_pass returned error for {exp_id}: {analyst_result['error']}")
+                    else:
+                        print(f"  📝 analyst: {analyst_result['n_items']} items, "
+                              f"{analyst_result['memo_chars']} chars, "
+                              f"{analyst_result['duration_seconds']}s")
+                except Exception as e:
+                    print(f"  ⚠ analyst_pass failed for {exp_id}: {e}")
 
                 if decision == "keep":
                     best_value = target_value

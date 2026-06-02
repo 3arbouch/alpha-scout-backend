@@ -1356,6 +1356,42 @@ async def get_experiment_session(run_id: str, experiment_id: str):
         raise HTTPException(500, f"Failed to read session: {e}")
 
 
+@router.get("/runs/{run_id}/experiments/{experiment_id}/analyst")
+async def get_experiment_analyst(run_id: str, experiment_id: str):
+    """Post-trade analyst memo + extracted items for an experiment.
+
+    Returns the markdown memo (one per experiment) and every memo_item — both
+    forward-looking and backward-looking, including falsified ones (with their
+    reason and the experiment that falsified them). Frontend can filter.
+
+    `memo` is null if the analyst hasn't reviewed this experiment yet.
+    """
+    conn = get_db()
+    exp_row = conn.execute(
+        "SELECT id FROM experiments WHERE id = ? AND run_id = ?",
+        (experiment_id, run_id),
+    ).fetchone()
+    conn.close()
+    if not exp_row:
+        raise HTTPException(404, f"Experiment '{experiment_id}' not found in run '{run_id}'")
+
+    from auto_trader.analyst import read_memo, recall_memo_items
+    memo_row = read_memo(experiment_id)
+    memo = None if memo_row.get("error") else memo_row
+    items = recall_memo_items(
+        experiment_id=experiment_id,
+        forward_looking_only=False,
+        include_falsified=True,
+        limit=500,
+    )
+    return {
+        "run_id": run_id,
+        "experiment_id": experiment_id,
+        "memo": memo,
+        "items": items,
+    }
+
+
 @router.get("/runs/{run_id}/prompt")
 async def get_run_prompt(run_id: str):
     """Get the prompt for this run (from its agent)."""

@@ -611,6 +611,71 @@ CREATE TABLE IF NOT EXISTS portfolio_deployments (
 
 
 # ---------------------------------------------------------------------------
+# Analyst agent: attributions cache, memos, and structured memo items
+# ---------------------------------------------------------------------------
+
+ATTRIBUTIONS = """
+CREATE TABLE IF NOT EXISTS attributions (
+    experiment_id    TEXT PRIMARY KEY,
+    run_id           TEXT NOT NULL,
+    universe         TEXT,                       -- sector slug or 'global'
+    alpha_log_total  REAL,                       -- Σ c_f + ε in log-return space
+    residual         REAL,                       -- ε
+    contributions    TEXT NOT NULL,              -- JSON: {factor: c_f, ...}
+    method           TEXT,                       -- 'q5_q1_spread' / 'sector_relative'
+    n_factors        INTEGER,
+    computed_at      TEXT NOT NULL,
+    FOREIGN KEY (experiment_id) REFERENCES experiments(id)
+);
+CREATE INDEX IF NOT EXISTS idx_attributions_run ON attributions(run_id);
+"""
+
+ANALYST_MEMOS = """
+CREATE TABLE IF NOT EXISTS analyst_memos (
+    experiment_id    TEXT PRIMARY KEY,           -- one memo per experiment
+    run_id           TEXT NOT NULL,
+    content          TEXT NOT NULL,              -- markdown
+    model            TEXT,
+    tokens_in        INTEGER,
+    tokens_out       INTEGER,
+    duration_seconds REAL,
+    created_at       TEXT NOT NULL,
+    FOREIGN KEY (experiment_id) REFERENCES experiments(id)
+);
+CREATE INDEX IF NOT EXISTS idx_memos_run ON analyst_memos(run_id);
+"""
+
+MEMO_ITEMS = """
+CREATE TABLE IF NOT EXISTS memo_items (
+    id                       TEXT PRIMARY KEY,
+    experiment_id            TEXT NOT NULL,
+    run_id                   TEXT NOT NULL,
+    universe                 TEXT,                              -- sector slug or 'global'
+    kind                     TEXT NOT NULL,                     -- factor_observation|trade_pattern|risk_observation|...
+    claim                    TEXT NOT NULL,                     -- 1-2 sentence testable assertion
+    mechanism                TEXT,                              -- causal story / why this is true
+    evidence_summary         TEXT,                              -- concrete numbers: IC, spread, n_trades, drivers
+    confidence               TEXT,                              -- 'high' | 'medium' | 'low'
+    caveats                  TEXT,                              -- known failure modes / regime dependencies
+    implication              TEXT,                              -- what the next iteration should do
+    is_forward_looking       INTEGER NOT NULL DEFAULT 0,
+    scope_level              TEXT NOT NULL DEFAULT 'run',       -- run|universe|global
+    promotion_count          INTEGER NOT NULL DEFAULT 1,
+    falsified                INTEGER NOT NULL DEFAULT 0,
+    falsified_reason         TEXT,
+    falsified_by_experiment  TEXT,
+    created_at               TEXT NOT NULL,
+    updated_at               TEXT NOT NULL,
+    FOREIGN KEY (experiment_id) REFERENCES experiments(id)
+);
+CREATE INDEX IF NOT EXISTS idx_memo_items_experiment ON memo_items(experiment_id);
+CREATE INDEX IF NOT EXISTS idx_memo_items_run ON memo_items(run_id);
+CREATE INDEX IF NOT EXISTS idx_memo_items_scope ON memo_items(scope_level, universe);
+CREATE INDEX IF NOT EXISTS idx_memo_items_kind ON memo_items(kind);
+"""
+
+
+# ---------------------------------------------------------------------------
 # All schemas combined
 # ---------------------------------------------------------------------------
 
@@ -627,6 +692,9 @@ ALL_SCHEMAS = [
     TRADE_EXECUTIONS,
     REGIME_DEPLOYMENTS,
     AUTO_TRADER,
+    ATTRIBUTIONS,
+    ANALYST_MEMOS,
+    MEMO_ITEMS,
     EXPERIMENTS,
     LEGACY,
     # Note: universe_profiles is in market.db, not app.db — managed by server/api.py
@@ -666,6 +734,14 @@ def _apply_migrations(conn: sqlite3.Connection):
         _add_column_if_missing(conn, "deployments", "last_sharpe_ratio_annualized", "REAL")
     if "auto_trader_agents" in existing_tables:
         _add_column_if_missing(conn, "auto_trader_agents", "allowed_tools", "TEXT")
+    if "memo_items" in existing_tables:
+        # Rich-claim upgrade: each item now carries causal mechanism, concrete
+        # evidence, confidence, caveats, and an actionable implication.
+        _add_column_if_missing(conn, "memo_items", "mechanism", "TEXT")
+        _add_column_if_missing(conn, "memo_items", "evidence_summary", "TEXT")
+        _add_column_if_missing(conn, "memo_items", "confidence", "TEXT")
+        _add_column_if_missing(conn, "memo_items", "caveats", "TEXT")
+        _add_column_if_missing(conn, "memo_items", "implication", "TEXT")
 
 
 def init_db(conn: sqlite3.Connection):
