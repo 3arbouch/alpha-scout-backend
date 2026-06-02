@@ -301,6 +301,7 @@ class CreateRunRequest(BaseModel):
     sector: str | None = Field(default=None, description="Restrict to a sector (e.g. 'Energy', 'Technology'). If set, data queries only return stocks in this sector.")
     alpha_benchmark: str = Field(default="auto", description="Benchmark for alpha: 'sector' (sector ETF), 'market' (SPY), 'auto' (sector if sector is set, else market)")
     starting_portfolio: dict | None = Field(default=None, description="Optional starting portfolio config.")
+    include_analyst_notes: bool = Field(default=True, description="Feed the post-trade analyst's notes to the trader agent in its history context. Memos are still generated either way (visible in the UI / analyst endpoint); this only controls whether the agent sees them.")
     # Walk-forward eval — both optional. Setting `eval` runs N+1 backtests per
     # iteration (training + each eval window). `target_aggregator != "overall"`
     # makes the agent climb the aggregated eval metric instead of the
@@ -685,6 +686,7 @@ async def create_run(body: CreateRunRequest):
         "sector": body.sector,
         "alpha_benchmark": alpha_benchmark,
         "target_aggregator": body.target_aggregator,
+        "include_analyst_notes": body.include_analyst_notes,
     }
     if body.starting_portfolio:
         config["starting_portfolio"] = body.starting_portfolio
@@ -788,6 +790,8 @@ async def start_run(run_id: str, body: StartRunRequest = StartRunRequest()):
         cmd.extend(["--eval-file", str(eval_file)])
     if config.get("target_aggregator") and config["target_aggregator"] != "overall":
         cmd.extend(["--target-aggregator", config["target_aggregator"]])
+    if not config.get("include_analyst_notes", True):
+        cmd.append("--no-analyst-notes")
 
     # Spawn as background process
     env = os.environ.copy()

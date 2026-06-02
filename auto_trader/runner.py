@@ -166,6 +166,9 @@ _custom_prompt = None
 # Explicit allowlist for this run. None means the API/CLI didn't supply one,
 # in which case we fall back to the full current catalog (CLI convenience).
 _allowed_tools: list[str] | None = None
+# When False, analyst notes are kept out of the agent's history context.
+# Memos are still generated; the agent just doesn't see them.
+_include_analyst_notes: bool = True
 
 
 def _resolve_allowed_mcp_tools() -> list[str]:
@@ -330,7 +333,8 @@ def _get_trade_summary(exp_id: str) -> dict | None:
 
 
 def build_history_context(run_id: str, target_metric: str, limit: int = 20,
-                          aggregator: str = "overall") -> str:
+                          aggregator: str = "overall",
+                          include_analyst_notes: bool = True) -> str:
     """Build full history of past experiments for the agent to learn from.
 
     Lessons convention: the `lessons` field stored on experiment row N is the
@@ -374,19 +378,27 @@ def build_history_context(run_id: str, target_metric: str, limit: int = 20,
     )
 
     lines = [f"## Past Experiments ({len(history)} most recent)\n"]
-    lines.append(
-        "Each experiment below carries two memory streams — treat them as "
-        "different kinds of evidence:\n"
+    reflection_note = (
         "- **Your reflection** — a free-text lesson you wrote at the start of "
         "the next iteration. Your own narrative, not independently verified. "
         "Only the 3 most-recently-written are shown (older self-reflections "
         "are dropped to avoid anchoring on stale interpretations).\n"
-        "- **Analyst observations** — forward-looking claims extracted by an "
-        "independent post-trade analyst that reviewed the actual trade "
-        "ledger, realized P&L, NAV, and factor attribution after each "
-        "experiment. Third-party, data-grounded. The analyst sees what "
-        "actually happened in the books, not what your thesis predicted.\n"
     )
+    if include_analyst_notes:
+        lines.append(
+            "Each experiment below carries two memory streams — treat them as "
+            "different kinds of evidence:\n"
+            + reflection_note +
+            "- **Analyst observations** — forward-looking claims extracted by an "
+            "independent post-trade analyst that reviewed the actual trade "
+            "ledger, realized P&L, NAV, and factor attribution after each "
+            "experiment. Third-party, data-grounded. The analyst sees what "
+            "actually happened in the books, not what your thesis predicted.\n"
+        )
+    else:
+        lines.append(
+            "Each experiment below carries a memory stream:\n" + reflection_note
+        )
     for exp in history_asc:
         status = "KEEP" if exp["decision"] == "keep" else "DISCARD"
         lines.append(f"### Experiment {exp['iteration']} [id: {exp['id']}] — {status}")
@@ -538,13 +550,14 @@ def build_history_context(run_id: str, target_metric: str, limit: int = 20,
             lines.append(lesson_text)
 
         # Analyst observations for this specific experiment.
-        try:
-            from auto_trader.analyst import render_memo_items_for_experiment
-            analyst_block = render_memo_items_for_experiment(exp["id"])
-            if analyst_block:
-                lines.append(analyst_block)
-        except Exception:
-            pass
+        if include_analyst_notes:
+            try:
+                from auto_trader.analyst import render_memo_items_for_experiment
+                analyst_block = render_memo_items_for_experiment(exp["id"])
+                if analyst_block:
+                    lines.append(analyst_block)
+            except Exception:
+                pass
 
         lines.append("")
 
@@ -1088,7 +1101,8 @@ async def run_agent_iteration(
 
     # Build the prompt
     program = load_program()
-    history = build_history_context(run_id, target_metric, aggregator=target_aggregator)
+    history = build_history_context(run_id, target_metric, aggregator=target_aggregator,
+                                    include_analyst_notes=_include_analyst_notes)
 
     conditions_desc = ", ".join(
         f"{c['metric']} {c['operator']} {c['value']}" for c in conditions
@@ -1531,6 +1545,9 @@ async def main():
                         help="How to reduce per-window metrics to the agent's optimization scalar. "
                              "Non-'overall' requires --eval-file. "
                              "Dispersion (stdev/iqr/range) is MINIMIZED; snr (mean/stdev) is maximized.")
+    parser.add_argument("--no-analyst-notes", action="store_true",
+                        help="Don't surface analyst notes in the agent's history context. "
+                             "Memos are still generated; the agent just doesn't see them.")
     args = parser.parse_args()
 
     # Load eval block from sidecar file.
@@ -1574,6 +1591,10 @@ async def main():
             print(f"--allowed-tools must be a JSON array of strings; got {parsed!r}")
             return
         _allowed_tools = parsed
+
+    if args.no_analyst_notes:
+        global _include_analyst_notes
+        _include_analyst_notes = False
 
     # Stop flag path
     stop_flag = PROJECT_ROOT / "auto_trader" / f".stop_{run_id}"
