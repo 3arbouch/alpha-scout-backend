@@ -373,8 +373,53 @@ def get_exit_recommendations(
             ))
             continue
 
-        # Take profit
-        if _check_take_profit(pos, price, sleeve_config):
+        # Take profit. Default action fully closes (shares=None). The
+        # gain_from_entry 'trim_gain' action instead skims the gain accrued
+        # since a ratchet reference (initially the entry price), keeping the
+        # reference-point capital invested; the executor resets the reference
+        # to today's price after the trim, so the next +value% leg trims again.
+        tp_cfg = sleeve_config.get("take_profit") or {}
+        tp_type = tp_cfg.get("type")
+        if tp_type == "gain_from_entry" and tp_cfg.get("action") == "trim_gain":
+            ref = pos.tp_reference_price or pos.entry_price
+            value = tp_cfg.get("value", 60)
+            if ref > 0 and ((price - ref) / ref) * 100.0 >= value:
+                trim_shares = pos.shares * (1.0 - ref / price)
+                if trim_shares > 0:
+                    out.append(ExitDirective(
+                        sleeve_label=sleeve_label, symbol=symbol,
+                        reason="take_profit", shares=trim_shares,
+                        detail={"action": "trim_gain",
+                                "reference_price": round(ref, 4),
+                                "new_reference": round(price, 4)},
+                    ))
+                    continue
+            # Not triggered (or trim rounds to ~0): fall through to time_stop.
+        elif tp_type == "trailing_peak":
+            # Trim `fraction` when price falls `drop_pct` below the trailing
+            # high (high since entry, or since the last trim). Arms only once
+            # the high has cleared entry by activate_gain_pct (no underwater
+            # trims). fraction>=1 ⇒ full exit; otherwise the executor resets the
+            # trailing high to today's price so a fresh high is needed to re-arm.
+            high = pos.trail_high if pos.trail_high is not None else pos.high_since_entry
+            drop_pct = tp_cfg.get("drop_pct", 10)
+            activate = tp_cfg.get("activate_gain_pct", 0)
+            fraction = tp_cfg.get("fraction", 1.0)
+            armed = high > pos.entry_price * (1.0 + activate / 100.0)
+            if armed and price <= high * (1.0 - drop_pct / 100.0):
+                trim_shares = None if fraction >= 1.0 else pos.shares * fraction
+                if trim_shares is None or trim_shares > 0:
+                    out.append(ExitDirective(
+                        sleeve_label=sleeve_label, symbol=symbol,
+                        reason="take_profit", shares=trim_shares,
+                        detail={"action": "trailing_peak",
+                                "trail_high": round(high, 4),
+                                "drop_pct": drop_pct,
+                                "reset_high": round(price, 4)},
+                    ))
+                    continue
+            # Not armed / not triggered: fall through to time_stop.
+        elif _check_take_profit(pos, price, sleeve_config):
             out.append(ExitDirective(
                 sleeve_label=sleeve_label, symbol=symbol,
                 reason="take_profit", shares=None,

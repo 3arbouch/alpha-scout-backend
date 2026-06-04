@@ -21,6 +21,7 @@ only. Multi-sleeve and regime/allocation_profile support added in 3b-3e.
 from __future__ import annotations
 
 import sys
+from collections import namedtuple
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -506,6 +507,115 @@ def _apply_equal_weight_rebalance(
     return trades
 
 
+_HeldName = namedtuple("_HeldName", ["symbol"])
+
+
+def _apply_target_weight_rebalance(
+    sleeve: "_SleeveContext",
+    book: PositionBook,
+    price_index: dict,
+    date: str,
+) -> list[dict]:
+    """Two-sided rebalance of held positions toward their sizing-model targets.
+
+    Targets come from the sleeve's sizing model (risk_parity → inverse-vol,
+    recomputed as of `date`; otherwise equal weight) over the CURRENTLY HELD,
+    priced names, normalized to sum to 1. Each position is trimmed down / added
+    up to its target share of the current invested value, so the pass is
+    cash-neutral (trim proceeds fund the adds). Names whose weight is within
+    ±rebalance_band_pct of target are left untouched (no-trade band).
+
+    Unlike equal_weight mode, this does NOT re-rank the universe, rotate names,
+    or open new positions — it is pure drift-control on existing holdings.
+    Trims are emitted before adds so freed cash funds the buys.
+    """
+    cfg = sleeve.config
+    sleeve_label = sleeve.label
+    slippage = sleeve.slippage_bps
+
+    positions = book.positions_for_sleeve(sleeve_label)
+    if not positions:
+        return []
+
+    rules = (cfg.get("rebalancing") or {}).get("rules") or {}
+    band = float(rules.get("rebalance_band_pct", 0)) / 100.0
+
+    # Priced, currently-held names + invested value.
+    priced: dict[str, tuple] = {}  # sym -> (pos, price, market_value)
+    invested = 0.0
+    for sym, pos in positions.items():
+        price = price_index.get(sym, {}).get(date)
+        if not price or price <= 0:
+            continue
+        mv = pos.market_value(price)
+        priced[sym] = (pos, price, mv)
+        invested += mv
+    if invested <= 0 or not priced:
+        return []
+
+    # Target weights from the sizing model (sum to 1 over priced names).
+    sizing_type = cfg.get("sizing", {}).get("type", "equal_weight")
+    targets: dict[str, float] = {}
+    if sizing_type == "risk_parity":
+        shim = [_HeldName(sym) for sym in priced]
+        targets = _compute_risk_parity_weights(sleeve, shim, price_index, date)
+    if not targets:
+        # equal_weight / fixed_amount, or risk_parity with no vol history.
+        w = 1.0 / len(priced)
+        targets = {sym: w for sym in priced}
+    else:
+        # Names with no vol estimate get the average weight; then renormalize
+        # so the targets sum to 1 across exactly the priced names.
+        missing = [s for s in priced if s not in targets]
+        if missing:
+            avg = sum(targets.values()) / len(targets)
+            for s in missing:
+                targets[s] = avg
+        tot = sum(targets[s] for s in priced)
+        if tot <= 0:
+            return []
+        targets = {s: targets[s] / tot for s in priced}
+
+    MIN_TRADE = 1.0  # ignore sub-dollar dust
+    sells: list[tuple] = []
+    buys: list[tuple] = []
+    for sym, (pos, price, mv) in priced.items():
+        cur_w = mv / invested
+        tgt_w = targets.get(sym, 0.0)
+        if abs(cur_w - tgt_w) <= band:
+            continue
+        diff = (tgt_w * invested) - mv  # >0 underweight (buy), <0 overweight (trim)
+        if diff < -MIN_TRADE:
+            trim_shares = pos.shares * min(abs(diff) / mv, 1.0)
+            if trim_shares > 0:
+                sells.append((sym, price, trim_shares))
+        elif diff > MIN_TRADE:
+            buys.append((sym, price, diff))
+
+    trades: list[dict] = []
+    for sym, price, trim_shares in sells:
+        t = book.sell(
+            sleeve_label=sleeve_label, symbol=sym, date=date,
+            exec_price=price, reason="rebalance_trim",
+            shares=trim_shares, slippage_bps=slippage,
+        )
+        if t is not None:
+            trades.append(t)
+    for sym, price, add_amount in buys:
+        amount = min(add_amount, book.sleeve_cash(sleeve_label) * 0.99)
+        if amount <= MIN_TRADE:
+            continue
+        t = book.open(
+            sleeve_label=sleeve_label, symbol=sym, date=date,
+            amount=amount, exec_price=price, slippage_bps=slippage,
+            reason="entry",
+            shares_mode=cfg.get("sizing", {}).get("shares"),
+        )
+        if t is not None:
+            trades.append(t)
+    return trades
+
+
 def _make_ohlc_fetcher(price_index: dict):
     """Stub OHLC fetcher used by compute_stop_pricing for vol-adaptive modes.
 
@@ -638,6 +748,18 @@ def _run_daily_loop(
                     all_trades.append(t)
                     if d.reason == "stop_loss":
                         sleeve.state.stop_loss_cooldowns[d.symbol] = date
+                    elif d.detail and d.detail.get("action") == "trim_gain":
+                        # Ratchet: re-anchor the TP reference to today's price so
+                        # the surviving shares need another +value% to trim again.
+                        rp = book.get(d.sleeve_label, d.symbol)
+                        if rp is not None:
+                            rp.tp_reference_price = d.detail.get("new_reference", price)
+                    elif d.detail and d.detail.get("action") == "trailing_peak":
+                        # Reset the trailing peak to today's price so a fresh new
+                        # high + another drop_pct pullback is needed to re-arm.
+                        rp = book.get(d.sleeve_label, d.symbol)
+                        if rp is not None:
+                            rp.trail_high = d.detail.get("reset_high", price)
 
         # -------------------------------------------------------------------
         # 3. Apply rebalance directives — gated-off days skip entirely
@@ -660,6 +782,18 @@ def _run_daily_loop(
                     price_index=price_index, date=date,
                 )
                 all_trades.extend(ew_trades)
+                sleeve.state.last_rebal_date = date
+                continue
+
+            # target_weight rebalance mode: two-sided drift-control on held
+            # positions toward the sizing model's (recomputed) target weights,
+            # with a no-trade band. Does NOT rotate the universe.
+            if (rb_mode == "target_weight" and rb_freq != "none"
+                    and is_rebalance_date(date, sleeve.state.last_rebal_date, rb_freq)):
+                tw_trades = _apply_target_weight_rebalance(
+                    sleeve=sleeve, book=book, price_index=price_index, date=date,
+                )
+                all_trades.extend(tw_trades)
                 sleeve.state.last_rebal_date = date
                 continue
             sleeve_nav = book.sleeve_nav(sleeve.label, price_index, date)
