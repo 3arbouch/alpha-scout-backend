@@ -63,6 +63,8 @@ class Position:
     signal_detail: Optional[dict] = None
     stop_price: Optional[float] = None       # frozen stop (vol-adaptive modes)
     take_profit_price: Optional[float] = None  # frozen TP
+    tp_reference_price: Optional[float] = None  # ratchet reference for gain_from_entry trim_gain TP; None ⇒ use entry_price
+    trail_high: Optional[float] = None          # resettable trailing-peak reference for trailing_peak TP; None ⇒ use high_since_entry
 
     def market_value(self, price: float) -> float:
         return float(price) * self.shares
@@ -78,9 +80,17 @@ class Position:
         return (d1 - d0).days
 
     def observe_price(self, price: float) -> None:
-        """Update trailing high since entry (used by above_peak TP / trailing stop)."""
+        """Update trailing high since entry (used by above_peak TP / trailing stop).
+
+        `trail_high` is the resettable peak used by the trailing_peak scale-out:
+        once a trim resets it to the trim price, this keeps it tracking the
+        running max from that point. It stays None (and the trailing check falls
+        back to high_since_entry) until the first reset.
+        """
         if price > self.high_since_entry:
             self.high_since_entry = price
+        if self.trail_high is not None and price > self.trail_high:
+            self.trail_high = price
 
 
 # Wildcard sleeve label for single-pool (backward-compatibility) cash mode.
