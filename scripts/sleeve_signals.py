@@ -24,6 +24,7 @@ recommendations instead of side-effects.
 """
 from __future__ import annotations
 
+import math
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -356,6 +357,14 @@ def get_exit_recommendations(
     """
     out: list[ExitDirective] = []
 
+    # Whole-share venues can't sell fractional shares. Partial take-profit
+    # trims must therefore floor to whole shares, mirroring the entry side
+    # (PositionBook.open floors buys when shares_mode == "whole").
+    _whole = (sleeve_config.get("sizing") or {}).get("shares") == "whole"
+
+    def _trim_qty(raw: float) -> float:
+        return float(math.floor(raw)) if _whole else raw
+
     for symbol, pos in sleeve_positions.items():
         price = price_index.get(symbol, {}).get(date)
         if price is None:
@@ -384,7 +393,7 @@ def get_exit_recommendations(
             ref = pos.tp_reference_price or pos.entry_price
             value = tp_cfg.get("value", 60)
             if ref > 0 and ((price - ref) / ref) * 100.0 >= value:
-                trim_shares = pos.shares * (1.0 - ref / price)
+                trim_shares = _trim_qty(pos.shares * (1.0 - ref / price))
                 if trim_shares > 0:
                     out.append(ExitDirective(
                         sleeve_label=sleeve_label, symbol=symbol,
@@ -407,7 +416,7 @@ def get_exit_recommendations(
             fraction = tp_cfg.get("fraction", 1.0)
             armed = high > pos.entry_price * (1.0 + activate / 100.0)
             if armed and price <= high * (1.0 - drop_pct / 100.0):
-                trim_shares = None if fraction >= 1.0 else pos.shares * fraction
+                trim_shares = None if fraction >= 1.0 else _trim_qty(pos.shares * fraction)
                 if trim_shares is None or trim_shares > 0:
                     out.append(ExitDirective(
                         sleeve_label=sleeve_label, symbol=symbol,
