@@ -811,7 +811,28 @@ def set_alert_mode(deploy_id: str, enabled: bool) -> dict:
 # ---------------------------------------------------------------------------
 # Queries (unified)
 # ---------------------------------------------------------------------------
-def list_deployments(include_stopped: bool = False, deploy_type: str = None) -> list[dict]:
+def set_live_capital(deploy_id: str, enabled: bool) -> dict:
+    """Tag/untag a deployment as deployed with real/live capital.
+
+    Independent of alert_mode — purely a label the frontend uses to group
+    live-capital books into their own section.
+    """
+    conn = get_db()
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE deployments SET live_capital = ?, updated_at = ? WHERE id = ?",
+        (1 if enabled else 0, now, deploy_id),
+    )
+    conn.commit()
+    row = conn.execute("SELECT id, name, live_capital FROM deployments WHERE id = ?", (deploy_id,)).fetchone()
+    conn.close()
+    if not row:
+        return {"error": "Deployment not found"}
+    return {"id": row["id"], "name": row["name"], "live_capital": bool(row["live_capital"])}
+
+
+def list_deployments(include_stopped: bool = False, deploy_type: str = None,
+                     live_capital: bool = None) -> list[dict]:
     conn = get_db()
     clauses = []
     params = []
@@ -820,6 +841,9 @@ def list_deployments(include_stopped: bool = False, deploy_type: str = None) -> 
     if deploy_type:
         clauses.append("type = ?")
         params.append(deploy_type)
+    if live_capital is not None:
+        clauses.append("COALESCE(live_capital, 0) = ?")
+        params.append(1 if live_capital else 0)
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     rows = conn.execute(f"SELECT * FROM deployments {where} ORDER BY created_at DESC", params).fetchall()
     conn.close()

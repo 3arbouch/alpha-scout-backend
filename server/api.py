@@ -1822,11 +1822,12 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 async def list_deployments_unified(
     include_stopped: bool = Query(False),
     type: Optional[str] = Query(None, description="Filter by type: 'strategy' or 'portfolio'"),
+    live_capital: Optional[bool] = Query(None, description="Filter by live-capital tag. true = only deployments tagged as deployed with live capital."),
     _: str = Depends(verify_api_key),
 ):
-    """List all deployments. Optional ?type=strategy or ?type=portfolio filter."""
+    """List all deployments. Optional ?type= and ?live_capital= filters."""
     from deploy_engine import list_deployments as _list
-    deployments = _list(include_stopped=include_stopped, deploy_type=type)
+    deployments = _list(include_stopped=include_stopped, deploy_type=type, live_capital=live_capital)
     return {
         "total": len(deployments),
         "data": [_sanitize_floats({
@@ -1862,6 +1863,7 @@ async def list_deployments_unified(
             "utilization_pct": d.get("utilization_pct"),
             "return_on_utilized_capital_pct": d.get("return_on_utilized_capital_pct"),
             "alert_mode": bool(d.get("alert_mode", 0)),
+            "live_capital": bool(d.get("live_capital", 0)),
             "error": d.get("error"),
         }) for d in deployments],
     }
@@ -1916,6 +1918,7 @@ async def get_deployment_unified(deploy_id: str, _: str = Depends(verify_api_key
         "utilization_pct": d.get("utilization_pct"),
         "return_on_utilized_capital_pct": d.get("return_on_utilized_capital_pct"),
         "alert_mode": bool(d.get("alert_mode", 0)),
+        "live_capital": bool(d.get("live_capital", 0)),
         "error": d.get("error"),
     })
 
@@ -2270,6 +2273,20 @@ async def disable_deployment_alerts_unified(deploy_id: str, _: str = Depends(ver
     return result
 
 
+@app.post("/deployments/{deploy_id}/live-capital/enable", tags=["Deployments (Unified)"])
+async def enable_deployment_live_capital(deploy_id: str, _: str = Depends(verify_api_key)):
+    """Tag a deployment as deployed with live capital (independent of alerts)."""
+    from deploy_engine import set_live_capital
+    return set_live_capital(deploy_id, True)
+
+
+@app.post("/deployments/{deploy_id}/live-capital/disable", tags=["Deployments (Unified)"])
+async def disable_deployment_live_capital(deploy_id: str, _: str = Depends(verify_api_key)):
+    """Remove the live-capital tag from a deployment."""
+    from deploy_engine import set_live_capital
+    return set_live_capital(deploy_id, False)
+
+
 # ---------------------------------------------------------------------------
 # Legacy Deploy Endpoints (kept for backward compat)
 # ---------------------------------------------------------------------------
@@ -2379,6 +2396,7 @@ async def list_deployments(
             "utilization_pct": d.get("utilization_pct"),
             "return_on_utilized_capital_pct": d.get("return_on_utilized_capital_pct"),
             "alert_mode": bool(d.get("alert_mode", 0)),
+            "live_capital": bool(d.get("live_capital", 0)),
             "error": d.get("error"),
         }) for d in deployments],
     }

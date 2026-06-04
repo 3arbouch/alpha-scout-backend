@@ -234,6 +234,8 @@ CREATE TABLE IF NOT EXISTS deployments (
     num_sleeves                     INTEGER DEFAULT 1,
     -- Alerts
     alert_mode                      INTEGER DEFAULT 0,
+    -- Tagging: 1 = deployed with real/live capital (independent of alert_mode)
+    live_capital                    INTEGER DEFAULT 0,
     error                           TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_deployments_status ON deployments(status);
@@ -732,6 +734,8 @@ def _apply_migrations(conn: sqlite3.Connection):
         _add_column_if_missing(conn, "deployments", "portfolio_id", "TEXT")
         _add_column_if_missing(conn, "deployments", "last_sharpe_basis", "TEXT")
         _add_column_if_missing(conn, "deployments", "last_sharpe_ratio_annualized", "REAL")
+        # Tag: deployed with real/live capital (independent of alert_mode).
+        _add_column_if_missing(conn, "deployments", "live_capital", "INTEGER DEFAULT 0")
     if "auto_trader_agents" in existing_tables:
         _add_column_if_missing(conn, "auto_trader_agents", "allowed_tools", "TEXT")
     if "memo_items" in existing_tables:
