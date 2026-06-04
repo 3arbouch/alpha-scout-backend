@@ -96,6 +96,30 @@ check("default action still sells all (shares=None)",
       len(exits) == 1 and exits[0].shares is None, f"got {exits}")
 
 
+# ---------------------------------------------------------------------------
+# 1a-whole. trim_gain respects whole-share sizing (floors the trim)
+# ---------------------------------------------------------------------------
+print("\n=== 1a-whole. trim_gain whole-share flooring ===")
+# entry 169.10 × 31sh, price 290.79 (+72%): raw trim = 31×(1−169.10/290.79)=12.97
+TP_TRIM_WHOLE = {
+    "sizing": {"type": "risk_parity", "shares": "whole"},
+    "take_profit": {"type": "gain_from_entry", "value": 65, "action": "trim_gain"},
+}
+pos = make_pos("MRVL", 169.10, 31)
+exits = get_exit_recommendations("S", TP_TRIM_WHOLE, "2026-06-02", {"MRVL": pos}, {"MRVL": {"2026-06-02": 290.79}})
+check("whole mode → trim floored to 12 shares (not 12.97)",
+      len(exits) == 1 and exits[0].shares == 12.0, f"got {[e.shares for e in exits]}")
+# fractional mode keeps the exact partial
+TP_TRIM_FRAC = {
+    "sizing": {"type": "risk_parity", "shares": "fractional"},
+    "take_profit": {"type": "gain_from_entry", "value": 65, "action": "trim_gain"},
+}
+pos = make_pos("MRVL", 169.10, 31)
+exits = get_exit_recommendations("S", TP_TRIM_FRAC, "2026-06-02", {"MRVL": pos}, {"MRVL": {"2026-06-02": 290.79}})
+check("fractional mode → keeps exact 12.97 shares",
+      len(exits) == 1 and abs(exits[0].shares - 31 * (1 - 169.10 / 290.79)) < 1e-6, f"got {[e.shares for e in exits]}")
+
+
 # ===========================================================================
 # 1b. trailing_peak scale-out
 # ===========================================================================
