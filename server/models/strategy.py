@@ -385,6 +385,16 @@ class GainFromEntryTP(BaseModel):
     """Fixed-percent take profit. exit if pnl_pct >= value."""
     type: Literal["gain_from_entry"] = "gain_from_entry"
     value: float = Field(default=60, description="Positive %. e.g. 60 = sell at 60% profit.")
+    action: Literal["sell_all", "trim_gain"] = Field(
+        default="sell_all",
+        description=(
+            "On trigger: 'sell_all' closes the whole position (default). "
+            "'trim_gain' banks the gain since a ratchet reference (initially the "
+            "entry price), keeps the reference-point capital invested, then resets "
+            "the reference to the current price — so each further +value% leg trims "
+            "the new gain again. Lets winners keep running while skimming profit."
+        ),
+    )
 
 
 class AbovePeakTP(BaseModel):
@@ -408,8 +418,34 @@ class RealizedVolMultipleTP(BaseModel):
     sigma_source: Literal["historical", "ewma"] = Field(default="historical")
 
 
+class TrailingPeakTP(BaseModel):
+    """Peak-relative trailing scale-out. Trims when price falls `drop_pct` below
+    the trailing high (high since entry, or since the last trim). Market-state
+    triggered — it acts on a pullback from the high, not on a fixed gain from
+    cost — so a winner that keeps making highs is never trimmed."""
+    type: Literal["trailing_peak"] = "trailing_peak"
+    drop_pct: float = Field(gt=0, le=100, description="Trim when price falls this % below the trailing high.")
+    fraction: float = Field(
+        gt=0, le=1, default=1.0,
+        description=(
+            "Fraction of the CURRENT position to sell on each trigger. 1.0 = "
+            "full exit. <1 = scale-out ladder: the trailing high resets to the "
+            "trim price, so a fresh new high + another `drop_pct` pullback is "
+            "required before the next trim."
+        ),
+    )
+    activate_gain_pct: float = Field(
+        ge=0, default=0,
+        description=(
+            "Arm only once the trailing high has exceeded entry by this %. "
+            "Prevents trimming while underwater (0 = arm as soon as the position "
+            "shows any profit)."
+        ),
+    )
+
+
 TakeProfitConfig = Annotated[
-    GainFromEntryTP | AbovePeakTP | AtrMultipleTP | RealizedVolMultipleTP,
+    GainFromEntryTP | AbovePeakTP | AtrMultipleTP | RealizedVolMultipleTP | TrailingPeakTP,
     Field(discriminator="type"),
 ]
 
@@ -502,12 +538,21 @@ class RebalancingRules(BaseModel):
     on_earnings_miss: Literal["hold", "trim", "sell"] = Field(default="trim")
     trim_pct: float = Field(ge=0, le=100, default=50, description="% of position to trim.")
     add_on_earnings_beat: dict | None = Field(default=None, description="Config for adding on earnings beat: {min_gain_pct, max_add_multiplier, lookback_days}.")
+    rebalance_band_pct: float = Field(
+        ge=0, le=100, default=0,
+        description=(
+            "target_weight mode only: no-trade band, in percentage points of "
+            "weight, around each position's target. A position is left untouched "
+            "while |current_weight − target_weight| ≤ this. 0 = always rebalance "
+            "fully to target."
+        ),
+    )
 
 
 class RebalancingConfig(BaseModel):
     """Periodic portfolio rebalancing."""
     frequency: Literal["none", "quarterly", "monthly", "on_earnings"] = Field(default="none")
-    mode: Literal["trim", "equal_weight"] = Field(default="trim")
+    mode: Literal["trim", "equal_weight", "target_weight"] = Field(default="trim")
     rules: RebalancingRules = Field(default_factory=RebalancingRules)
 
 
