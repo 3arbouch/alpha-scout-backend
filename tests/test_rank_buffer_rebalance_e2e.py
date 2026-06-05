@@ -139,6 +139,26 @@ def open_syms(trades):
 check(f"book size stays near top_n ({len(open_syms(buf))} held, cap={TOP_N})",
       len(open_syms(buf)) <= TOP_N + 1)
 
+# --- Invariant 3: rebalance_band_pct suppresses survivor reweight churn ------
+# Same buffer as #2, but add a weight no-trade band. Survivors whose weight is
+# within ±band of the equal target are left untouched → fewer rebalance_trim
+# (and band-suppressed add) trades, while rotation membership is unchanged.
+print("\n=== 3. rebalance_band_pct cuts survivor reweight churn ===")
+band = run(make_cfg("rank_buffer", {"entry_rank": TOP_N, "exit_rank": int(TOP_N * 2),
+                                    "rebalance_band_pct": 3}))
+band_c = Counter(t.get("reason") for t in band)
+print(f"  rank_buffer(exit={TOP_N*2}, band=3%): {len(band)} trades, reasons={dict(band_c)}")
+check(f"fewer rebalance_trim with band (buf={buf_c.get('rebalance_trim',0)} → band={band_c.get('rebalance_trim',0)})",
+      band_c.get("rebalance_trim", 0) < buf_c.get("rebalance_trim", 0),
+      f"trims {band_c.get('rebalance_trim',0)} not < {buf_c.get('rebalance_trim',0)}")
+check(f"lower total turnover with band (buf={len(buf)} → band={len(band)})",
+      len(band) < len(buf), f"{len(band)} not < {len(buf)}")
+check(f"rotation membership unchanged by the band (buf={buf_rot} band={band_c.get('rebalance_rotation',0)})",
+      band_c.get("rebalance_rotation", 0) == buf_rot,
+      f"rotation moved: {band_c.get('rebalance_rotation',0)} vs {buf_rot}")
+check(f"book still near top_n ({len(open_syms(band))} held, cap={TOP_N})",
+      len(open_syms(band)) <= TOP_N + 1)
+
 print("\n" + "=" * 60)
 print(f"PASSED: {PASS}\nFAILED: {FAIL}")
 print("=" * 60)
