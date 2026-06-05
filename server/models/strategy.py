@@ -541,10 +541,27 @@ class RebalancingRules(BaseModel):
     rebalance_band_pct: float = Field(
         ge=0, le=100, default=0,
         description=(
-            "target_weight mode only: no-trade band, in percentage points of "
-            "weight, around each position's target. A position is left untouched "
-            "while |current_weight − target_weight| ≤ this. 0 = always rebalance "
-            "fully to target."
+            "target_weight / rank_buffer modes: no-trade band, in percentage "
+            "points of weight, around each position's target. A position is left "
+            "untouched while |current_weight − target_weight| ≤ this. 0 = always "
+            "rebalance fully to target."
+        ),
+    )
+    entry_rank: int | None = Field(
+        default=None, ge=1,
+        description=(
+            "rank_buffer mode only: a non-held name is bought only if its "
+            "composite rank is ≤ this. Defaults to ranking.top_n. Set lower than "
+            "exit_rank to create the hysteresis buffer."
+        ),
+    )
+    exit_rank: int | None = Field(
+        default=None, ge=1,
+        description=(
+            "rank_buffer mode only: a held name is sold only when its composite "
+            "rank falls past this (or it drops out of the ranked universe). "
+            "Defaults to ranking.top_n. Set higher than entry_rank so names "
+            "oscillating around top_n are not churned."
         ),
     )
 
@@ -552,7 +569,7 @@ class RebalancingRules(BaseModel):
 class RebalancingConfig(BaseModel):
     """Periodic portfolio rebalancing."""
     frequency: Literal["none", "quarterly", "monthly", "on_earnings"] = Field(default="none")
-    mode: Literal["trim", "equal_weight", "target_weight"] = Field(default="trim")
+    mode: Literal["trim", "equal_weight", "target_weight", "rank_buffer"] = Field(default="trim")
     rules: RebalancingRules = Field(default_factory=RebalancingRules)
 
 

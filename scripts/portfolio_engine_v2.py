@@ -616,6 +616,166 @@ def _apply_target_weight_rebalance(
     return trades
 
 
+def _apply_rank_buffer_rebalance(
+    sleeve: "_SleeveContext",
+    book: PositionBook,
+    conn,
+    price_index: dict,
+    date: str,
+) -> list[dict]:
+    """Rank-buffer (hysteresis) rotation — the low-turnover ranking rebalance.
+
+    Re-ranks the universe by composite score, then rotates the book with an
+    ASYMMETRIC entry/exit-rank buffer so names oscillating around the top_n
+    boundary are not churned:
+      - SELL a held name only if its rank falls past ``exit_rank`` (or it drops
+        out of the ranked universe).            → reason=rebalance_rotation
+      - KEEP every held name still inside exit_rank (the buffer zone).
+      - BUY non-held names ranked within ``entry_rank``, best first, up to the
+        max_positions cap.                       → reason=entry
+      - Reweight survivors toward the equal-weight target, skipping any whose
+        weight is within ``rebalance_band_pct`` of target (no-trade band).
+
+    entry_rank/exit_rank default to ranking.top_n; with entry_rank == exit_rank
+    == top_n and band == 0 this matches equal_weight's rotation membership. (It
+    is not byte-identical to equal_weight: weights are spread over the actually
+    actionable book — survivors + priced entrants — rather than the nominal
+    top_n, so capital is not left idle on an unpriceable target slot.) Requires
+    a ranking config — without one there is nothing to rotate on (no-op).
+    """
+    cfg = sleeve.config
+    sizing_cfg = cfg.get("sizing", {})
+    max_positions = sizing_cfg.get("max_positions", 10)
+    ranking_cfg = cfg.get("ranking")
+    slippage = sleeve.slippage_bps
+    sleeve_label = sleeve.label
+    trades: list[dict] = []
+
+    if not ranking_cfg:
+        return trades
+
+    sleeve_nav = book.sleeve_nav(sleeve_label, price_index, date)
+    if sleeve_nav <= 0:
+        return trades
+
+    rules = (cfg.get("rebalancing") or {}).get("rules") or {}
+    top_n = ranking_cfg.get("top_n", max_positions)
+    entry_rank = int(rules.get("entry_rank") or top_n)
+    exit_rank = int(rules.get("exit_rank") or top_n)
+    band = float(rules.get("rebalance_band_pct", 0)) / 100.0
+
+    # ---- Re-rank the universe as of `date` -----------------------------
+    candidates: list[tuple[str, float]] = []
+    for symbol in sorted(sleeve.signals.keys()):
+        sig_data = sleeve.signals.get(symbol, {})
+        if date in sig_data:
+            candidates.append((symbol, sig_data[date]))
+    if not candidates:
+        return trades
+    ranked = rank_candidates(
+        candidates, cfg, conn, date, price_index,
+        pe_series=sleeve.pe_series,
+        composite_series=sleeve.composite_series,
+    )
+    rank_of = {sym: i + 1 for i, (sym, _) in enumerate(ranked)}  # 1-based
+
+    # ---- Step 1: rotation sells (only past the exit-rank buffer) -------
+    survivors: list[str] = []
+    for symbol in list(book.symbols_held_by_sleeve(sleeve_label)):
+        r = rank_of.get(symbol)
+        if r is not None and r <= exit_rank:
+            survivors.append(symbol)
+            continue
+        price = price_index.get(symbol, {}).get(date)
+        if not price:
+            survivors.append(symbol)  # can't price → can't sell, keep
+            continue
+        t = book.sell(
+            sleeve_label=sleeve_label, symbol=symbol, date=date,
+            exec_price=price, reason="rebalance_rotation",
+            slippage_bps=slippage,
+        )
+        if t is not None:
+            trades.append(t)
+        else:
+            survivors.append(symbol)
+
+    # ---- Step 2: pick new entrants (within entry_rank, fill to cap) ----
+    slots = max_positions - len(survivors)
+    survivor_set = set(survivors)
+    entrants: list[str] = []
+    if slots > 0:
+        for sym, _ in ranked:
+            if len(entrants) >= slots or rank_of[sym] > entry_rank:
+                break  # ranked is best-first → nothing eligible remains
+            if sym in survivor_set:
+                continue
+            if price_index.get(sym, {}).get(date):
+                entrants.append(sym)
+
+    n_targets = len(survivors) + len(entrants)
+    if n_targets == 0:
+        return trades
+
+    # ---- Step 3: reweight survivors toward equal target (with band) ----
+    sleeve_nav = book.sleeve_nav(sleeve_label, price_index, date)
+    target_amount = sleeve_nav / n_targets
+    for symbol in survivors:
+        price = price_index.get(symbol, {}).get(date)
+        if not price:
+            continue
+        pos = book.get(sleeve_label, symbol)
+        if pos is None:
+            continue
+        mv = pos.market_value(price)
+        if band > 0 and abs(mv / sleeve_nav - 1.0 / n_targets) <= band:
+            continue  # within no-trade band
+        diff = target_amount - mv
+        if diff < -1000:
+            trim_pct = min((abs(diff) / mv) * 100, 99)
+            trim_shares = pos.shares * (trim_pct / 100.0)
+            if trim_shares > 0:
+                t = book.sell(
+                    sleeve_label=sleeve_label, symbol=symbol, date=date,
+                    exec_price=price, reason="rebalance_trim",
+                    shares=trim_shares, slippage_bps=slippage,
+                )
+                if t is not None:
+                    trades.append(t)
+        elif diff > 1000 and book.sleeve_cash(sleeve_label) > 1000:
+            add_amount = min(diff, book.sleeve_cash(sleeve_label) * 0.95)
+            if add_amount >= 1000:
+                t = book.open(
+                    sleeve_label=sleeve_label, symbol=symbol, date=date,
+                    amount=add_amount, exec_price=price,
+                    slippage_bps=slippage, reason="entry",
+                    shares_mode=cfg.get("sizing", {}).get("shares"),
+                )
+                if t is not None:
+                    trades.append(t)
+
+    # ---- Step 4: buy new entrants --------------------------------------
+    sleeve_nav = book.sleeve_nav(sleeve_label, price_index, date)
+    target_amount = sleeve_nav / n_targets
+    for symbol in entrants:
+        price = price_index.get(symbol, {}).get(date)
+        if not price:
+            continue
+        amount = min(target_amount, book.sleeve_cash(sleeve_label) * 0.95)
+        if amount <= 0:
+            continue
+        t = book.open(
+            sleeve_label=sleeve_label, symbol=symbol, date=date,
+            amount=amount, exec_price=price,
+            slippage_bps=slippage, reason="entry",
+            shares_mode=cfg.get("sizing", {}).get("shares"),
+        )
+        if t is not None:
+            trades.append(t)
+
+    return trades
+
+
 def _make_ohlc_fetcher(price_index: dict):
     """Stub OHLC fetcher used by compute_stop_pricing for vol-adaptive modes.
 
@@ -794,6 +954,19 @@ def _run_daily_loop(
                     sleeve=sleeve, book=book, price_index=price_index, date=date,
                 )
                 all_trades.extend(tw_trades)
+                sleeve.state.last_rebal_date = date
+                continue
+
+            # rank_buffer rebalance mode: hysteresis rotation — re-rank, sell
+            # only names past exit_rank, buy only names within entry_rank, keep
+            # survivors in the buffer zone (low-turnover ranking model).
+            if (rb_mode == "rank_buffer" and rb_freq != "none"
+                    and is_rebalance_date(date, sleeve.state.last_rebal_date, rb_freq)):
+                rbf_trades = _apply_rank_buffer_rebalance(
+                    sleeve=sleeve, book=book, conn=conn,
+                    price_index=price_index, date=date,
+                )
+                all_trades.extend(rbf_trades)
                 sleeve.state.last_rebal_date = date
                 continue
             sleeve_nav = book.sleeve_nav(sleeve.label, price_index, date)
