@@ -150,6 +150,11 @@ class _SleeveContext:
         self.pit_members_on: dict[str, frozenset[str]] | None = None
         # pending entries from yesterday's signals (next_close/next_open mode)
         self.pending_entries: list = []  # list of EntryDirective
+        # True when this sleeve's book was seeded with carried-in opening
+        # positions (real broker holdings). The strategy then runs forward
+        # exactly as designed from that opening book — seeding only changes the
+        # starting state, not the entry/exit logic.
+        self.seeded: bool = False
         # Allocated capital (in fixed-weight mode = weight × initial_capital)
         self.allocated_capital: float = 0.0
         # Bookkeeping
@@ -616,6 +621,166 @@ def _apply_target_weight_rebalance(
     return trades
 
 
+def _apply_rank_buffer_rebalance(
+    sleeve: "_SleeveContext",
+    book: PositionBook,
+    conn,
+    price_index: dict,
+    date: str,
+) -> list[dict]:
+    """Rank-buffer (hysteresis) rotation — the low-turnover ranking rebalance.
+
+    Re-ranks the universe by composite score, then rotates the book with an
+    ASYMMETRIC entry/exit-rank buffer so names oscillating around the top_n
+    boundary are not churned:
+      - SELL a held name only if its rank falls past ``exit_rank`` (or it drops
+        out of the ranked universe).            → reason=rebalance_rotation
+      - KEEP every held name still inside exit_rank (the buffer zone).
+      - BUY non-held names ranked within ``entry_rank``, best first, up to the
+        max_positions cap.                       → reason=entry
+      - Reweight survivors toward the equal-weight target, skipping any whose
+        weight is within ``rebalance_band_pct`` of target (no-trade band).
+
+    entry_rank/exit_rank default to ranking.top_n; with entry_rank == exit_rank
+    == top_n and band == 0 this matches equal_weight's rotation membership. (It
+    is not byte-identical to equal_weight: weights are spread over the actually
+    actionable book — survivors + priced entrants — rather than the nominal
+    top_n, so capital is not left idle on an unpriceable target slot.) Requires
+    a ranking config — without one there is nothing to rotate on (no-op).
+    """
+    cfg = sleeve.config
+    sizing_cfg = cfg.get("sizing", {})
+    max_positions = sizing_cfg.get("max_positions", 10)
+    ranking_cfg = cfg.get("ranking")
+    slippage = sleeve.slippage_bps
+    sleeve_label = sleeve.label
+    trades: list[dict] = []
+
+    if not ranking_cfg:
+        return trades
+
+    sleeve_nav = book.sleeve_nav(sleeve_label, price_index, date)
+    if sleeve_nav <= 0:
+        return trades
+
+    rules = (cfg.get("rebalancing") or {}).get("rules") or {}
+    top_n = ranking_cfg.get("top_n", max_positions)
+    entry_rank = int(rules.get("entry_rank") or top_n)
+    exit_rank = int(rules.get("exit_rank") or top_n)
+    band = float(rules.get("rebalance_band_pct", 0)) / 100.0
+
+    # ---- Re-rank the universe as of `date` -----------------------------
+    candidates: list[tuple[str, float]] = []
+    for symbol in sorted(sleeve.signals.keys()):
+        sig_data = sleeve.signals.get(symbol, {})
+        if date in sig_data:
+            candidates.append((symbol, sig_data[date]))
+    if not candidates:
+        return trades
+    ranked = rank_candidates(
+        candidates, cfg, conn, date, price_index,
+        pe_series=sleeve.pe_series,
+        composite_series=sleeve.composite_series,
+    )
+    rank_of = {sym: i + 1 for i, (sym, _) in enumerate(ranked)}  # 1-based
+
+    # ---- Step 1: rotation sells (only past the exit-rank buffer) -------
+    survivors: list[str] = []
+    for symbol in list(book.symbols_held_by_sleeve(sleeve_label)):
+        r = rank_of.get(symbol)
+        if r is not None and r <= exit_rank:
+            survivors.append(symbol)
+            continue
+        price = price_index.get(symbol, {}).get(date)
+        if not price:
+            survivors.append(symbol)  # can't price → can't sell, keep
+            continue
+        t = book.sell(
+            sleeve_label=sleeve_label, symbol=symbol, date=date,
+            exec_price=price, reason="rebalance_rotation",
+            slippage_bps=slippage,
+        )
+        if t is not None:
+            trades.append(t)
+        else:
+            survivors.append(symbol)
+
+    # ---- Step 2: pick new entrants (within entry_rank, fill to cap) ----
+    slots = max_positions - len(survivors)
+    survivor_set = set(survivors)
+    entrants: list[str] = []
+    if slots > 0:
+        for sym, _ in ranked:
+            if len(entrants) >= slots or rank_of[sym] > entry_rank:
+                break  # ranked is best-first → nothing eligible remains
+            if sym in survivor_set:
+                continue
+            if price_index.get(sym, {}).get(date):
+                entrants.append(sym)
+
+    n_targets = len(survivors) + len(entrants)
+    if n_targets == 0:
+        return trades
+
+    # ---- Step 3: reweight survivors toward equal target (with band) ----
+    sleeve_nav = book.sleeve_nav(sleeve_label, price_index, date)
+    target_amount = sleeve_nav / n_targets
+    for symbol in survivors:
+        price = price_index.get(symbol, {}).get(date)
+        if not price:
+            continue
+        pos = book.get(sleeve_label, symbol)
+        if pos is None:
+            continue
+        mv = pos.market_value(price)
+        if band > 0 and abs(mv / sleeve_nav - 1.0 / n_targets) <= band:
+            continue  # within no-trade band
+        diff = target_amount - mv
+        if diff < -1000:
+            trim_pct = min((abs(diff) / mv) * 100, 99)
+            trim_shares = pos.shares * (trim_pct / 100.0)
+            if trim_shares > 0:
+                t = book.sell(
+                    sleeve_label=sleeve_label, symbol=symbol, date=date,
+                    exec_price=price, reason="rebalance_trim",
+                    shares=trim_shares, slippage_bps=slippage,
+                )
+                if t is not None:
+                    trades.append(t)
+        elif diff > 1000 and book.sleeve_cash(sleeve_label) > 1000:
+            add_amount = min(diff, book.sleeve_cash(sleeve_label) * 0.95)
+            if add_amount >= 1000:
+                t = book.open(
+                    sleeve_label=sleeve_label, symbol=symbol, date=date,
+                    amount=add_amount, exec_price=price,
+                    slippage_bps=slippage, reason="entry",
+                    shares_mode=cfg.get("sizing", {}).get("shares"),
+                )
+                if t is not None:
+                    trades.append(t)
+
+    # ---- Step 4: buy new entrants --------------------------------------
+    sleeve_nav = book.sleeve_nav(sleeve_label, price_index, date)
+    target_amount = sleeve_nav / n_targets
+    for symbol in entrants:
+        price = price_index.get(symbol, {}).get(date)
+        if not price:
+            continue
+        amount = min(target_amount, book.sleeve_cash(sleeve_label) * 0.95)
+        if amount <= 0:
+            continue
+        t = book.open(
+            sleeve_label=sleeve_label, symbol=symbol, date=date,
+            amount=amount, exec_price=price,
+            slippage_bps=slippage, reason="entry",
+            shares_mode=cfg.get("sizing", {}).get("shares"),
+        )
+        if t is not None:
+            trades.append(t)
+
+    return trades
+
+
 def _make_ohlc_fetcher(price_index: dict):
     """Stub OHLC fetcher used by compute_stop_pricing for vol-adaptive modes.
 
@@ -651,6 +816,7 @@ def _run_daily_loop(
     force_close_at_end: bool,
     initial_capital: float,
     profile_name_by_date: dict[str, str] | None = None,
+    seed_trades: list[dict] | None = None,
 ) -> dict:
     """Daily loop: iterate trading days, apply per-sleeve directives,
     execute trades against the unified PositionBook, emit unified ledger.
@@ -660,7 +826,7 @@ def _run_daily_loop(
     liquidated cleanly with reason=`rebalance_to_<profile>`. This is the
     actual broker action when the portfolio reallocates a sleeve to 0%.
     """
-    all_trades: list[dict] = []
+    all_trades: list[dict] = list(seed_trades or [])
     ranking_history: list[dict] = []   # one entry per (date, sleeve) ranking event
     last_date = trading_dates[-1] if trading_dates else None
     profile_name_by_date = profile_name_by_date or {}
@@ -796,6 +962,19 @@ def _run_daily_loop(
                 all_trades.extend(tw_trades)
                 sleeve.state.last_rebal_date = date
                 continue
+
+            # rank_buffer rebalance mode: hysteresis rotation — re-rank, sell
+            # only names past exit_rank, buy only names within entry_rank, keep
+            # survivors in the buffer zone (low-turnover ranking model).
+            if (rb_mode == "rank_buffer" and rb_freq != "none"
+                    and is_rebalance_date(date, sleeve.state.last_rebal_date, rb_freq)):
+                rbf_trades = _apply_rank_buffer_rebalance(
+                    sleeve=sleeve, book=book, conn=conn,
+                    price_index=price_index, date=date,
+                )
+                all_trades.extend(rbf_trades)
+                sleeve.state.last_rebal_date = date
+                continue
             sleeve_nav = book.sleeve_nav(sleeve.label, price_index, date)
             rds = get_rebalance_directives(
                 sleeve_label=sleeve.label, sleeve_config=sleeve.config, date=date,
@@ -908,6 +1087,61 @@ def _run_daily_loop(
 # ---------------------------------------------------------------------------
 # Public entrypoint
 # ---------------------------------------------------------------------------
+def _seed_opening_positions(
+    portfolio_config: dict,
+    book: PositionBook,
+    sleeve_ctxs: list[_SleeveContext],
+    seed_date: str,
+) -> list[dict]:
+    """Carry pre-existing holdings into the book at deploy time.
+
+    `portfolio_config["opening_positions"]` is a list of
+    {symbol, shares, entry_price, entry_date?, sleeve_label?}. Each is seeded
+    as an open lot at its REAL fill price (cash debited by the exact cost
+    basis). Sleeves that receive a seed are marked `seeded` and have their
+    rebalance anchor set to the seed date. The strategy then runs forward from
+    this opening book exactly as designed — seeding changes only the starting
+    state, not the entry/exit logic (e.g. a full book leaves no open slot, so
+    no day-1 top-up; a partial book backfills toward max_positions as usual).
+    Returns the BUY trade records for the carried-in lots (prepended to the
+    ledger).
+    """
+    seeds = portfolio_config.get("opening_positions") or []
+    if not seeds:
+        return []
+    by_label = {c.label: c for c in sleeve_ctxs}
+    default_label = sleeve_ctxs[0].label if len(sleeve_ctxs) == 1 else None
+    trades: list[dict] = []
+    for s in seeds:
+        label = s.get("sleeve_label") or default_label
+        if label is None or label not in by_label:
+            raise ValueError(
+                f"opening_positions: sleeve_label required and must match a "
+                f"sleeve; got {s.get('sleeve_label')!r} for {s.get('symbol')!r}"
+            )
+        t = book.seed_position(
+            sleeve_label=label,
+            symbol=s["symbol"],
+            entry_date=s.get("entry_date") or seed_date,
+            entry_price=float(s["entry_price"]),
+            shares=float(s["shares"]),
+        )
+        if t is not None:
+            trades.append(t)
+            by_label[label].seeded = True
+    # Anchor the rebalance cadence at the seed date for seeded sleeves so the
+    # next scheduled rebalance is measured from the carry-in, and the loop
+    # suppresses day-1 entry top-ups.
+    for c in sleeve_ctxs:
+        if c.seeded:
+            c.state.last_rebal_date = seed_date
+    if any(c.seeded for c in sleeve_ctxs):
+        total = sum(t["amount"] for t in trades)
+        print(f"Seeded {len(trades)} opening position(s) @ cost ${total:,.2f} "
+              f"(cash remaining ${book.cash:,.2f})")
+    return trades
+
+
 def run_portfolio_backtest(
     portfolio_config: dict,
     force_close_at_end: bool = True,
@@ -1155,6 +1389,11 @@ def run_portfolio_backtest(
         # Park leftover in the wildcard pool so it doesn't get lost.
         initial_cash_by_sleeve["*"] = leftover
     book = PositionBook(initial_cash_by_sleeve)
+    # Carry in pre-existing holdings (real broker fills) when provided. Must
+    # run before the daily loop so day 1 sees the seeded book.
+    seed_trades = _seed_opening_positions(
+        portfolio_config, book, sleeve_ctxs, seed_date=trading_dates[0],
+    )
     print(f"Running V2 simulation with ${initial_capital:,.0f}...")
     loop_result = _run_daily_loop(
         book=book, sleeves=sleeve_ctxs,
@@ -1164,6 +1403,7 @@ def run_portfolio_backtest(
         force_close_at_end=force_close_at_end,
         initial_capital=initial_capital,
         profile_name_by_date=profile_name_by_date,
+        seed_trades=seed_trades,
     )
     conn.close()
 

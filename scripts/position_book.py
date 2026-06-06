@@ -342,6 +342,61 @@ class PositionBook:
         return trade
 
     # -----------------------------------------------------------------------
+    # Seed — carry in a pre-existing holding (real broker fill at deploy time)
+    # -----------------------------------------------------------------------
+    def seed_position(
+        self,
+        sleeve_label: str,
+        symbol: str,
+        entry_date: str,
+        entry_price: float,
+        shares: float,
+        signal_detail: dict | None = None,
+        reason: str = "entry",
+    ) -> dict | None:
+        """Seed a pre-existing OPEN position (an actual broker holding carried
+        in at deploy time) into the book.
+
+        Unlike open(): `entry_price` is the REAL fill price (no slippage
+        applied), `shares` is the actual share count, and cash is debited by
+        the exact cost basis (shares × entry_price). Returns a BUY trade record
+        (so the carried-in lot shows in the ledger), or None if invalid.
+        """
+        entry_price = float(entry_price)
+        shares = float(shares)
+        if entry_price <= 0 or shares <= 0:
+            return None
+        key = (sleeve_label, symbol)
+        if key in self.positions:
+            raise ValueError(f"seed_position: ({sleeve_label}, {symbol}) already exists")
+        pool_key = self._resolve_cash_pool(sleeve_label)
+        amount = shares * entry_price
+        self.cash_by_sleeve[pool_key] -= amount
+        self.positions[key] = Position(
+            sleeve_label=sleeve_label,
+            symbol=symbol,
+            entry_date=entry_date,
+            entry_price=entry_price,
+            shares=shares,
+            peak_price=entry_price,
+            high_since_entry=entry_price,
+            signal_detail=signal_detail,
+        )
+        trade = {
+            "date": entry_date,
+            "symbol": symbol,
+            "action": "BUY",
+            "reason": reason,
+            "price": round(entry_price, 2),
+            "shares": round(shares, 4),
+            "amount": round(amount, 2),
+            "sleeve_label": sleeve_label,
+        }
+        if signal_detail is not None:
+            trade["signal_detail"] = signal_detail
+        return trade
+
+    # -----------------------------------------------------------------------
     # Sell — partial or full
     # -----------------------------------------------------------------------
     def sell(

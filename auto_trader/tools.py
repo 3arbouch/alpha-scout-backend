@@ -425,6 +425,46 @@ async def analyze_factor_library_tool(args: dict[str, Any]) -> dict[str, Any]:
 
 
 @tool(
+    "combine_factors",
+    "Solve data-driven composite_score weights for a set of factors, instead of "
+    "hand-setting bucket weights. Given factors + a target horizon, it computes "
+    "each factor's rank-IC over the run's training window, decorrelates them via "
+    "the factor covariance, and returns a ready-to-use composite_score block "
+    "(one factor per bucket, with the solved weight and the IC-implied sign).\n\n"
+    "CRITICAL — judge by the OUT-OF-SAMPLE number, not in-sample. The diagnostics "
+    "include `combined_ic_oos` (purged k-fold, embargoed by the horizon so "
+    "overlapping forward-return windows can't leak) and `equal_weight_ic_oos` as "
+    "the baseline to beat. If `combined_ic_oos` <= 0 or < equal-weight, DO NOT use "
+    "the solved weights — fall back to method='equal' or 'ic_weighted'. A large "
+    "in-sample/OOS gap means overfitting (raise `shrinkage`).\n\n"
+    "What it tells you: which factors actually carry OOS predictive power at this "
+    "horizon (and their correct sign), how to weight them accounting for "
+    "redundancy, and whether the combination generalizes at all. Window + universe "
+    "default to the run's training period and sector (never reads past the data "
+    "cutoff).\n\n"
+    "Args: factors (list of feature names from the 35-factor library), horizon "
+    "('63d'/'3m'/'6m'/'12m'; hold/IC horizon, default '63d'), method "
+    "('ic_optimal' = Sigma^-1*IC decorrelated [default], 'ic_weighted' = "
+    "IC-weighted, 'equal'), shrinkage (0..1 toward equal weight, default 0.3).",
+    {"factors": list, "horizon": str, "method": str, "shrinkage": float},
+)
+async def combine_factors_tool(args: dict[str, Any]) -> dict[str, Any]:
+    from alpha_combine import combine_factors
+
+    result = combine_factors(
+        factors=args.get("factors") or [],
+        horizon=args.get("horizon") or "63d",
+        method=args.get("method") or "ic_optimal",
+        shrinkage=args.get("shrinkage") if args.get("shrinkage") is not None else 0.3,
+        sector=_SECTOR,
+        start=_START_DATE or "2015-01-01",
+        end=_STOP_DATE,
+        db_path=str(MARKET_DB_PATH),
+    )
+    return {"content": [{"type": "text", "text": json.dumps(result, default=str)}]}
+
+
+@tool(
     "get_experiment_trades",
     "Drill into the trade log for a past experiment in this run. Call "
     "get_experiment_stats FIRST to identify the dimension worth drilling into "

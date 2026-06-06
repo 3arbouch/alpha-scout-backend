@@ -102,6 +102,21 @@ class InlineRegimeDefinition(BaseModel):
 # Full Portfolio Config
 # ---------------------------------------------------------------------------
 
+class OpeningPosition(BaseModel):
+    """A pre-existing holding carried into the book at deploy time — a real
+    broker fill. The engine seeds it at the actual fill price/shares (cost
+    basis, no slippage applied), so the deployment's holdings and P&L track the
+    live account; the strategy then runs forward from this opening book exactly
+    as designed (seeding changes only the starting state, not the logic)."""
+    symbol: str = Field(description="Ticker held at deploy time.")
+    shares: float = Field(gt=0, description="Actual share count filled.")
+    entry_price: float = Field(gt=0, description="Actual per-share fill price (cost basis).")
+    entry_date: str | None = Field(
+        default=None, description="Fill date (YYYY-MM-DD). Defaults to the deployment start date.")
+    sleeve_label: str | None = Field(
+        default=None, description="Sleeve this lot belongs to. Defaults to the sole sleeve in single-sleeve portfolios.")
+
+
 class PortfolioConfig(BaseModel):
     """Complete portfolio definition.
 
@@ -185,6 +200,15 @@ class PortfolioConfig(BaseModel):
     rebalance_threshold: float = Field(
         default=0.05, ge=0.0, le=1.0,
         description="Drift tolerance for portfolio-level rebalancing. When the actual sleeve weight differs from the allocation_profile target by more than this fraction (e.g., 0.05 = 5%), the engine emits rebalance trades to bring the portfolio back to target. When set to 0, the portfolio rebalances continuously every day (institutional 'leveraged-ETF' pattern). Default 0.05 = 5% drift tolerance, the institutional balanced-portfolio standard. Regime-driven profile changes and lerp days bypass this threshold (the contract itself is changing, not just drift).",
+    )
+
+    opening_positions: list[OpeningPosition] | None = Field(
+        default=None,
+        description="Carry-in holdings (real broker fills) to seed the book at "
+                    "deploy time. The engine opens these at their actual cost "
+                    "basis, then runs the strategy forward exactly as designed "
+                    "from that opening book. Used to align a deployment with a "
+                    "live-capital account.",
     )
 
     backtest: BacktestParams = Field(default_factory=BacktestParams)
