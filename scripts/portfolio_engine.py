@@ -172,6 +172,11 @@ def compute_portfolio_id(config: dict) -> str:
         "regime_filter": config.get("regime_filter", False),
         "capital_when_gated_off": config.get("capital_when_gated_off", config.get("capital_flow", "to_cash")),
     }
+    # Carry-in holdings make a portfolio distinct (a seeded live-capital deploy
+    # vs the same strategy run fresh). Only fold it in when present so every
+    # existing portfolio_id stays byte-stable.
+    if config.get("opening_positions"):
+        key_parts["opening_positions"] = config["opening_positions"]
     raw = json.dumps(key_parts, sort_keys=True)
     return hashlib.md5(raw.encode()).hexdigest()[:12]
 

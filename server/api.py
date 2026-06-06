@@ -1958,6 +1958,22 @@ async def get_deployment_unified(deploy_id: str, _: str = Depends(verify_api_key
     return result
 
 
+@app.get("/deployments/{deploy_id}/daily", tags=["Deployments (Unified)"])
+async def get_deployment_daily_pnl(deploy_id: str, _: str = Depends(verify_api_key)):
+    """Slim daily P&L series vs. benchmark, for the daily-performance chart.
+
+    One lightweight point per trading day (no per-day positions payload):
+    portfolio NAV, daily P&L ($ and %), cumulative return %, and the market
+    benchmark rebased to the same initial capital + date grid (daily % and
+    cumulative %). Benchmark fields are null when unavailable.
+    """
+    from deploy_engine import daily_pnl_series
+    series = daily_pnl_series(deploy_id)
+    if series is None:
+        raise HTTPException(404, f"Deployment '{deploy_id}' not found")
+    return _sanitize_floats(series)
+
+
 @app.post("/deployments/{deploy_id}/evaluate", tags=["Deployments (Unified)"])
 async def evaluate_deployment_unified(deploy_id: str, _: str = Depends(verify_api_key)):
     """Manually trigger re-evaluation of a deployment."""

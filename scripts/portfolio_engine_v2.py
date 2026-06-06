@@ -150,6 +150,11 @@ class _SleeveContext:
         self.pit_members_on: dict[str, frozenset[str]] | None = None
         # pending entries from yesterday's signals (next_close/next_open mode)
         self.pending_entries: list = []  # list of EntryDirective
+        # True when this sleeve's book was seeded with carried-in opening
+        # positions (real broker holdings). The strategy then runs forward
+        # exactly as designed from that opening book — seeding only changes the
+        # starting state, not the entry/exit logic.
+        self.seeded: bool = False
         # Allocated capital (in fixed-weight mode = weight × initial_capital)
         self.allocated_capital: float = 0.0
         # Bookkeeping
@@ -811,6 +816,7 @@ def _run_daily_loop(
     force_close_at_end: bool,
     initial_capital: float,
     profile_name_by_date: dict[str, str] | None = None,
+    seed_trades: list[dict] | None = None,
 ) -> dict:
     """Daily loop: iterate trading days, apply per-sleeve directives,
     execute trades against the unified PositionBook, emit unified ledger.
@@ -820,7 +826,7 @@ def _run_daily_loop(
     liquidated cleanly with reason=`rebalance_to_<profile>`. This is the
     actual broker action when the portfolio reallocates a sleeve to 0%.
     """
-    all_trades: list[dict] = []
+    all_trades: list[dict] = list(seed_trades or [])
     ranking_history: list[dict] = []   # one entry per (date, sleeve) ranking event
     last_date = trading_dates[-1] if trading_dates else None
     profile_name_by_date = profile_name_by_date or {}
@@ -1081,6 +1087,61 @@ def _run_daily_loop(
 # ---------------------------------------------------------------------------
 # Public entrypoint
 # ---------------------------------------------------------------------------
+def _seed_opening_positions(
+    portfolio_config: dict,
+    book: PositionBook,
+    sleeve_ctxs: list[_SleeveContext],
+    seed_date: str,
+) -> list[dict]:
+    """Carry pre-existing holdings into the book at deploy time.
+
+    `portfolio_config["opening_positions"]` is a list of
+    {symbol, shares, entry_price, entry_date?, sleeve_label?}. Each is seeded
+    as an open lot at its REAL fill price (cash debited by the exact cost
+    basis). Sleeves that receive a seed are marked `seeded` and have their
+    rebalance anchor set to the seed date. The strategy then runs forward from
+    this opening book exactly as designed — seeding changes only the starting
+    state, not the entry/exit logic (e.g. a full book leaves no open slot, so
+    no day-1 top-up; a partial book backfills toward max_positions as usual).
+    Returns the BUY trade records for the carried-in lots (prepended to the
+    ledger).
+    """
+    seeds = portfolio_config.get("opening_positions") or []
+    if not seeds:
+        return []
+    by_label = {c.label: c for c in sleeve_ctxs}
+    default_label = sleeve_ctxs[0].label if len(sleeve_ctxs) == 1 else None
+    trades: list[dict] = []
+    for s in seeds:
+        label = s.get("sleeve_label") or default_label
+        if label is None or label not in by_label:
+            raise ValueError(
+                f"opening_positions: sleeve_label required and must match a "
+                f"sleeve; got {s.get('sleeve_label')!r} for {s.get('symbol')!r}"
+            )
+        t = book.seed_position(
+            sleeve_label=label,
+            symbol=s["symbol"],
+            entry_date=s.get("entry_date") or seed_date,
+            entry_price=float(s["entry_price"]),
+            shares=float(s["shares"]),
+        )
+        if t is not None:
+            trades.append(t)
+            by_label[label].seeded = True
+    # Anchor the rebalance cadence at the seed date for seeded sleeves so the
+    # next scheduled rebalance is measured from the carry-in, and the loop
+    # suppresses day-1 entry top-ups.
+    for c in sleeve_ctxs:
+        if c.seeded:
+            c.state.last_rebal_date = seed_date
+    if any(c.seeded for c in sleeve_ctxs):
+        total = sum(t["amount"] for t in trades)
+        print(f"Seeded {len(trades)} opening position(s) @ cost ${total:,.2f} "
+              f"(cash remaining ${book.cash:,.2f})")
+    return trades
+
+
 def run_portfolio_backtest(
     portfolio_config: dict,
     force_close_at_end: bool = True,
@@ -1328,6 +1389,11 @@ def run_portfolio_backtest(
         # Park leftover in the wildcard pool so it doesn't get lost.
         initial_cash_by_sleeve["*"] = leftover
     book = PositionBook(initial_cash_by_sleeve)
+    # Carry in pre-existing holdings (real broker fills) when provided. Must
+    # run before the daily loop so day 1 sees the seeded book.
+    seed_trades = _seed_opening_positions(
+        portfolio_config, book, sleeve_ctxs, seed_date=trading_dates[0],
+    )
     print(f"Running V2 simulation with ${initial_capital:,.0f}...")
     loop_result = _run_daily_loop(
         book=book, sleeves=sleeve_ctxs,
@@ -1337,6 +1403,7 @@ def run_portfolio_backtest(
         force_close_at_end=force_close_at_end,
         initial_capital=initial_capital,
         profile_name_by_date=profile_name_by_date,
+        seed_trades=seed_trades,
     )
     conn.close()
 
