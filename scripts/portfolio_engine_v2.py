@@ -643,6 +643,50 @@ def _band_dest_amount(mv: float, sleeve_nav: float, target_weight: float, band: 
     return sleeve_nav * target_weight
 
 
+def _rank_buffer_target_weights(
+    symbols: list[str],
+    sleeve: "_SleeveContext",
+    price_index: dict,
+    date: str,
+    n_targets: int,
+) -> dict[str, float]:
+    """Per-name target weights for the rank_buffer reweight, per sizing.type.
+
+    - equal_weight / fixed_amount → uniform 1/n_targets (byte-identical to the
+      legacy reweight, which always targeted equal weight).
+    - risk_parity → inverse-vol shares normalized across the held book, so risk
+      parity is MAINTAINED on every rebalance instead of decaying to equal
+      weight (the rank_buffer reweight previously ignored sizing.type). Names
+      whose vol can't be estimated fall back to the book's median vol so they
+      stay invested rather than dropping to a zero target.
+    """
+    uniform = (1.0 / n_targets) if n_targets else 0.0
+    cfg = sleeve.config
+    if cfg.get("sizing", {}).get("type") != "risk_parity" or not symbols:
+        return {s: uniform for s in symbols}
+    import statistics
+    vol_window = int(cfg["sizing"].get("vol_window_days", 20))
+    vol_source = cfg["sizing"].get("vol_source", "historical")
+    sigmas: dict[str, float] = {}
+    for sym in symbols:
+        pm = price_index.get(sym, {})
+        if not pm:
+            continue
+        closes_dates = sorted(d for d in pm if d < date)
+        tail = closes_dates[-(vol_window + 1):] if len(closes_dates) >= vol_window + 1 else []
+        if not tail:
+            continue
+        sigma = compute_realized_vol([pm[d] for d in tail], vol_window, vol_source)
+        if sigma is not None and sigma > 0:
+            sigmas[sym] = sigma
+    if not sigmas:
+        return {s: uniform for s in symbols}
+    median_sigma = statistics.median(sigmas.values())
+    inv = {s: 1.0 / sigmas.get(s, median_sigma) for s in symbols}
+    total = sum(inv.values())
+    return {s: v / total for s, v in inv.items()}
+
+
 def _apply_rank_buffer_rebalance(
     sleeve: "_SleeveContext",
     book: PositionBook,
@@ -752,7 +796,12 @@ def _apply_rank_buffer_rebalance(
     # up to the edge was already deemed acceptable, so trading past the edge is
     # wasted turnover. With band == 0 this degrades to full correction to target.
     sleeve_nav = book.sleeve_nav(sleeve_label, price_index, date)
-    target_weight = 1.0 / n_targets
+    # Per-name target weights from sizing.type (equal_weight → uniform;
+    # risk_parity → inverse-vol). Computed once over the full intended book
+    # (survivors + entrants) and reused by Step 4.
+    target_weights = _rank_buffer_target_weights(
+        survivors + entrants, sleeve, price_index, date, n_targets)
+    uniform_w = 1.0 / n_targets
     for symbol in survivors:
         price = price_index.get(symbol, {}).get(date)
         if not price:
@@ -761,7 +810,7 @@ def _apply_rank_buffer_rebalance(
         if pos is None:
             continue
         mv = pos.market_value(price)
-        dest_amount = _band_dest_amount(mv, sleeve_nav, target_weight, band)
+        dest_amount = _band_dest_amount(mv, sleeve_nav, target_weights.get(symbol, uniform_w), band)
         if dest_amount is None:
             continue  # within no-trade band
         diff = dest_amount - mv
@@ -788,13 +837,13 @@ def _apply_rank_buffer_rebalance(
                 if t is not None:
                     trades.append(t)
 
-    # ---- Step 4: buy new entrants --------------------------------------
+    # ---- Step 4: buy new entrants (at their sizing-derived target) ------
     sleeve_nav = book.sleeve_nav(sleeve_label, price_index, date)
-    target_amount = sleeve_nav / n_targets
     for symbol in entrants:
         price = price_index.get(symbol, {}).get(date)
         if not price:
             continue
+        target_amount = sleeve_nav * target_weights.get(symbol, uniform_w)
         amount = min(target_amount, book.sleeve_cash(sleeve_label) * 0.95)
         if amount <= 0:
             continue
