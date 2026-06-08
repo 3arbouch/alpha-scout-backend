@@ -522,6 +522,12 @@ class CompositeScoreConfig(BaseModel):
         default="rank",
         description="'rank' = rank-then-normalize (robust to outliers; recommended). 'z' = (x-mean)/stdev.",
     )
+    sector_neutral: bool = Field(
+        default=False,
+        description="When true, standardize each factor WITHIN its GICS sector (sector-relative) "
+        "instead of across the whole candidate set. Removes the sector-level signal so the score "
+        "picks the best name relative to its peers rather than overweighting whichever sector runs hot.",
+    )
 
     @model_validator(mode="after")
     def _validate_weights(self):
@@ -568,7 +574,7 @@ class RebalancingRules(BaseModel):
 
 class RebalancingConfig(BaseModel):
     """Periodic portfolio rebalancing."""
-    frequency: Literal["none", "quarterly", "monthly", "on_earnings"] = Field(default="none")
+    frequency: Literal["none", "weekly", "monthly", "quarterly", "on_earnings"] = Field(default="none")
     mode: Literal["trim", "equal_weight", "target_weight", "rank_buffer"] = Field(default="trim")
     rules: RebalancingRules = Field(default_factory=RebalancingRules)
 

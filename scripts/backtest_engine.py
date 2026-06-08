@@ -960,6 +960,65 @@ DEFAULT_RANKING_METRIC = "pe_percentile"
 DEFAULT_RANKING_ORDER = "asc"
 
 
+def _load_symbol_sectors(symbols: list[str], conn) -> dict[str, str]:
+    """Map each symbol to its GICS sector via universe_profiles.
+
+    Returns {symbol: sector} for symbols with a non-null sector. Symbols
+    missing from universe_profiles (or with a null sector) are simply absent
+    from the result — the caller groups them under a None sentinel. Returns
+    {} when `conn` is None or the lookup fails, so the sector-neutral path
+    degrades to whole-universe standardization rather than erroring.
+    """
+    if conn is None or not symbols:
+        return {}
+    try:
+        placeholders = ",".join("?" * len(symbols))
+        rows = conn.execute(
+            f"SELECT symbol, sector FROM universe_profiles WHERE symbol IN ({placeholders})",
+            list(symbols),
+        ).fetchall()
+    except Exception:
+        return {}
+    return {r[0]: r[1] for r in rows if r[1]}
+
+
+def _standardize_vals(vals, standardization: str):
+    """Cross-sectional standardization of a 1-D array (rank or z).
+
+    Extracted verbatim from the in-loop math so the whole-universe and
+    per-sector paths share one implementation. Returns a float array the same
+    length as `vals`. 'rank' = average-rank centered to mean 0 / unit std;
+    'z' = (x - mean) / stdev. A degenerate spread (all equal) maps to zeros.
+    """
+    import numpy as np
+
+    if standardization == "rank":
+        # Average-rank → centered → unit std (bit-exact reproducible).
+        order = np.argsort(vals, kind="mergesort")
+        ranks = np.empty_like(order, dtype=np.float64)
+        n = len(vals)
+        i = 0
+        sorted_vals = vals[order]
+        while i < n:
+            j = i + 1
+            while j < n and sorted_vals[j] == sorted_vals[i]:
+                j += 1
+            avg_rank = (i + j - 1) / 2.0 + 1.0  # 1-based
+            ranks[order[i:j]] = avg_rank
+            i = j
+        centered = ranks - (n + 1) / 2.0   # mean 0
+        scale = np.std(centered, ddof=0)
+        if scale == 0:
+            return np.zeros_like(centered)
+        return centered / scale
+    else:  # 'z': plain mean/stdev
+        mu = float(vals.mean())
+        sd = float(vals.std(ddof=0))
+        if sd == 0:
+            return np.zeros_like(vals)
+        return (vals - mu) / sd
+
+
 def _compute_composite_score(
     symbols: list[str],
     conn,
@@ -1068,50 +1127,42 @@ def _compute_composite_score(
 
     # Cross-sectional standardization per factor (rank or z), over the
     # candidate set passed in. Stocks missing the factor are not in z_by_factor[f].
+    #
+    # sector_neutral: when set, standardize each factor WITHIN its sector group
+    # instead of across the whole candidate set. This subtracts the sector-level
+    # signal so the score reflects within-peer-group strength (best semi vs best
+    # healthcare name) rather than "whichever sector is hot." A sector group with
+    # <2 members can't be standardized, so those names get no z for that factor —
+    # the same convention as the whole-universe <2 case. Symbols with an unknown
+    # sector are pooled under a None sentinel and standardized among themselves.
+    sector_neutral = bool(composite_config.get("sector_neutral", False))
+    sector_of = _load_symbol_sectors(symbols, conn) if sector_neutral else {}
+
     z_by_factor: dict[str, dict[str, float]] = {}
     for fname, per_sym in values_by_factor.items():
         if len(per_sym) < 2:
             z_by_factor[fname] = {}
             continue
-        syms = list(per_sym.keys())
-        vals = np.array([per_sym[s] for s in syms], dtype=np.float64)
-        if standardization == "rank":
-            # Average-rank → percentile → z-equivalent (approximately N(0,1))
-            order = np.argsort(vals, kind="mergesort")
-            ranks = np.empty_like(order, dtype=np.float64)
-            # Use average ranks for ties (same as scipy.stats.rankdata 'average')
-            n = len(vals)
-            i = 0
-            sorted_vals = vals[order]
-            while i < n:
-                j = i + 1
-                while j < n and sorted_vals[j] == sorted_vals[i]:
-                    j += 1
-                avg_rank = (i + j - 1) / 2.0 + 1.0  # 1-based
-                ranks[order[i:j]] = avg_rank
-                i = j
-            # Percentile in (0, 1), then map to z ~ N(0, 1) via inverse normal.
-            # Use simple (rank - 0.5) / n to avoid 0 or 1.
-            pct = (ranks - 0.5) / n
-            # Equivalent z via inverse normal — but we don't need scipy here.
-            # Use sqrt(2) * erfinv(2*pct - 1). For audit purposes use a direct
-            # rank-based standardization that's bit-exact reproducible: scale
-            # ranks to [-1, +1] then to unit std. Skip the inv-normal mapping
-            # since the relative ordering is what ultimately drives ranking.
-            centered = ranks - (n + 1) / 2.0   # mean 0
-            scale = np.std(centered, ddof=0)
-            if scale == 0:
-                z_vals = np.zeros_like(centered)
-            else:
-                z_vals = centered / scale
-        else:  # 'z': plain mean/stdev
-            mu = float(vals.mean())
-            sd = float(vals.std(ddof=0))
-            if sd == 0:
-                z_vals = np.zeros_like(vals)
-            else:
-                z_vals = (vals - mu) / sd
-        z_by_factor[fname] = {syms[k]: float(z_vals[k]) for k in range(len(syms))}
+        if sector_neutral:
+            # Group this factor's available symbols by sector, standardize each
+            # group independently, then merge back into one z map.
+            groups: dict[object, list[str]] = {}
+            for s in per_sym:
+                groups.setdefault(sector_of.get(s), []).append(s)
+            z_map: dict[str, float] = {}
+            for grp_syms in groups.values():
+                if len(grp_syms) < 2:
+                    continue
+                vals = np.array([per_sym[s] for s in grp_syms], dtype=np.float64)
+                z_vals = _standardize_vals(vals, standardization)
+                for k, s in enumerate(grp_syms):
+                    z_map[s] = float(z_vals[k])
+            z_by_factor[fname] = z_map
+        else:
+            syms = list(per_sym.keys())
+            vals = np.array([per_sym[s] for s in syms], dtype=np.float64)
+            z_vals = _standardize_vals(vals, standardization)
+            z_by_factor[fname] = {syms[k]: float(z_vals[k]) for k in range(len(syms))}
 
     # Compose: per-bucket mean over (sign · z); cross-bucket weighted sum.
     # `details_by_sym` mirrors the math, retaining every intermediate value the
@@ -2368,6 +2419,8 @@ def is_rebalance_date(date: str, last_rebal: str, frequency: str) -> bool:
         return (current - last).days >= 90
     elif frequency == "monthly":
         return (current - last).days >= 30
+    elif frequency == "weekly":
+        return (current - last).days >= 7
 
     return False
 

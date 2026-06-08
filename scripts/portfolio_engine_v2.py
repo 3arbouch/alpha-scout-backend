@@ -621,6 +621,28 @@ def _apply_target_weight_rebalance(
     return trades
 
 
+def _band_dest_amount(mv: float, sleeve_nav: float, target_weight: float, band: float):
+    """Dollar destination for a survivor under a no-trade band with trade-to-edge.
+
+    Returns None when the position needs no trade — either it sits within the
+    no-trade band (|weight − target| ≤ band) or the sleeve NAV is non-positive.
+    Otherwise returns the dollar amount to size the position to:
+      - band > 0: the NEAR BAND EDGE (target ± band) — drift up to the edge was
+        already acceptable, so we stop there rather than overshooting to target
+        (the no-trade-region result; minimises turnover).
+      - band == 0: full correction to the target weight (legacy behaviour).
+    """
+    if sleeve_nav <= 0:
+        return None
+    weight = mv / sleeve_nav
+    if band > 0:
+        if abs(weight - target_weight) <= band:
+            return None  # within no-trade band
+        edge_weight = target_weight + band if weight > target_weight else target_weight - band
+        return sleeve_nav * max(edge_weight, 0.0)
+    return sleeve_nav * target_weight
+
+
 def _apply_rank_buffer_rebalance(
     sleeve: "_SleeveContext",
     book: PositionBook,
@@ -723,8 +745,14 @@ def _apply_rank_buffer_rebalance(
         return trades
 
     # ---- Step 3: reweight survivors toward equal target (with band) ----
+    # No-trade band with trade-to-edge: a survivor whose weight is within
+    # `band` of the equal target is left alone. When it breaches, we correct it
+    # back only to the NEAR BAND EDGE (target ± band), not all the way to
+    # target — the no-trade-region result (Markowitz–van Dijk / Leland). Drift
+    # up to the edge was already deemed acceptable, so trading past the edge is
+    # wasted turnover. With band == 0 this degrades to full correction to target.
     sleeve_nav = book.sleeve_nav(sleeve_label, price_index, date)
-    target_amount = sleeve_nav / n_targets
+    target_weight = 1.0 / n_targets
     for symbol in survivors:
         price = price_index.get(symbol, {}).get(date)
         if not price:
@@ -733,9 +761,10 @@ def _apply_rank_buffer_rebalance(
         if pos is None:
             continue
         mv = pos.market_value(price)
-        if band > 0 and abs(mv / sleeve_nav - 1.0 / n_targets) <= band:
+        dest_amount = _band_dest_amount(mv, sleeve_nav, target_weight, band)
+        if dest_amount is None:
             continue  # within no-trade band
-        diff = target_amount - mv
+        diff = dest_amount - mv
         if diff < -1000:
             trim_pct = min((abs(diff) / mv) * 100, 99)
             trim_shares = pos.shares * (trim_pct / 100.0)

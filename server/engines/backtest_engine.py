@@ -236,6 +236,8 @@ def _is_rebalance_date(date: str, last_rebal: str | None, frequency: str) -> boo
         return (current - last).days >= 90
     elif frequency == "monthly":
         return (current - last).days >= 30
+    elif frequency == "weekly":
+        return (current - last).days >= 7
     return False
 
 
