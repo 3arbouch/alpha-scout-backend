@@ -44,8 +44,8 @@ Then extract the durable claims as STRUCTURED RESEARCH RECORDS — each one
 modelled on the kind of post-trade note a real quant shop would write. Each
 item carries:
 
-  - kind: one of {factor_observation, trade_pattern, risk_observation,
-                  thesis_validation, regime_observation, anomaly}
+  - kind: one of {factor_observation, factor_interaction, trade_pattern,
+                  risk_observation, thesis_validation, regime_observation, anomaly}
   - claim: 1-2 sentence testable assertion. Sharp, falsifiable, specific.
     Bad:  "Momentum worked."
     Good: "12-1 month momentum (ret_12_1m) delivered positive cross-sectional
@@ -72,6 +72,13 @@ item carries:
     ("this run lost money on energy") — those are not falsifiable.
   - universe: sector slug or "global". Use the experiment's universe when
     the claim is universe-specific; "global" when it transcends sectors.
+  - test_spec: REQUIRED for kind=factor_interaction — the machine-testable form
+    of the claim, so the pipeline can validate it out-of-sample, per regime.
+    Shape: {"primary_factor": "<factor>", "conditioning_factor": "<factor>",
+            "horizon_days": 63, "hypothesis": "cheap_beats_expensive"}
+    hypothesis ∈ {cheap_beats_expensive, expensive_beats_cheap, low_beats_high,
+    high_beats_low}. If you cannot express the interaction as a test_spec, it is
+    a platitude — do not emit it as a factor_interaction.
 
 Be skeptical. Distinguish noise from signal. If the result was driven by one
 position or one window, say so in caveats AND lower confidence accordingly.
@@ -315,13 +322,18 @@ def _persist_memo_and_items(experiment_id: str, run_id: str,
                 confidence = None
         else:
             confidence = None
+        # A factor-interaction claim carrying a test_spec enters as a `candidate`
+        # for the validation pipeline (lesson_pipeline.validate_candidate_lessons).
+        ts = item.get("test_spec")
+        test_spec_json = json.dumps(ts) if isinstance(ts, dict) else None
+        vstatus = "candidate" if (test_spec_json and kind == "factor_interaction") else None
         app.execute(
             """INSERT INTO memo_items
                (id, experiment_id, run_id, universe, kind, claim,
                 mechanism, evidence_summary, confidence, caveats, implication,
                 is_forward_looking, scope_level, promotion_count,
-                falsified, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                falsified, test_spec, validation_status, created_at, updated_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (item_id, experiment_id, run_id,
              item.get("universe") or universe_default,
              kind, claim,
@@ -331,7 +343,7 @@ def _persist_memo_and_items(experiment_id: str, run_id: str,
              item.get("caveats") or None,
              item.get("implication") or None,
              1 if item.get("is_forward_looking") else 0,
-             "run", 1, 0, now, now),
+             "run", 1, 0, test_spec_json, vstatus, now, now),
         )
     app.commit()
     app.close()
@@ -410,6 +422,7 @@ def recall_memo_items(run_id: str | None = None,
                       scope_level: str | None = None,
                       forward_looking_only: bool = True,
                       include_falsified: bool = False,
+                      validated_only: bool = False,
                       limit: int = 20) -> list[dict]:
     """Query memo_items by filter. Sorted by promotion_count DESC, recency DESC.
 
@@ -432,10 +445,14 @@ def recall_memo_items(run_id: str | None = None,
         where.append("is_forward_looking = 1")
     if not include_falsified:
         where.append("falsified = 0")
+    if validated_only:
+        where.append("validation_status IN ('validated', 'validated_conditional')")
     sql = """SELECT id, experiment_id, run_id, universe, kind, claim,
                     mechanism, evidence_summary, confidence, caveats, implication,
                     is_forward_looking, scope_level, promotion_count,
                     falsified, falsified_reason, falsified_by_experiment,
+                    validation_status, validated_confidence, regime_conditions,
+                    last_validated_at, test_spec,
                     created_at, updated_at
              FROM memo_items"""
     if where:
