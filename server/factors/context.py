@@ -233,6 +233,28 @@ class ComputeContext:
             return None
         return (cur / prev - 1.0) * 100.0
 
+    def trailing_daily_returns(self, window: int) -> list[float] | None:
+        """The last `window` simple daily returns ending at self.date.
+
+        r_t = close_t / close_{t-1} − 1. The most recent return is the one
+        realized at self.date's close — point-in-time (known by today's close,
+        never forward-looking). Returns None when self.date isn't a price date
+        or there's insufficient history (needs window+1 prior closes).
+        """
+        if not self.prices_history:
+            return None
+        idx = self._current_price_idx()
+        if idx is None or idx - window < 0:
+            return None
+        rets: list[float] = []
+        for j in range(idx - window + 1, idx + 1):
+            prev = self.prices_history[j - 1][1]
+            cur = self.prices_history[j][1]
+            if not prev or prev <= 0 or cur is None:
+                return None
+            rets.append(cur / prev - 1.0)
+        return rets
+
     # ---- Analyst-grade window helpers --------------------------------------
     def grades_in_window(self, days: int) -> list[tuple]:
         """Grade rows with date in [self.date - days + 1, self.date]."""
