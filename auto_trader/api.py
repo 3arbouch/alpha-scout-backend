@@ -303,6 +303,9 @@ class CreateRunRequest(BaseModel):
     alpha_benchmark: str = Field(default="auto", description="Benchmark for alpha: 'sector' (sector ETF), 'market' (SPY), 'auto' (sector if sector is set, else market)")
     starting_portfolio: dict | None = Field(default=None, description="Optional starting portfolio config.")
     include_analyst_notes: bool = Field(default=True, description="Feed the post-trade analyst's notes to the trader agent in its history context. Memos are still generated either way (visible in the UI / analyst endpoint); this only controls whether the agent sees them.")
+    validate_lessons: bool = Field(default=False, description="After the run, validate this run's candidate factor-interaction lessons on a held-out window (per regime) and persist the verdict to memo_items. OFF by default. Requires holdout_start + holdout_end.")
+    holdout_start: str | None = Field(default=None, description="Lesson-validation holdout start (YYYY-MM-DD). MUST be disjoint from start/end — never validate on training data.")
+    holdout_end: str | None = Field(default=None, description="Lesson-validation holdout end (YYYY-MM-DD).")
     # Walk-forward eval — both optional. Setting `eval` runs N+1 backtests per
     # iteration (training + each eval window). `target_aggregator != "overall"`
     # makes the agent climb the aggregated eval metric instead of the
@@ -689,6 +692,9 @@ async def create_run(body: CreateRunRequest):
         "alpha_benchmark": alpha_benchmark,
         "target_aggregator": body.target_aggregator,
         "include_analyst_notes": body.include_analyst_notes,
+        "validate_lessons": body.validate_lessons,
+        "holdout_start": body.holdout_start,
+        "holdout_end": body.holdout_end,
     }
     if body.starting_portfolio:
         config["starting_portfolio"] = body.starting_portfolio
@@ -794,6 +800,11 @@ async def start_run(run_id: str, body: StartRunRequest = StartRunRequest()):
         cmd.extend(["--target-aggregator", config["target_aggregator"]])
     if not config.get("include_analyst_notes", True):
         cmd.append("--no-analyst-notes")
+    # Opt-in lesson validation — only when toggled AND a disjoint holdout is given.
+    if config.get("validate_lessons") and config.get("holdout_start") and config.get("holdout_end"):
+        cmd.append("--validate-lessons")
+        cmd.extend(["--holdout-start", config["holdout_start"]])
+        cmd.extend(["--holdout-end", config["holdout_end"]])
 
     # Spawn as background process
     env = os.environ.copy()
