@@ -1549,6 +1549,14 @@ async def main():
     parser.add_argument("--no-analyst-notes", action="store_true",
                         help="Don't surface analyst notes in the agent's history context. "
                              "Memos are still generated; the agent just doesn't see them.")
+    parser.add_argument("--validate-lessons", action="store_true",
+                        help="After the run, validate this run's candidate factor-interaction "
+                             "lessons on a held-out window (per regime) and persist the verdict. "
+                             "OFF by default. Requires --holdout-start/--holdout-end.")
+    parser.add_argument("--holdout-start", type=str, default=None,
+                        help="Lesson-validation holdout start — MUST be disjoint from --start/--end.")
+    parser.add_argument("--holdout-end", type=str, default=None,
+                        help="Lesson-validation holdout end.")
     args = parser.parse_args()
 
     # Load eval block from sidecar file.
@@ -1756,6 +1764,25 @@ async def main():
     print(f"Discards:     {summary['discards']}")
     print(f"Errors:       {summary['errors']}")
     print(f"Best {args.metric}: {summary['best_value']}")
+
+    # --- Lesson validation (opt-in; auxiliary — must NEVER crash the run) ---
+    if args.validate_lessons:
+        if not (args.holdout_start and args.holdout_end):
+            print("  ⚠ --validate-lessons set but no --holdout-start/--holdout-end given; "
+                  "skipping (refusing to validate on training data).")
+        else:
+            try:
+                import sqlite3 as _sqlite
+                from auto_trader.lesson_pipeline import validate_candidate_lessons
+                from auto_trader.schema import get_db as _get_db
+                _mkt = _sqlite.connect(os.environ.get(
+                    "MARKET_DB_PATH",
+                    str(Path(__file__).parent.parent / "data" / "market_dev.db")))
+                _summary = validate_candidate_lessons(
+                    _get_db(), _mkt, args.holdout_start, args.holdout_end, run_id=run_id)
+                print(f"  🔎 lesson validation ({args.holdout_start}..{args.holdout_end}): {_summary}")
+            except Exception as e:
+                print(f"  ⚠ lesson validation failed (non-fatal): {e}")
 
     # Mark run as completed (reached max_experiments)
     _update_run_status(run_id, "completed")

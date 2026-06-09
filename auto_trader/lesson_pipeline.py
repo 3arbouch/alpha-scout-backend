@@ -95,7 +95,8 @@ def _known_factors(market_conn):
 # Phase 3 + 6 — confidence engine / persistence / graveyard / re-test
 # --------------------------------------------------------------------------- #
 def validate_candidate_lessons(app_conn, market_conn, holdout_start, holdout_end,
-                               regime_configs=None, only_candidates=True, limit=None):
+                               regime_configs=None, only_candidates=True, limit=None,
+                               run_id=None):
     """Validate candidate lessons on the holdout; write the verdict back.
 
     Pulls factor-interaction claims, operationalizes them, runs the PIT
@@ -107,13 +108,17 @@ def validate_candidate_lessons(app_conn, market_conn, holdout_start, holdout_end
     regime_configs = regime_configs or SEED_REGIMES
     migrate_memo_items(app_conn)   # idempotent — self-heal schema on the runtime DB
     known = _known_factors(market_conn)
+    params = []
     where = "WHERE kind='factor_interaction' AND test_spec IS NOT NULL"
     if only_candidates:
         where += " AND (validation_status IS NULL OR validation_status='candidate')"
+    if run_id:
+        where += " AND run_id=?"
+        params.append(run_id)
     sql = f"SELECT id, claim, test_spec FROM memo_items {where} ORDER BY created_at"
     if limit:
         sql += f" LIMIT {int(limit)}"
-    rows = app_conn.execute(sql).fetchall()
+    rows = app_conn.execute(sql, params).fetchall()
 
     now = datetime.now(timezone.utc).isoformat()
     summary = {"validated": 0, "validated_conditional": 0, "rejected": 0, "skipped": 0}
