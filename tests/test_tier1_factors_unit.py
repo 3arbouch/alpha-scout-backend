@@ -12,9 +12,12 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "server"))
 
+import statistics
+
 from factors.context import ComputeContext
 from factors.library.profitability import _gross_profitability, _accruals
 from factors.library.investment import _net_issuance, _asset_growth
+from factors.library.surprise import _sue, _earnings_surprise
 
 PASS = FAIL = 0
 
@@ -108,6 +111,40 @@ check("-10% asset shrink", approx(_asset_growth(ctx(balance_slice=balsh)), -10.0
       str(_asset_growth(ctx(balance_slice=balsh))))
 # <5 balance rows → None
 check("4 balance rows → None", _asset_growth(ctx(balance_slice=bal5[:4])) is None)
+
+print("\n=== sue = latest surprise / sample stdev of trailing surprises ===")
+# surprises [1,2,3,4,5]; sample stdev = sqrt(2.5)=1.5811; SUE = 5/1.5811 = 3.1623
+sur = [1.0, 2.0, 3.0, 4.0, 5.0]
+exp_sue = sur[-1] / statistics.stdev(sur)
+check(f"matches hand-computed ({exp_sue:.4f})", approx(_sue(sur), exp_sue), str(_sue(sur)))
+# negative surprise (miss) → negative SUE
+check("miss → negative", _sue([2.0, 1.0, 0.0, -1.0, -3.0]) < 0)
+# <4 surprises → None
+check("3 surprises → None", _sue([1.0, 2.0, 3.0]) is None)
+# zero dispersion (identical surprises) → None (avoid div-by-zero)
+check("flat surprises → None", _sue([2.0, 2.0, 2.0, 2.0, 2.0]) is None)
+
+
+def ectx(history, date="d5"):
+    return ComputeContext(symbol="T", date=date, close=100.0, income_slice=[],
+                          balance_asof=None, cashflow_slice=[], earnings_history=history)
+
+
+print("\n=== sue via context: PIT filters to announced-on-or-before date ===")
+# surprises 1..5 on d1..d5; estimate fixed so surprise = actual - est.
+# rows: (date, eps_actual, eps_estimated); surprise = actual-est
+hist = [("d1", 11.0, 10.0), ("d2", 12.0, 10.0), ("d3", 13.0, 10.0),
+        ("d4", 14.0, 10.0), ("d5", 15.0, 10.0)]   # surprises 1,2,3,4,5
+got = _earnings_surprise(ectx(hist, date="d5"))
+check(f"as-of d5 SUE = {exp_sue:.4f}", approx(got, exp_sue), str(got))
+# as-of d4: only surprises 1,2,3,4 visible (d5 not yet announced) — no lookahead
+sur4 = [1.0, 2.0, 3.0, 4.0]
+check("as-of d4 excludes future d5", approx(_earnings_surprise(ectx(hist, date="d4")),
+                                            sur4[-1] / statistics.stdev(sur4)), "")
+# row with missing actual is skipped
+hist_gap = hist[:4] + [("d5", None, 10.0)]
+check("missing eps_actual skipped → uses d1..d4", approx(_earnings_surprise(ectx(hist_gap, "d5")),
+                                                         sur4[-1] / statistics.stdev(sur4)), "")
 
 print("\n=== formula recompute (independent) on arbitrary numbers ===")
 gp_q, ta = [11.0, 13.0, 17.0, 19.0], 250.0   # TTM = 60

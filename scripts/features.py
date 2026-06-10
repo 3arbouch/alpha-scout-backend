@@ -213,6 +213,15 @@ def _load_earnings_dates(conn: sqlite3.Connection, symbol: str) -> list[str]:
     ).fetchall()]
 
 
+def _load_earnings_history(conn: sqlite3.Connection, symbol: str) -> list[tuple]:
+    """Ascending (date, eps_actual, eps_estimated) — for SUE / earnings-surprise.
+    date is the announcement date (point-in-time)."""
+    return [tuple(r) for r in conn.execute(
+        "SELECT date, eps_actual, eps_estimated FROM earnings WHERE symbol=? ORDER BY date ASC",
+        (symbol,)
+    ).fetchall()]
+
+
 def _load_grades(conn: sqlite3.Connection, symbol: str) -> list[tuple]:
     """Ascending (date, action) where action ∈ {'upgrade','downgrade','maintain'}."""
     return [(d, a) for d, a in conn.execute(
@@ -350,6 +359,7 @@ def build_symbol(conn: sqlite3.Connection, symbol: str, start_date: str | None =
     if not income or not prices:
         return 0
     earnings_dates = _load_earnings_dates(conn, symbol)
+    earnings_history = _load_earnings_history(conn, symbol)
     grades = _load_grades(conn, symbol)
 
     cols = _materialized_columns()
@@ -363,7 +373,7 @@ def build_symbol(conn: sqlite3.Connection, symbol: str, start_date: str | None =
         ctx = build_context(
             symbol, date, close, income, balance, cashflow,
             earnings_dates=earnings_dates, grades=grades,
-            prices=prices,
+            prices=prices, earnings_history=earnings_history,
         )
         if ctx is None:
             continue

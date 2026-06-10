@@ -86,6 +86,7 @@ class ComputeContext:
     cashflow_slice: list[tuple]    # ascending, all rows with date <= self.date
     balance_slice: list[tuple] = field(default_factory=list)  # ascending balance rows with date <= self.date (for YoY)
     earnings_dates: list[str] = field(default_factory=list)   # ascending, all symbol earnings (past + scheduled)
+    earnings_history: list[tuple] = field(default_factory=list)  # ascending (date, eps_actual, eps_estimated); date IS the announce date
     grades_slice: list[tuple] = field(default_factory=list)   # ascending (date, action), all rows with date <= self.date
     prices_history: list[tuple] = field(default_factory=list)  # ascending (date, close); the symbol's full price history. Used by return-based features that need T-N day lookback.
 
@@ -208,6 +209,17 @@ class ComputeContext:
         d1 = datetime.strptime(self.next_earnings_date, "%Y-%m-%d")
         return (d1 - d0).days
 
+    def surprises_asof(self, max_n: int = 8) -> list[float]:
+        """Last up-to-max_n EPS surprises (eps_actual − eps_estimated) announced on or
+        before self.date, ascending. Skips rows missing either value. The earnings
+        date IS the announcement date, so date <= self.date is point-in-time."""
+        out: list[float] = []
+        for row in self.earnings_history:
+            d, act, est = row[0], row[1], row[2]
+            if d <= self.date and act is not None and est is not None:
+                out.append(act - est)
+        return out[-max_n:]
+
     @cached_property
     def days_since_last_earnings(self) -> int | None:
         """Calendar days from last earnings to self.date. None if no past earnings."""
@@ -294,6 +306,7 @@ def build_context(
     earnings_dates: list[str] | None = None,
     grades: list[tuple] | None = None,
     prices: list[tuple] | None = None,
+    earnings_history: list[tuple] | None = None,
 ) -> ComputeContext | None:
     """Slice raw symbol bundles to the as-of view for `date` and wrap them.
 
@@ -324,6 +337,9 @@ def build_context(
         balance_slice=_as_of_slice(balance, date, key_idx=B_AVAIL),
         cashflow_slice=_as_of_slice(cashflow, date, key_idx=C_AVAIL),
         earnings_dates=list(earnings_dates) if earnings_dates else [],
+        # Earnings actual/estimate history (date, eps_actual, eps_estimated), ascending.
+        # date IS the announce date, so surprises_asof filters date<=self.date (PIT).
+        earnings_history=list(earnings_history) if earnings_history else [],
         # Grades and earnings are real-world events — date IS the announce date,
         # so legacy index-0 bisect remains correct for them.
         grades_slice=_as_of_slice(grades, date) if grades else [],
