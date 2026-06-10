@@ -230,12 +230,18 @@ def resolve_universe(config: dict, conn) -> list[str]:
     if utype == "symbols":
         symbols = universe_cfg.get("symbols", [])
     elif utype == "sector":
-        sector = universe_cfg["sector"]
+        # Single `sector` (back-compat) or multi `sectors` — the universe is the
+        # UNION of all named sectors' constituents.
+        sectors = universe_cfg.get("sectors") or (
+            [universe_cfg["sector"]] if universe_cfg.get("sector") else [])
         # Prefer the DB-backed universe_profiles table — includes every name
         # we have profile data for (today's universe + the PIT backfill set).
         # Falls back to profile JSONs only if the DB is empty (dev env without
         # backfill done).
-        symbols = _get_sector_symbols_from_db(sector, conn) or _get_sector_symbols(sector)
+        symbols = []
+        for sec in sectors:
+            symbols.extend(_get_sector_symbols_from_db(sec, conn) or _get_sector_symbols(sec))
+        symbols = list(dict.fromkeys(symbols))  # dedupe, preserve order
         # Optional PIT anchor: when set, intersect with ever-members of the
         # named index over the backtest window. Gives PIT-aware sector
         # universes (modulo the limitation that GICS sector itself is treated
@@ -3161,13 +3167,63 @@ MIN_TRADING_DAYS_FOR_ANNUALIZATION = 60
 MIN_TRADING_DAYS_FOR_BENCHMARK = 2
 
 
+def _sector_cap_weights(sectors: list[str], conn) -> dict:
+    """Cap-weight sectors by aggregate market cap of their constituents.
+
+    Uses the universe_profiles market_cap snapshot (current, not PIT — sector
+    weights drift slowly, so a static weight over the window is an acceptable
+    benchmark approximation). Equal-weights as a fallback when caps are missing.
+    """
+    caps = {}
+    for sec in sectors:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(market_cap), 0) FROM universe_profiles "
+            "WHERE LOWER(sector) = LOWER(?) AND market_cap IS NOT NULL",
+            (sec,),
+        ).fetchone()
+        caps[sec] = row[0] or 0
+    total = sum(caps.values())
+    if total <= 0:
+        return {s: 1.0 / len(sectors) for s in sectors}
+    return {s: caps[s] / total for s in sectors}
+
+
+def _blended_benchmark_prices(sectors: list[str], trading_dates: list[str], conn):
+    """Cap-weighted return index of the sectors' ETFs, normalized to 1.0 at the
+    first common date. Returns (price_dict, label) or ({}, None) if data is thin.
+
+    The return index lets the existing buy-and-hold loop treat it as a single
+    synthetic price series (first_price == 1.0 ⇒ nav == initial_cash * index).
+    """
+    weights = _sector_cap_weights(sectors, conn)
+    series = {}
+    for sec in sectors:
+        prices = get_prices(SECTOR_ETF_MAP[sec], start=trading_dates[0],
+                            end=trading_dates[-1], conn=conn)
+        if not prices or len(prices) < MIN_TRADING_DAYS_FOR_BENCHMARK:
+            return {}, None
+        series[sec] = {d: c for d, c in prices}
+    common = [d for d in trading_dates if all(d in series[sec] for sec in sectors)]
+    if len(common) < MIN_TRADING_DAYS_FOR_BENCHMARK:
+        return {}, None
+    base = {sec: series[sec][common[0]] for sec in sectors}
+    blended = {d: sum(weights[sec] * (series[sec][d] / base[sec]) for sec in sectors)
+               for d in common}
+    label = "BLEND:" + "+".join(SECTOR_ETF_MAP[s] for s in sectors)
+    return blended, label
+
+
 def compute_benchmark(trading_dates: list[str], initial_cash: float,
-                      conn=None, sector: str = None) -> dict:
+                      conn=None, sector: str = None,
+                      sectors: list[str] = None) -> dict:
     """
     Compute buy-and-hold benchmark over the same period.
 
-    If sector is provided, uses the sector ETF (e.g. XLK for Technology).
-    Falls back to SPY / S&P 500 index for multi-sector or unknown sectors.
+    `sector` (single) or `sectors` (list) select the benchmark:
+      - one known sector  → that sector ETF (e.g. XLK for Technology).
+      - many sectors      → cap-weighted blend of their ETFs (passive hold of
+                            the combined opportunity set).
+      - none / unknown    → SPY / S&P 500 index.
 
     Returns a dict with always-honest realized period metrics. Annualized
     metrics are only included when the sample is statistically meaningful
@@ -3176,25 +3232,32 @@ def compute_benchmark(trading_dates: list[str], initial_cash: float,
 
     Returns None only when there isn't enough data to compute a return at all.
     """
+    bench_sectors = [s for s in (sectors or ([sector] if sector else []))
+                     if s in SECTOR_ETF_MAP]
+
     price_dict = {}
     bench_symbol = None
 
-    # Build candidate list: sector ETF first, then broad market
-    candidates = []
-    if sector and sector in SECTOR_ETF_MAP:
-        candidates.append(SECTOR_ETF_MAP[sector])
-    candidates.extend(["SPY", "^GSPC", "GSPC"])
-
-    # Try DB first
     own_conn = conn is None
     if own_conn:
         conn = get_connection()
-    for sym in candidates:
-        prices = get_prices(sym, start=trading_dates[0], end=trading_dates[-1], conn=conn)
-        if prices and len(prices) >= MIN_TRADING_DAYS_FOR_BENCHMARK:
-            bench_symbol = sym
-            price_dict = {d: c for d, c in prices}
-            break
+
+    if len(bench_sectors) > 1:
+        # Multi-sector → cap-weighted blend of the sector ETFs.
+        price_dict, bench_symbol = _blended_benchmark_prices(
+            bench_sectors, trading_dates, conn)
+    else:
+        # Single sector ETF first, then broad market.
+        candidates = []
+        if bench_sectors:
+            candidates.append(SECTOR_ETF_MAP[bench_sectors[0]])
+        candidates.extend(["SPY", "^GSPC", "GSPC"])
+        for sym in candidates:
+            prices = get_prices(sym, start=trading_dates[0], end=trading_dates[-1], conn=conn)
+            if prices and len(prices) >= MIN_TRADING_DAYS_FOR_BENCHMARK:
+                bench_symbol = sym
+                price_dict = {d: c for d, c in prices}
+                break
     if own_conn:
         conn.close()
 

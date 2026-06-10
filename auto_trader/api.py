@@ -299,8 +299,10 @@ class CreateRunRequest(BaseModel):
     capital: float = Field(default=1_000_000, description="Initial capital")
     model: str = Field(default="sonnet", description="Claude model: sonnet, opus, haiku")
     max_experiments: int = Field(default=1000, ge=1, le=10000, description="Safety cap. Default 1000.")
-    sector: str | None = Field(default=None, description="Restrict to a sector (e.g. 'Energy', 'Technology'). If set, data queries only return stocks in this sector.")
-    alpha_benchmark: str = Field(default="auto", description="Benchmark for alpha: 'sector' (sector ETF), 'market' (SPY), 'auto' (sector if sector is set, else market)")
+    sector: str | None = Field(default=None, description="Restrict to a single sector (back-compat). For multiple sectors use `sectors`.")
+    sectors: list[str] | None = Field(default=None, description="Trade universe = UNION of these sectors (e.g. ['Technology', 'Communication Services']). Takes precedence over `sector`. Data queries return only stocks in these sectors.")
+    benchmark_sectors: list[str] | None = Field(default=None, description="Sectors whose ETFs form the alpha benchmark: one → that ETF, many → cap-weighted blend. Defaults to the universe sectors. Only applies when alpha_benchmark resolves to 'sector'.")
+    alpha_benchmark: str = Field(default="auto", description="Benchmark for alpha: 'sector' (sector ETF / blend of benchmark_sectors), 'market' (SPY), 'auto' (sector if any sector is set, else market)")
     starting_portfolio: dict | None = Field(default=None, description="Optional starting portfolio config.")
     include_analyst_notes: bool = Field(default=True, description="Feed the post-trade analyst's notes to the trader agent in its history context. Memos are still generated either way (visible in the UI / analyst endpoint); this only controls whether the agent sees them.")
     validate_lessons: bool = Field(default=False, description="After the run, validate this run's candidate factor-interaction lessons on a held-out window (per regime) and persist the verdict to memo_items. OFF by default. Requires holdout_start + holdout_end.")
@@ -668,17 +670,22 @@ async def create_run(body: CreateRunRequest):
     run_id = _generate_run_id(body.name)
     now = datetime.now(timezone.utc).isoformat()
 
-    # Validate sector
+    # Validate sectors
     valid_sectors = ["Technology", "Healthcare", "Financial Services", "Energy",
                      "Consumer Cyclical", "Consumer Defensive", "Industrials",
                      "Basic Materials", "Real Estate", "Communication Services", "Utilities"]
-    if body.sector and body.sector not in valid_sectors:
-        raise HTTPException(400, f"Invalid sector: '{body.sector}'. Valid: {valid_sectors}")
+    # Universe = `sectors` (union) or single `sector` (back-compat).
+    universe_sectors = body.sectors or ([body.sector] if body.sector else None)
+    # Benchmark = explicit `benchmark_sectors` or, by default, the universe sectors.
+    bench_sectors = body.benchmark_sectors or universe_sectors
+    for sec in (universe_sectors or []) + (body.benchmark_sectors or []):
+        if sec not in valid_sectors:
+            raise HTTPException(400, f"Invalid sector: '{sec}'. Valid: {valid_sectors}")
 
     # Resolve alpha benchmark
     alpha_benchmark = body.alpha_benchmark
     if alpha_benchmark == "auto":
-        alpha_benchmark = "sector" if body.sector else "market"
+        alpha_benchmark = "sector" if universe_sectors else "market"
 
     config = {
         "metric": body.metric,
@@ -688,7 +695,9 @@ async def create_run(body: CreateRunRequest):
         "capital": body.capital,
         "model": body.model,
         "max_experiments": body.max_experiments,
-        "sector": body.sector,
+        "sector": universe_sectors[0] if universe_sectors else None,
+        "sectors": universe_sectors,
+        "benchmark_sectors": bench_sectors if alpha_benchmark == "sector" else None,
         "alpha_benchmark": alpha_benchmark,
         "target_aggregator": body.target_aggregator,
         "include_analyst_notes": body.include_analyst_notes,
@@ -780,8 +789,12 @@ async def start_run(run_id: str, body: StartRunRequest = StartRunRequest()):
     # Forward the agent's explicit MCP tool allowlist (always a list post-backfill).
     cmd.extend(["--allowed-tools", json.dumps(agent.get("allowed_tools", []))])
 
-    if config.get("sector"):
+    if config.get("sectors"):
+        cmd.extend(["--sectors", ",".join(config["sectors"])])
+    elif config.get("sector"):
         cmd.extend(["--sector", config["sector"]])
+    if config.get("benchmark_sectors"):
+        cmd.extend(["--benchmark-sectors", ",".join(config["benchmark_sectors"])])
     if config.get("alpha_benchmark"):
         cmd.extend(["--alpha-benchmark", config["alpha_benchmark"]])
 

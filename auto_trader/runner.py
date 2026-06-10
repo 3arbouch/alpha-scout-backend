@@ -711,7 +711,8 @@ def save_portfolio(portfolio_config: dict) -> str | None:
 
 
 def _run_one_backtest(portfolio_config: dict, start: str, end: str, capital: float,
-                      sector: str | None = None) -> dict | None:
+                      sector: str | None = None,
+                      benchmark_sectors: list[str] | None = None) -> dict | None:
     """Run a single backtest over one [start, end] window.
 
     Returns: {"metrics": {...}, "sleeve_trades": [{"label", "trades"}, ...]}
@@ -763,9 +764,12 @@ def _run_one_backtest(portfolio_config: dict, start: str, end: str, capital: flo
                 metrics["market_benchmark_return_pct"] = market_bench["metrics"]["total_return_pct"]
                 metrics["market_benchmark_ann_return_pct"] = market_bench["metrics"]["annualized_return_pct"]
 
-            # Sector benchmark — compute if sector is set
-            if sector and sector in SECTOR_ETF_MAP:
-                sector_bench = compute_benchmark(trading_dates, capital, sector=sector)
+            # Sector benchmark — single sector ETF, or a cap-weighted blend of
+            # the chosen benchmark sectors (when more than one is selected).
+            bench_sectors = benchmark_sectors or ([sector] if sector else [])
+            bench_sectors = [s for s in bench_sectors if s in SECTOR_ETF_MAP]
+            if bench_sectors:
+                sector_bench = compute_benchmark(trading_dates, capital, sectors=bench_sectors)
                 if sector_bench:
                     sector_ann = sector_bench["metrics"]["annualized_return_pct"]
                     metrics["alpha_vs_sector_pct"] = round(ann_return - sector_ann, 2)
@@ -974,6 +978,7 @@ def run_backtest(
         portfolio_config,
         config.training_start, config.training_end,
         config.initial_capital, config.sector,
+        benchmark_sectors=config.benchmark_sectors,
     )
     if training is None:
         return None
@@ -1001,6 +1006,7 @@ def run_backtest(
         res = _run_one_backtest(
             portfolio_config, w_start, w_end,
             config.initial_capital, config.sector,
+            benchmark_sectors=config.benchmark_sectors,
         )
         if res is None:
             print(f"  [warn] eval window {w_label} failed; skipping")
@@ -1091,6 +1097,8 @@ async def run_agent_iteration(
     alpha_benchmark: str = "market",
     eval_block: dict | None = None,
     target_aggregator: str = "overall",
+    sectors: list[str] | None = None,
+    benchmark_sectors: list[str] | None = None,
 ) -> dict:
     """Run a single agent iteration. Returns experiment result.
 
@@ -1124,6 +1132,14 @@ async def run_agent_iteration(
 
     t0 = time.time()
 
+    # Universe sectors (trade-from) vs benchmark sectors (alpha-vs) are
+    # independent. `sector` (single) is the back-compat alias for a one-element
+    # `sectors` list. When benchmarking against sectors, default the benchmark
+    # to the universe sectors unless an explicit benchmark set is given.
+    sectors = sectors or ([sector] if sector else None)
+    sector = sectors[0] if sectors else None  # primary — single-sector callsites
+    benchmark_sectors = (benchmark_sectors or sectors) if alpha_benchmark == "sector" else None
+
     # Build the prompt
     program = load_program()
     history = build_history_context(run_id, target_metric, aggregator=target_aggregator,
@@ -1133,8 +1149,19 @@ async def run_agent_iteration(
         f"{c['metric']} {c['operator']} {c['value']}" for c in conditions
     )
 
-    sector_desc = f"\n**Sector:** {sector} — All data queries are restricted to {sector} stocks only. Alpha is measured against the {sector} sector ETF." if sector else ""
-    benchmark_desc = f"sector ETF" if alpha_benchmark == "sector" else "S&P 500 (SPY)"
+    if sectors:
+        uni = ", ".join(sectors)
+        bench_txt = (" + ".join(benchmark_sectors) + " ETF blend") if benchmark_sectors and len(benchmark_sectors) > 1 else \
+                    (f"{benchmark_sectors[0]} sector ETF" if benchmark_sectors else "S&P 500")
+        sector_desc = (f"\n**Sectors:** {uni} — All data queries are restricted to stocks in "
+                       f"these sectors (their union). Alpha is measured against {bench_txt}.")
+    else:
+        sector_desc = ""
+    if alpha_benchmark == "sector":
+        benchmark_desc = ("cap-weighted ETF blend of " + ", ".join(benchmark_sectors)) \
+            if benchmark_sectors and len(benchmark_sectors) > 1 else "sector ETF"
+    else:
+        benchmark_desc = "S&P 500 (SPY)"
 
     # Frame the objective so the agent knows whether it's climbing the
     # training-period scalar or the eval-window aggregator. When eval is set
@@ -1204,7 +1231,7 @@ You are researching as of {backtest_end}. You do not know what happens after thi
     tool_calls = 0
     session_id = None
     auto_trader_tools = create_auto_trader_tools(
-        stop_date=backtest_end, sector=sector, start_date=backtest_start,
+        stop_date=backtest_end, sectors=sectors, start_date=backtest_start,
         run_id=run_id,
         # Enforce the agent's allowlist at the MCP server boundary so forbidden
         # tools don't appear in the model's tool catalog at all.
@@ -1362,6 +1389,7 @@ You are researching as of {backtest_end}. You do not know what happens after thi
     bt_cfg_kwargs = dict(
         training_start=backtest_start, training_end=backtest_end,
         initial_capital=initial_capital, sector=sector,
+        benchmark_sectors=benchmark_sectors,
         benchmark="sector" if alpha_benchmark == "sector" else "market",
     )
     if eval_block:
@@ -1566,7 +1594,9 @@ async def main():
                         help="JSON array of MCP tool names this agent may call. "
                              "Omit (or pass empty) for 'all current tools'. '[]' disables all MCP tools.")
     parser.add_argument("--starting-portfolio", type=str, default=None, help="Path to starting portfolio config JSON")
-    parser.add_argument("--sector", type=str, default=None, help="Restrict data queries to this sector")
+    parser.add_argument("--sector", type=str, default=None, help="Restrict data queries to this sector (single; back-compat)")
+    parser.add_argument("--sectors", type=str, default=None, help="Comma-separated sectors for the trade universe (union), e.g. 'Technology,Communication Services'")
+    parser.add_argument("--benchmark-sectors", type=str, default=None, help="Comma-separated sectors whose ETFs form the sector benchmark (cap-weighted blend if many). Defaults to --sectors.")
     parser.add_argument("--alpha-benchmark", type=str, default="market", help="Benchmark: sector or market")
     parser.add_argument("--eval-file", type=str, default=None,
                         help="Path to JSON file with walk-forward eval block: "
@@ -1769,6 +1799,8 @@ async def main():
             initial_capital=args.capital,
             model=args.model,
             sector=args.sector,
+            sectors=[s.strip() for s in args.sectors.split(",")] if args.sectors else None,
+            benchmark_sectors=[s.strip() for s in args.benchmark_sectors.split(",")] if args.benchmark_sectors else None,
             alpha_benchmark=args.alpha_benchmark,
             eval_block=eval_block,
             target_aggregator=args.target_aggregator,

@@ -30,8 +30,30 @@ MARKET_DB_PATH = Path(os.environ.get("MARKET_DB_PATH",
 # Filters — set by create_auto_trader_tools() at runtime
 _STOP_DATE: str | None = None
 _START_DATE: str | None = None
-_SECTOR: str | None = None
+_SECTORS: list[str] | None = None  # universe sectors (union); None = no restriction
 _RUN_ID: str | None = None
+
+
+def _primary_sector() -> str | None:
+    """First sector — used where a tool only accepts a single sector (its
+    single-ETF benchmark / scoping). The scored backtest uses the full blend."""
+    return _SECTORS[0] if _SECTORS else None
+
+
+def _sector_filter_symbols() -> list[str] | None:
+    """Union of tickers across _SECTORS (None if unrestricted). Passed as the
+    `universe=` override to research tools so they span all selected sectors."""
+    if not _SECTORS:
+        return None
+    conn = sqlite3.connect(str(MARKET_DB_PATH))
+    try:
+        ph = ",".join("?" * len(_SECTORS))
+        rows = conn.execute(
+            f"SELECT symbol FROM universe_profiles WHERE sector IN ({ph})", _SECTORS
+        ).fetchall()
+        return [r[0] for r in rows]
+    finally:
+        conn.close()
 
 # Canonical factor set for portfolio exposure analysis. Pulled from
 # features_daily — the 13 factors most commonly used for risk/style attribution.
@@ -142,16 +164,20 @@ def execute_query(sql: str) -> dict:
         # Benchmark/sector ETFs — always queryable regardless of sector scope so the
         # agent can compare against SPY or its sector ETF. ETFs are absent from
         # universe_profiles, so the sector subquery would otherwise exclude them.
-        BENCHMARK_ETFS = ("SPY", "XLK", "XLF", "XLE", "XLV")
+        BENCHMARK_ETFS = ("SPY", "XLK", "XLV", "XLF", "XLE", "XLY", "XLP",
+                          "XLI", "XLB", "XLRE", "XLC", "XLU")
         etf_list = ", ".join(f"'{s}'" for s in BENCHMARK_ETFS)
+
+        # Sector restriction is the UNION of all selected sectors.
+        sector_in = ", ".join(f"'{s}'" for s in _SECTORS) if _SECTORS else None
 
         for table, date_col in DATE_COLUMN_MAP.items():
             conditions = []
             if _STOP_DATE:
                 conditions.append(f"{date_col} <= '{_STOP_DATE}'")
-            if _SECTOR and table in SYMBOL_TABLES:
+            if sector_in and table in SYMBOL_TABLES:
                 conditions.append(
-                    f"(symbol IN (SELECT symbol FROM main.universe_profiles WHERE sector = '{_SECTOR}') "
+                    f"(symbol IN (SELECT symbol FROM main.universe_profiles WHERE sector IN ({sector_in})) "
                     f"OR symbol IN ({etf_list}))"
                 )
             if conditions:
@@ -159,10 +185,10 @@ def execute_query(sql: str) -> dict:
                 conn.execute(f"CREATE TEMP VIEW IF NOT EXISTS {table} AS SELECT * FROM main.{table} WHERE {where}")
 
         # Filter universe_profiles by sector (but keep it queryable)
-        if _SECTOR:
+        if sector_in:
             conn.execute(f"""
                 CREATE TEMP VIEW IF NOT EXISTS universe_profiles AS
-                SELECT * FROM main.universe_profiles WHERE sector = '{_SECTOR}'
+                SELECT * FROM main.universe_profiles WHERE sector IN ({sector_in})
             """)
 
         cursor = conn.execute(sql)
@@ -313,7 +339,8 @@ async def evaluate_signal_tool(args: dict[str, Any]) -> dict[str, Any]:
         db_path=str(MARKET_DB_PATH),
         start=_START_DATE or "2015-01-01",
         end=_STOP_DATE or "2025-12-31",
-        sector=_SECTOR,
+        sector=_primary_sector(),
+        universe=_sector_filter_symbols(),
     )
 
     text = json.dumps(result, default=str)
@@ -369,7 +396,8 @@ async def rank_signals_tool(args: dict[str, Any]) -> dict[str, Any]:
         db_path=str(MARKET_DB_PATH),
         start=_START_DATE or "2015-01-01",
         end=_STOP_DATE or "2025-12-31",
-        sector=_SECTOR,
+        sector=_primary_sector(),
+        universe=_sector_filter_symbols(),
     )
 
     text = json.dumps(result, default=str)
@@ -407,10 +435,10 @@ async def rank_signals_tool(args: dict[str, Any]) -> dict[str, Any]:
 async def analyze_factor_library_tool(args: dict[str, Any]) -> dict[str, Any]:
     from auto_trader.factor_library import analyze_factor_library as _afl
 
-    sector = args.get("sector") or _SECTOR
+    sector = args.get("sector") or _primary_sector()
     start = args.get("start") or _START_DATE or "2015-01-01"
     end = args.get("end") or _STOP_DATE or "2025-12-31"
-    universe = args.get("universe")
+    universe = args.get("universe") or _sector_filter_symbols()
     features = args.get("features")
 
     result = _afl(
@@ -456,7 +484,7 @@ async def combine_factors_tool(args: dict[str, Any]) -> dict[str, Any]:
         horizon=args.get("horizon") or "63d",
         method=args.get("method") or "ic_optimal",
         shrinkage=args.get("shrinkage") if args.get("shrinkage") is not None else 0.3,
-        sector=_SECTOR,
+        sector=_primary_sector(),
         start=_START_DATE or "2015-01-01",
         end=_STOP_DATE,
         db_path=str(MARKET_DB_PATH),
@@ -1096,7 +1124,7 @@ async def analyze_portfolio_exposures_tool(args: dict[str, Any]) -> dict[str, An
     experiment_id = (args.get("experiment_id") or "").strip()
     positions = args.get("positions") or {}
     as_of_date = args.get("as_of_date")
-    sector_arg = args.get("sector") or _SECTOR
+    sector_arg = args.get("sector") or _primary_sector()
     factor_arg = args.get("factors")
 
     factors = factor_arg if isinstance(factor_arg, list) and factor_arg else CANONICAL_FACTOR_COLUMNS
@@ -1258,7 +1286,7 @@ async def recall_memo_items_tool(args: dict[str, Any]) -> dict[str, Any]:
     items = recall_memo_items(
         run_id=_RUN_ID,
         experiment_id=args.get("experiment_id") or None,
-        universe=args.get("universe") or _SECTOR,
+        universe=args.get("universe") or _primary_sector(),
         kind=args.get("kind") or None,
         scope_level=args.get("scope_level") or None,
         forward_looking_only=args.get("forward_looking_only", True),
@@ -1292,22 +1320,25 @@ async def read_memo_tool(args: dict[str, Any]) -> dict[str, Any]:
 
 def create_auto_trader_tools(stop_date: str | None = None, sector: str | None = None,
                              start_date: str | None = None, run_id: str | None = None,
-                             allowed_tool_names: list[str] | None = None):
+                             allowed_tool_names: list[str] | None = None,
+                             sectors: list[str] | None = None):
     """Create the MCP server with auto-trader tools.
 
     Args:
         stop_date: If set, silently filters all query results to dates <= stop_date.
-        sector: If set, silently filters stock data to only this sector.
+        sector: Single-sector restriction (back-compat). Use `sectors` for multiple.
+        sectors: If set, silently filters stock data to the UNION of these sectors.
+            Takes precedence over `sector`.
         start_date: If set, used as the start date for signal evaluation/ranking.
         run_id: If set, scopes get_experiment_trades to this run's experiments only.
         allowed_tool_names: If set, only these tool names are registered on the
             server — the model's tool catalog for this run cannot include any
             forbidden tools. If None, all tools are registered (CLI convenience).
     """
-    global _STOP_DATE, _SECTOR, _START_DATE, _RUN_ID
+    global _STOP_DATE, _SECTORS, _START_DATE, _RUN_ID
     _STOP_DATE = stop_date
     _START_DATE = start_date
-    _SECTOR = sector
+    _SECTORS = sectors or ([sector] if sector else None)
     _RUN_ID = run_id
 
     if allowed_tool_names is None:

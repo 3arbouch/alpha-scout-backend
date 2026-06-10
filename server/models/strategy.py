@@ -270,7 +270,8 @@ class UniverseConfig(BaseModel):
                     "'index' is point-in-time membership of a major index (set 'index' field to sp500|nasdaq|dowjones). "
                     "'index' is the only PIT-aware option and is the recommended type for survivorship-correct backtests.",
     )
-    sector: str | None = Field(default=None, description="GICS sector name. Required when type='sector'.")
+    sector: str | None = Field(default=None, description="Single GICS sector name. Use with type='sector'. For multiple sectors use 'sectors' instead.")
+    sectors: list[str] | None = Field(default=None, description="Multiple GICS sector names with type='sector': the universe is the UNION of all of them (e.g. ['Technology', 'Communication Services']). Takes precedence over 'sector'.")
     symbols: list[str] | None = Field(default=None, description="Explicit ticker list. Required when type='symbols'.")
     index: Literal["sp500", "nasdaq", "dowjones"] | None = Field(
         default=None,
