@@ -15,12 +15,17 @@ from ..context import ComputeContext
 from ..registry import register_feature
 
 
+# Economic sanity bounds: real GP/assets ~ [0, 3], accruals/assets ~ [-1, 1].
+# Values far outside these come from degenerate/stub denominators (e.g. a
+# total_assets data glitch) — return None so a single bad row can't blow up a
+# z-standardized cross-section. Bounds are deliberately generous.
 def _gross_profitability(ctx: ComputeContext) -> float | None:
     gp = ctx.ttm_gross_profit
     ta = ctx.total_assets
     if gp is None or not ta or ta <= 0:
         return None
-    return gp / ta
+    v = gp / ta
+    return v if -5.0 < v < 10.0 else None
 
 
 def _accruals(ctx: ComputeContext) -> float | None:
@@ -29,7 +34,8 @@ def _accruals(ctx: ComputeContext) -> float | None:
     ta = ctx.total_assets
     if ni is None or ocf is None or not ta or ta <= 0:
         return None
-    return (ni - ocf) / ta
+    v = (ni - ocf) / ta
+    return v if -5.0 < v < 5.0 else None
 
 
 register_feature(

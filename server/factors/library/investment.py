@@ -15,6 +15,11 @@ from ..context import ComputeContext, I_SHARES, B_TOTAL_ASSETS
 from ..registry import register_feature
 
 
+# YoY % changes explode when the year-ago denominator is near zero (mergers,
+# IPOs, stub rows). A change below -100% is impossible and a change of many
+# hundreds of percent is a corporate-action artifact, not an organic signal —
+# return None outside generous bounds so one such row can't dominate a
+# z-standardized cross-section.
 def _net_issuance(ctx: ComputeContext) -> float | None:
     if not ctx.latest_q or not ctx.prior_year_q:
         return None
@@ -22,7 +27,8 @@ def _net_issuance(ctx: ComputeContext) -> float | None:
     prior = ctx.prior_year_q[I_SHARES]
     if not now or not prior or prior <= 0:
         return None
-    return (now / prior - 1.0) * 100.0
+    v = (now / prior - 1.0) * 100.0
+    return v if -100.0 <= v <= 500.0 else None
 
 
 def _asset_growth(ctx: ComputeContext) -> float | None:
@@ -32,7 +38,8 @@ def _asset_growth(ctx: ComputeContext) -> float | None:
     prior = ctx.prior_year_balance[B_TOTAL_ASSETS]
     if now is None or not prior or prior <= 0:
         return None
-    return (now / prior - 1.0) * 100.0
+    v = (now / prior - 1.0) * 100.0
+    return v if -100.0 <= v <= 1000.0 else None
 
 
 register_feature(

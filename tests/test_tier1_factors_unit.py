@@ -146,6 +146,28 @@ hist_gap = hist[:4] + [("d5", None, 10.0)]
 check("missing eps_actual skipped → uses d1..d4", approx(_earnings_surprise(ectx(hist_gap, "d5")),
                                                          sur4[-1] / statistics.stdev(sur4)), "")
 
+print("\n=== degenerate-denominator guards (live-capital safety) ===")
+# gross_profitability with stub total_assets (AMCR-style: gp huge / tiny assets) → None
+c_bad = ctx(income=[inc(f"q{i}", gp=2.5e8) for i in range(4)], balance_slice=[bal("b", ta=130.0)])
+check("gross_prof explosion → None (bad total_assets)", _gross_profitability(c_bad) is None,
+      str(_gross_profitability(c_bad)))
+# accruals explosion → None
+c_acc = ctx(income=[inc(f"q{i}", ni=1e7) for i in range(4)],
+            cashflow=[cf(f"q{i}", ocf=0.0) for i in range(4)], balance_slice=[bal("b", ta=100.0)])
+check("accruals explosion → None", _accruals(c_acc) is None, str(_accruals(c_acc)))
+# asset_growth from near-zero prior (merger) → None
+balm = [bal("b0", ta=0.001)] + [bal(f"b{i}", ta=1e6) for i in range(1, 4)] + [bal("b4", ta=1e9)]
+check("asset_growth merger artifact → None", _asset_growth(ctx(balance_slice=balm)) is None,
+      str(_asset_growth(ctx(balance_slice=balm))))
+# net_issuance from near-zero prior shares → None
+incm = [inc("q0", shares=0.001)] + [inc(f"q{i}", shares=1e6) for i in range(1, 4)] + [inc("q4", shares=1e9)]
+check("net_issuance split artifact → None", _net_issuance(ctx(income=incm)) is None,
+      str(_net_issuance(ctx(income=incm))))
+# SUE with near-zero σ (LRCX-style) → clipped to +20, not 1e15
+near_flat = [0.50, 0.50, 0.50, 0.50, 0.5000001]
+check("SUE near-zero σ → clipped to +20", approx(_sue(near_flat), 20.0), str(_sue(near_flat)))
+check("SUE stays in [-20,20]", -20.0 <= _sue(near_flat) <= 20.0)
+
 print("\n=== formula recompute (independent) on arbitrary numbers ===")
 gp_q, ta = [11.0, 13.0, 17.0, 19.0], 250.0   # TTM = 60
 exp_gp = sum(gp_q) / ta

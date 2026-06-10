@@ -22,13 +22,20 @@ from ..registry import register_feature
 
 
 def _sue(surprises: list[float], min_obs: int = 4) -> float | None:
-    """Latest surprise / sample stdev of the trailing surprise window."""
+    """Latest surprise / sample stdev of the trailing surprise window.
+
+    SUE is a z-score; when trailing surprises are near-identical the stdev
+    collapses toward zero and the ratio explodes. Clip to a sane z-range so a
+    degenerate-σ row can't blow up a z-standardized cross-section (a |z| beyond
+    ~20 carries no extra information).
+    """
     if not surprises or len(surprises) < min_obs:
         return None
     sd = statistics.stdev(surprises)          # sample stdev (ddof=1)
     if sd <= 0:
         return None
-    return surprises[-1] / sd
+    v = surprises[-1] / sd
+    return max(-20.0, min(20.0, v))
 
 
 def _earnings_surprise(ctx: ComputeContext) -> float | None:
