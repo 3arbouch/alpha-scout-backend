@@ -26,12 +26,12 @@ from functools import cached_property
 I_DATE, I_REV, I_NI, I_EBITDA, I_EPS_D, I_SHARES = 0, 1, 2, 3, 4, 5
 I_GROSS_PROFIT, I_OP_INCOME = 6, 7
 I_AVAIL = 8
-# Balance: (period_end, total_equity, net_debt, total_debt, available_from)
-B_EQUITY, B_NET_DEBT, B_TOTAL_DEBT = 1, 2, 3
-B_AVAIL = 4
-# Cashflow: (period_end, free_cash_flow, dividends_paid, available_from)
-C_FCF, C_DIV = 1, 2
-C_AVAIL = 3
+# Balance: (period_end, total_equity, net_debt, total_debt, total_assets, available_from)
+B_EQUITY, B_NET_DEBT, B_TOTAL_DEBT, B_TOTAL_ASSETS = 1, 2, 3, 4
+B_AVAIL = 5
+# Cashflow: (period_end, free_cash_flow, dividends_paid, operating_cf, available_from)
+C_FCF, C_DIV, C_OPERATING_CF = 1, 2, 3
+C_AVAIL = 4
 
 
 def _ttm(quarters: list[tuple], col_idx: int) -> float | None:
@@ -84,6 +84,7 @@ class ComputeContext:
     income_slice: list[tuple]      # ascending, all rows with date <= self.date
     balance_asof: tuple | None     # last balance row with date <= self.date
     cashflow_slice: list[tuple]    # ascending, all rows with date <= self.date
+    balance_slice: list[tuple] = field(default_factory=list)  # ascending balance rows with date <= self.date (for YoY)
     earnings_dates: list[str] = field(default_factory=list)   # ascending, all symbol earnings (past + scheduled)
     grades_slice: list[tuple] = field(default_factory=list)   # ascending (date, action), all rows with date <= self.date
     prices_history: list[tuple] = field(default_factory=list)  # ascending (date, close); the symbol's full price history. Used by return-based features that need T-N day lookback.
@@ -129,6 +130,18 @@ class ComputeContext:
         return self.balance_asof[B_EQUITY] if self.balance_asof else None
 
     @cached_property
+    def total_assets(self) -> float | None:
+        return self.balance_asof[B_TOTAL_ASSETS] if self.balance_asof else None
+
+    @cached_property
+    def prior_year_balance(self) -> tuple | None:
+        """Balance row 4 quarters before the latest as-of row, or None."""
+        if not self.balance_slice:
+            return None
+        idx = len(self.balance_slice) - 1 - 4
+        return self.balance_slice[idx] if idx >= 0 else None
+
+    @cached_property
     def net_debt(self) -> float | None:
         return self.balance_asof[B_NET_DEBT] if self.balance_asof else None
 
@@ -141,6 +154,10 @@ class ComputeContext:
     @cached_property
     def ttm_fcf(self) -> float | None:
         return _ttm(self.cashflow_slice, C_FCF) if self.cashflow_slice else None
+
+    @cached_property
+    def ttm_operating_cf(self) -> float | None:
+        return _ttm(self.cashflow_slice, C_OPERATING_CF) if self.cashflow_slice else None
 
     @cached_property
     def ttm_dividends(self) -> float | None:
@@ -304,6 +321,7 @@ def build_context(
         close=close,
         income_slice=income_slice,
         balance_asof=_as_of(balance, date, key_idx=B_AVAIL),
+        balance_slice=_as_of_slice(balance, date, key_idx=B_AVAIL),
         cashflow_slice=_as_of_slice(cashflow, date, key_idx=C_AVAIL),
         earnings_dates=list(earnings_dates) if earnings_dates else [],
         # Grades and earnings are real-world events — date IS the announce date,
