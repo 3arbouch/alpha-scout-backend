@@ -1011,12 +1011,25 @@ def _standardize_vals(vals, standardization: str):
         if scale == 0:
             return np.zeros_like(centered)
         return centered / scale
-    else:  # 'z': plain mean/stdev
-        mu = float(vals.mean())
-        sd = float(vals.std(ddof=0))
+    else:  # 'z': winsorized robust z-score (outlier-safe for live scoring)
+        # Winsorize the cross-section BEFORE standardizing so a single degenerate
+        # value (e.g. eps_yoy from a near-zero base, or a bad-data ratio) can't
+        # dominate the mean/std and collapse every other name to ~0. MAD-based
+        # clip is robust (the std itself would be corrupted by the outlier);
+        # fall back to 1st/99th percentile when MAD is degenerate. The 'rank'
+        # path above is already outlier-immune and is left untouched.
+        median = float(np.median(vals))
+        scaled_mad = 1.4826 * float(np.median(np.abs(vals - median)))
+        if scaled_mad > 0:
+            lo, hi = median - 3.0 * scaled_mad, median + 3.0 * scaled_mad
+        else:
+            lo, hi = float(np.percentile(vals, 1)), float(np.percentile(vals, 99))
+        clipped = np.clip(vals, lo, hi)
+        mu = float(clipped.mean())
+        sd = float(clipped.std(ddof=0))
         if sd == 0:
             return np.zeros_like(vals)
-        return (vals - mu) / sd
+        return (clipped - mu) / sd
 
 
 def _compute_composite_score(
