@@ -1201,7 +1201,11 @@ You are researching as of {backtest_end}. You do not know what happens after thi
         cwd=str(PROJECT_ROOT / "auto_trader"),
         model=resolved_model,
         setting_sources=["project"],
-        allowed_tools=["Skill", "Read"] + _resolve_allowed_mcp_tools(),
+        allowed_tools=["Skill", "Read", "Bash"] + _resolve_allowed_mcp_tools(),
+        # The agent may run Bash (scratch scripts, inspect the factor library,
+        # query data) but must not modify code — so the file-editing tools are
+        # removed entirely.
+        disallowed_tools=["Edit", "Write", "NotebookEdit"],
         mcp_servers={"auto_trader": auto_trader_tools},
         permission_mode="acceptEdits",
         max_turns=50,
