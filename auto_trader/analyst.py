@@ -15,6 +15,7 @@ import asyncio
 import hashlib
 import json
 import re
+import sqlite3
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -79,6 +80,16 @@ item carries:
     hypothesis ∈ {cheap_beats_expensive, expensive_beats_cheap, low_beats_high,
     high_beats_low}. If you cannot express the interaction as a test_spec, it is
     a platitude — do not emit it as a factor_interaction.
+  - kind=regime: propose a NEW market regime to condition lessons on, when the
+    existing regimes don't capture a state you think matters (e.g. rising-rate,
+    curve-inverted, credit-stress). test_spec IS a regime_config of point-in-time
+    macro rules: {"name": "rising_rate", "entry_conditions": [{"series":
+    "treasury_10y", "operator": ">", "value": 4.0}], "entry_logic": "all",
+    "exit_conditions": [...], "exit_logic": "all"}. It only becomes usable if it
+    is PIT-expressible, RECURS (≥3 distinct episodes), and actually separates
+    forward market returns — a one-off period gets rejected. Series must be ones
+    that exist in the macro tables (vix, treasury_*, hy_spread, spx_vs_200dma_pct,
+    real_fed_funds, dxy, core_pce_yoy, …).
 
 Be skeptical. Distinguish noise from signal. If the result was driven by one
 position or one window, say so in caveats AND lower confidence accordingly.
@@ -326,7 +337,7 @@ def _persist_memo_and_items(experiment_id: str, run_id: str,
         # for the validation pipeline (lesson_pipeline.validate_candidate_lessons).
         ts = item.get("test_spec")
         test_spec_json = json.dumps(ts) if isinstance(ts, dict) else None
-        vstatus = "candidate" if (test_spec_json and kind == "factor_interaction") else None
+        vstatus = "candidate" if (test_spec_json and kind in ("factor_interaction", "regime")) else None
         app.execute(
             """INSERT INTO memo_items
                (id, experiment_id, run_id, universe, kind, claim,
@@ -446,21 +457,31 @@ def recall_memo_items(run_id: str | None = None,
     if not include_falsified:
         where.append("falsified = 0")
     if validated_only:
-        where.append("validation_status IN ('validated', 'validated_conditional')")
-    sql = """SELECT id, experiment_id, run_id, universe, kind, claim,
-                    mechanism, evidence_summary, confidence, caveats, implication,
-                    is_forward_looking, scope_level, promotion_count,
-                    falsified, falsified_reason, falsified_by_experiment,
-                    validation_status, validated_confidence, regime_conditions,
-                    last_validated_at, test_spec,
-                    created_at, updated_at
-             FROM memo_items"""
-    if where:
-        sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY promotion_count DESC, created_at DESC LIMIT ?"
-    params.append(limit)
+        where.append("validation_status IN "
+                     "('unconditional', 'validated', 'validated_conditional', 'regime_reversing')")
+    cols = """id, experiment_id, run_id, universe, kind, claim,
+              mechanism, evidence_summary, confidence, caveats, implication,
+              is_forward_looking, scope_level, promotion_count,
+              falsified, falsified_reason, falsified_by_experiment,
+              validation_status, validated_confidence, regime_conditions,
+              validation_windows, last_validated_at, test_spec,
+              created_at, updated_at"""
+
+    def _run(select_cols):
+        sql = f"SELECT {select_cols} FROM memo_items"
+        if where:
+            sql_w = sql + " WHERE " + " AND ".join(where)
+        else:
+            sql_w = sql
+        sql_w += " ORDER BY promotion_count DESC, created_at DESC LIMIT ?"
+        return app.execute(sql_w, params + [limit]).fetchall()
+
     app = get_db()
-    rows = app.execute(sql, params).fetchall()
+    try:
+        rows = _run(cols)
+    except sqlite3.OperationalError:
+        # validation_windows not migrated yet on this DB — degrade gracefully.
+        rows = _run(cols.replace("validation_windows, ", ""))
     app.close()
     return [dict(r) for r in rows]
 
@@ -529,13 +550,22 @@ def _validation_line(it: dict) -> str | None:
     # "holds in risk_off (+12.3% ann, t=2.1); REVERSES in calm_uptrend (...)".
     regimes = (it.get("regime_conditions") or "").strip()
     regime_tag = f" [{regimes}]" if regimes else ""
+    # validation_windows is the per-window IS/OOS panel, e.g. "IS:+8%(t2.1) OOS:+9%(t2.0)".
+    windows = (it.get("validation_windows") or "").strip()
+    win_tag = f" Windows: {windows}." if windows else ""
     if status == "candidate":
         return ("⚠ Validation: UNVALIDATED candidate — not yet tested out-of-sample. "
                 "Treat as an untested hypothesis, not evidence.")
+    if status == "unconditional":
+        return (f"✓ Validation: UNCONDITIONAL — holds across all regimes{vconf_tag}{regime_tag}. "
+                f"Regime adds no conditioning — apply always (most robust).{win_tag}")
+    if status == "regime_reversing":
+        return (f"⚠ Validation: REGIME-DEPENDENT — the sign FLIPS by regime{regime_tag}. "
+                f"The pooled effect HIDES this; only trade it conditional on the active regime.{win_tag}")
     if status == "validated":
-        return f"✓ Validation: held out-of-sample{vconf_tag}{regime_tag}."
+        return f"✓ Validation: held out-of-sample{vconf_tag}{regime_tag}.{win_tag}"
     if status == "validated_conditional":
         return (f"✓ Validation: held out-of-sample only CONDITIONALLY{vconf_tag}{regime_tag}. "
-                "Applies only when that regime currently holds.")
+                f"Applies only when that regime currently holds.{win_tag}")
     # rejected / falsified-in-validation: surface it plainly.
     return f"✗ Validation: did NOT hold out-of-sample (status={status}){regime_tag}. Do not rely on this."

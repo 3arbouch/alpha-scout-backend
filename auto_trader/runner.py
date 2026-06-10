@@ -1773,20 +1773,44 @@ async def main():
 
     # --- Lesson validation (opt-in; auxiliary — must NEVER crash the run) ---
     if args.validate_lessons:
-        if not (args.holdout_start and args.holdout_end):
-            print("  ⚠ --validate-lessons set but no --holdout-start/--holdout-end given; "
-                  "skipping (refusing to validate on training data).")
+        # Prefer the per-window × per-regime PANEL over the walk-forward eval
+        # blocks (discovery on training, tested across the eval windows,
+        # IS/OOS-tagged). Fall back to the single clean holdout when no eval
+        # block is configured.
+        _windows = None
+        if eval_block:
+            try:
+                from server.models.backtest import EvalBlock, WindowSpec
+                _eb = EvalBlock(start=eval_block["start"], end=eval_block["end"],
+                                spec=WindowSpec(**eval_block.get("spec", {})))
+                _windows = _generate_eval_windows(_eb)
+            except Exception as e:
+                print(f"  ⚠ could not build eval windows for lesson panel: {e}")
+        if not _windows and not (args.holdout_start and args.holdout_end):
+            print("  ⚠ --validate-lessons set but no eval block and no "
+                  "--holdout-start/--holdout-end given; skipping "
+                  "(refusing to validate on training data).")
         else:
             try:
                 import sqlite3 as _sqlite
-                from auto_trader.lesson_pipeline import validate_candidate_lessons
+                from auto_trader.lesson_pipeline import (
+                    validate_candidate_lessons, validate_candidate_regimes,
+                )
                 from auto_trader.schema import get_db as _get_db
                 _mkt = _sqlite.connect(os.environ.get(
                     "MARKET_DB_PATH",
                     str(Path(__file__).parent.parent / "data" / "market_dev.db")))
+                # First gate any regimes this run's analyst proposed, so the
+                # panel can slice by them (seed + accepted).
+                _rsum = validate_candidate_regimes(
+                    _get_db(), _mkt, args.start, args.end, run_id=run_id)
                 _summary = validate_candidate_lessons(
-                    _get_db(), _mkt, args.holdout_start, args.holdout_end, run_id=run_id)
-                print(f"  🔎 lesson validation ({args.holdout_start}..{args.holdout_end}): {_summary}")
+                    _get_db(), _mkt, args.holdout_start, args.holdout_end, run_id=run_id,
+                    eval_windows=_windows,
+                    train_span=(args.start, args.end) if _windows else None)
+                _mode = f"panel/{len(_windows)} windows" if _windows else \
+                    f"holdout {args.holdout_start}..{args.holdout_end}"
+                print(f"  🔎 lesson validation ({_mode}): regimes={_rsum} lessons={_summary}")
             except Exception as e:
                 print(f"  ⚠ lesson validation failed (non-fatal): {e}")
 

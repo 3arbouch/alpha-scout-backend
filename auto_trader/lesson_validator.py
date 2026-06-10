@@ -167,6 +167,93 @@ def derive_verdict(agg):
     }
 
 
+# Verdict statuses that count as a real (non-rejected) finding.
+VALIDATED_STATUSES = ("unconditional", "validated", "validated_conditional", "regime_reversing")
+
+
+def derive_verdict_panel(per_regime, per_window=None):
+    """Richer verdict from the per-regime panel, optionally with per-window OOS info.
+
+    Distinguishes four shapes the pooled-only `derive_verdict` can't:
+      - unconditional       : strong pooled effect, homogeneous across regimes
+                              (none reverses, none contradicts) → apply ALWAYS.
+                              This is the most robust, most deployable kind.
+      - regime_reversing    : at least one regime holds AND at least one reverses —
+                              the sign flips by regime, so the pooled number HIDES it.
+                              Only tradeable conditional on regime.
+      - validated_conditional: holds in some regime(s) but not everywhere/not pooled.
+      - rejected            : nothing meaningful.
+
+    Homogeneity (for `unconditional`): pooled is significant, no regime reverses,
+    and no regime with enough data (n>=8) contradicts the pooled sign or is flat
+    (|t|<FLAT). i.e. the effect shows up wherever there is data.
+    """
+    SIG, FLAT = 1.5, 0.5
+    regimes = {k: v for k, v in per_regime.items() if k != "__overall__"}
+    big = {k: v for k, v in regimes.items() if v["n"] >= 8}
+    holds = {k: v for k, v in big.items() if v["t_stat"] >= SIG}
+    reverses = {k: v for k, v in big.items() if v["t_stat"] <= -SIG}
+    overall = per_regime.get("__overall__", {})
+    overall_t = overall.get("t_stat", 0.0)
+    overall_mean = overall.get("mean_ann_pct", 0.0)
+    overall_sig = abs(overall_t) >= SIG
+    overall_sign = 1 if overall_mean >= 0 else -1
+
+    cond = []
+    for k, v in holds.items():
+        cond.append(f"holds in {k} ({v['mean_ann_pct']:+}% ann, t={v['t_stat']})")
+    for k, v in reverses.items():
+        cond.append(f"REVERSES in {k} ({v['mean_ann_pct']:+}% ann, t={v['t_stat']})")
+
+    if holds and reverses:
+        status, conf = "regime_reversing", "medium"
+    elif overall_sig and holds and not reverses:
+        contradicting = [
+            k for k, v in big.items()
+            if (1 if v["mean_ann_pct"] >= 0 else -1) != overall_sign or abs(v["t_stat"]) < FLAT
+        ]
+        if not contradicting:
+            status, conf = "unconditional", "high"
+            cond = [f"holds across all regimes (pooled {overall_mean:+}% ann, "
+                    f"t={overall_t}); regime adds no conditioning"]
+        else:
+            status, conf = "validated_conditional", "medium"
+    elif holds or reverses:
+        status, conf = "validated_conditional", "medium"
+    else:
+        status, conf = "rejected", "low"
+
+    out = {
+        "status": status,
+        "validated_confidence": conf,
+        "regime_conditions": "; ".join(cond) or "no regime shows a meaningful effect",
+    }
+    if per_window is not None:
+        out["windows_summary"] = _summarize_windows(per_window)
+        out["oos_persistence"] = _oos_persistence(per_window)
+    return out
+
+
+def _summarize_windows(per_window):
+    """Compact per-window line, IS/OOS-tagged: 'IS:+8.0%(t2.1) OOS:-3.1%(t-1.4)'."""
+    if not per_window:
+        return "no windows"
+    parts = []
+    for w in per_window:
+        tag = "OOS" if w["is_oos"] else "IS"
+        parts.append(f"{tag}:{w['mean_ann_pct']:+}%(t{w['t_stat']})")
+    return " ".join(parts)
+
+
+def _oos_persistence(per_window):
+    """How many out-of-sample windows hold (|t|>=1.5). The forward-evidence read."""
+    oos = [w for w in per_window if w["is_oos"]]
+    if not oos:
+        return "no OOS windows (in-sample only — treat as descriptive)"
+    sig = sum(1 for w in oos if abs(w["t_stat"]) >= 1.5)
+    return f"{sig}/{len(oos)} OOS windows hold"
+
+
 # --------------------------------------------------------------------------- #
 # Data plumbing (point-in-time)
 # --------------------------------------------------------------------------- #
@@ -244,6 +331,77 @@ def validate_lesson(spec, start, end, conn, regime_configs=None,
 
     agg = _aggregate(per_date, regime_labels, horizon)
     return {"n_dates": len(per_date), "by_regime": agg, "verdict": derive_verdict(agg)}
+
+
+def _compute_per_date(spec, span_start, span_end, conn, grid_step, control_random, seed):
+    """The PIT double-sort grid over [span_start, span_end]: {date: spread}."""
+    horizon = int(spec["horizon_days"])
+    cal = _trading_calendar(conn, span_start, span_end)
+    members_on = _membership_asof_fn(conn)
+    closes = _load_closes(conn, span_start, span_end)
+    rng = random.Random(seed) if control_random else None
+    per_date = {}
+    for i in range(0, len(cal) - horizon, grid_step):
+        d, fwd = cal[i], cal[i + horizon]
+        xs = _cross_section(conn, d, members_on(d),
+                            spec["primary_factor"], spec["conditioning_factor"])
+        sp = _double_sort_spread(xs, lambda s: (
+            (closes[s][fwd] / closes[s][d] - 1)
+            if (s in closes and d in closes[s] and fwd in closes[s] and closes[s][d] > 0)
+            else None), rng=rng)
+        if sp is not None:
+            per_date[d] = sp
+    return per_date
+
+
+def validate_lesson_panel(spec, conn, eval_windows, regime_configs=None,
+                          train_span=None, grid_step=21, control_random=False, seed=42):
+    """Per-window × per-regime panel for one lesson.
+
+    eval_windows: list of (start, end, label) — the overlapping walk-forward
+    blocks. The double-sort grid is computed ONCE over the union span, then
+    sliced two ways (two marginals, not a sparse full cross-tab):
+      - per_regime : pooled across all dates (the conditioning view — pools each
+                     regime's recurring episodes for sample size).
+      - per_window : by eval block (the time-stability / non-stationarity view),
+                     each tagged IS or OOS.
+    train_span=(train_start, train_end): a window is OOS iff it is DISJOINT from
+    the training span. None → every window tagged IS (purely descriptive).
+
+    Returns {n_dates, per_regime, per_window, verdict}.
+    """
+    regime_configs = regime_configs or SEED_REGIMES
+    horizon = int(spec["horizon_days"])
+    if not eval_windows:
+        return {"n_dates": 0, "per_regime": {}, "per_window": [],
+                "verdict": derive_verdict_panel({}, [])}
+    span_start = min(w[0] for w in eval_windows)
+    span_end = max(w[1] for w in eval_windows)
+
+    per_date = _compute_per_date(spec, span_start, span_end, conn,
+                                 grid_step, control_random, seed)
+    regime_labels = evaluate_regime_series(span_start, span_end, regime_configs, conn=conn)
+    per_regime = _aggregate(per_date, regime_labels, horizon)
+
+    per_window = []
+    for (ws, we, label) in eval_windows:
+        wd = {d: sp for d, sp in per_date.items() if ws <= d <= we}
+        if not wd:
+            continue
+        ov = _aggregate(wd, {}, horizon)["__overall__"]   # within-window overall
+        is_oos = True
+        if train_span:
+            ts, te = train_span
+            is_oos = not (ws <= te and ts <= we)          # disjoint from training
+        per_window.append({
+            "label": label, "start": ws, "end": we, "is_oos": is_oos,
+            "n": ov["n"], "mean_ann_pct": ov["mean_ann_pct"],
+            "t_stat": ov["t_stat"], "hit_rate": ov["hit_rate"],
+        })
+
+    verdict = derive_verdict_panel(per_regime, per_window)
+    return {"n_dates": len(per_date), "per_regime": per_regime,
+            "per_window": per_window, "verdict": verdict}
 
 
 if __name__ == "__main__":
