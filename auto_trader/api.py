@@ -293,7 +293,7 @@ class CreateRunRequest(BaseModel):
     name: str = Field(description="Human-readable run name")
     agent_id: str = Field(default="default", description="Agent ID to use for this run")
     metric: str = Field(description="Metric to optimize: sharpe_ratio, alpha_ann_pct, annualized_volatility_pct, max_drawdown_pct")
-    conditions: list[str] = Field(default_factory=list, description="Optional conditions, e.g. ['alpha_ann_pct > 0', 'annualized_volatility_pct < 20']")
+    conditions: list[str] = Field(default_factory=list, description="Optional hard constraints a kept config must satisfy, 'metric operator value'. A bare metric is the overall training-period value (e.g. 'alpha_ann_pct > 0'). A '<metric>.<aggregator>' name applies the constraint across the walk-forward eval windows — aggregators: min, max, mean, median, p10, p25, stdev, iqr, range, snr. E.g. 'alpha_ann_pct.min > 3' = alpha above 3% in EVERY window (consistency); 'alpha_ann_pct.p10 > 3' tolerates one weak tail window. Requires `eval` to be set.")
     start: str = Field(description="Training period start (YYYY-MM-DD)")
     end: str = Field(description="Training period end (YYYY-MM-DD)")
     capital: float = Field(default=1_000_000, description="Initial capital")

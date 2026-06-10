@@ -648,6 +648,24 @@ def check_conditions(metrics: dict, conditions: list[dict]) -> tuple[bool, list[
     return all_met, detail
 
 
+def conditions_namespace(metrics: dict, eval_aggregated: dict | None) -> dict:
+    """Lookup namespace for conditions: overall metrics + per-window eval aggregates.
+
+    Bare names (e.g. `alpha_ann_pct`) resolve to the overall training-period
+    value. `<metric>.<aggregator>` (e.g. `alpha_ann_pct.min`, `sharpe_ratio.p10`)
+    resolves to that aggregate across the walk-forward eval windows — so a
+    condition like `alpha_ann_pct.min > 3` means "alpha > 3% in EVERY window"
+    (the worst window clears 3%). Aggregators come from _aggregate_window_metrics:
+    mean, median, min, max, p10, p25, stdev, iqr, range, snr.
+    """
+    ns = dict(metrics)
+    for m, aggs in (eval_aggregated or {}).items():
+        for agg, v in aggs.items():
+            if v is not None:
+                ns[f"{m}.{agg}"] = v
+    return ns
+
+
 def normalize_config(portfolio_config: dict) -> dict:
     """Fix common config issues from LLM output before passing to engine."""
     config = dict(portfolio_config)
@@ -1396,7 +1414,10 @@ You are researching as of {backtest_end}. You do not know what happens after thi
     # Score — resolve the single scalar the agent climbs.
     eval_aggregated = (eval_data or {}).get("aggregated", {})
     target_value = _resolve_target_value(metrics, eval_aggregated, target_metric, target_aggregator)
-    conditions_met, conditions_detail = check_conditions(metrics, conditions)
+    # Conditions may reference per-window eval aggregates via `<metric>.<aggregator>`
+    # (e.g. alpha_ann_pct.min > 3 → alpha > 3% in every walk-forward window).
+    conditions_met, conditions_detail = check_conditions(
+        conditions_namespace(metrics, eval_aggregated), conditions)
 
     improved = (
         target_value is not None
