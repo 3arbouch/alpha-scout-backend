@@ -499,6 +499,9 @@ def render_memo_items_for_experiment(experiment_id: str,
         lines.append(
             f"- [{it['kind']}, {it.get('universe') or 'global'}]{conf_tag} {it['claim']}"
         )
+        vline = _validation_line(it)
+        if vline:
+            lines.append(f"  - {vline}")
         if it.get("mechanism"):
             lines.append(f"  - Mechanism: {it['mechanism']}")
         if it.get("evidence_summary"):
@@ -508,3 +511,31 @@ def render_memo_items_for_experiment(experiment_id: str,
         if it.get("implication"):
             lines.append(f"  - Implication: {it['implication']}")
     return "\n".join(lines)
+
+
+def _validation_line(it: dict) -> str | None:
+    """One-line validation-status tag for a memo item, or None if not applicable.
+
+    Only factor-interaction claims carry a validation_status. The tag tells the
+    trader whether the claim survived out-of-sample testing — and in which
+    regimes — so it can weight a proven lesson over an untested hypothesis.
+    """
+    status = it.get("validation_status")
+    if not status:
+        return None
+    vconf = it.get("validated_confidence")
+    vconf_tag = f", OOS confidence {vconf}" if vconf else ""
+    # regime_conditions is the validator's human-readable summary, e.g.
+    # "holds in risk_off (+12.3% ann, t=2.1); REVERSES in calm_uptrend (...)".
+    regimes = (it.get("regime_conditions") or "").strip()
+    regime_tag = f" [{regimes}]" if regimes else ""
+    if status == "candidate":
+        return ("⚠ Validation: UNVALIDATED candidate — not yet tested out-of-sample. "
+                "Treat as an untested hypothesis, not evidence.")
+    if status == "validated":
+        return f"✓ Validation: held out-of-sample{vconf_tag}{regime_tag}."
+    if status == "validated_conditional":
+        return (f"✓ Validation: held out-of-sample only CONDITIONALLY{vconf_tag}{regime_tag}. "
+                "Applies only when that regime currently holds.")
+    # rejected / falsified-in-validation: surface it plainly.
+    return f"✗ Validation: did NOT hold out-of-sample (status={status}){regime_tag}. Do not rely on this."

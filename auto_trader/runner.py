@@ -395,6 +395,12 @@ def build_history_context(run_id: str, target_metric: str, limit: int = 20,
             "ledger, realized P&L, NAV, and factor attribution after each "
             "experiment. Third-party, data-grounded. The analyst sees what "
             "actually happened in the books, not what your thesis predicted.\n"
+            "  - Some analyst observations carry a **Validation** tag from an "
+            "independent point-in-time out-of-sample test. Weight them by it: a "
+            "claim that **held out-of-sample** is evidence you can act on; a "
+            "claim validated **only in specific regimes** applies only when that "
+            "regime currently holds; an **UNVALIDATED candidate** is an untested "
+            "hypothesis — do not size into it as if it were proven.\n"
         )
     else:
         lines.append(
