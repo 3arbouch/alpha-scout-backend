@@ -665,6 +665,15 @@ def evaluate_one(deploy_id: str) -> dict | None:
                 print(f"    {len(alerts)} alert(s) generated for {today}")
 
         conn.close()
+
+        # Refresh the daily composite-score panel for scoring strategies
+        # (incremental — only new dates; opens its own connections; never fatal).
+        try:
+            from deployment_scores import compute_and_persist as _persist_scores
+            _persist_scores(deploy_id)
+        except Exception as _se:
+            print(f"    [scores] panel refresh skipped: {_se}")
+
         return result
 
     except Exception as e:
