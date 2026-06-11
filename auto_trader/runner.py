@@ -842,6 +842,19 @@ def _generate_eval_windows(eval_block) -> list[tuple[str, str, str]]:
     return windows
 
 
+def _eval_max_workers() -> int:
+    """Max parallel processes for eval-window backtests.
+
+    Default 4. Override with EVAL_MAX_WORKERS (e.g. lower it when several
+    studies run on the box at once to avoid oversubscribing cores).
+    """
+    try:
+        n = int(os.environ.get("EVAL_MAX_WORKERS", "4"))
+    except ValueError:
+        n = 4
+    return max(1, n)
+
+
 # Metric names whose distribution we aggregate across eval windows.
 _AGG_METRIC_NAMES = (
     "sharpe_ratio",
@@ -1000,14 +1013,48 @@ def run_backtest(
         }
         return training
 
-    print(f"  Running {len(window_specs)} eval window(s)...")
+    # Each eval window is a fresh-capital, fully independent backtest (no state
+    # rolls between them; each opens its own read-only SQLite connection), so
+    # they parallelize cleanly across processes. We use 'spawn' rather than fork
+    # because run_backtest runs mid-agent-conversation while the Claude SDK
+    # subprocess is live — forking that is unsafe. Results are reassembled in
+    # window order for deterministic output.
+    n_windows = len(window_specs)
+    max_workers = min(n_windows, _eval_max_workers())
+    print(f"  Running {n_windows} eval window(s) across {max_workers} worker(s)...")
+
+    results: list[dict | None] = [None] * n_windows
+    if max_workers <= 1:
+        for i, (w_start, w_end, _w_label) in enumerate(window_specs):
+            results[i] = _run_one_backtest(
+                portfolio_config, w_start, w_end,
+                config.initial_capital, config.sector,
+                benchmark_sectors=config.benchmark_sectors,
+            )
+    else:
+        import concurrent.futures
+        import multiprocessing
+        ctx = multiprocessing.get_context("spawn")
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as ex:
+            futures = {
+                ex.submit(
+                    _run_one_backtest,
+                    portfolio_config, w_start, w_end,
+                    config.initial_capital, config.sector,
+                    config.benchmark_sectors,
+                ): i
+                for i, (w_start, w_end, _w_label) in enumerate(window_specs)
+            }
+            for fut in concurrent.futures.as_completed(futures):
+                i = futures[fut]
+                try:
+                    results[i] = fut.result()
+                except Exception as e:
+                    print(f"  [warn] eval window {window_specs[i][2]} crashed: {e}")
+                    results[i] = None
+
     eval_windows: list[dict] = []
-    for w_start, w_end, w_label in window_specs:
-        res = _run_one_backtest(
-            portfolio_config, w_start, w_end,
-            config.initial_capital, config.sector,
-            benchmark_sectors=config.benchmark_sectors,
-        )
+    for (w_start, w_end, w_label), res in zip(window_specs, results):
         if res is None:
             print(f"  [warn] eval window {w_label} failed; skipping")
             continue
