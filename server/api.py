@@ -19,6 +19,7 @@ import sys
 import json
 import sqlite3
 import asyncio
+import subprocess
 from pathlib import Path
 from typing import Optional
 from contextlib import contextmanager
@@ -52,6 +53,32 @@ async def _run_sync(func, *args, **kwargs):
     """Run a blocking function in a thread pool so it doesn't freeze the event loop."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, partial(func, *args, **kwargs))
+
+
+def _spawn_deploy_evaluation(deploy_id: str) -> None:
+    """Run a deployment's catch-up backtest in a detached subprocess.
+
+    A deploy's evaluation is a minutes-long, CPU-bound backtest. Running it in a
+    thread (via _run_sync) still holds the GIL and freezes the API event loop, so
+    we run it as a separate process instead — it lands on its own core and never
+    blocks request handling. DB/market paths are passed explicitly so the child
+    reads/writes the exact same databases this process uses.
+    """
+    import deploy_engine
+    engine_path = Path(deploy_engine.__file__)
+    log_dir = Path(__file__).resolve().parent.parent / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / f"deploy_eval_{deploy_id}.log"
+    env = dict(os.environ)
+    env["APP_DB_PATH"] = str(APP_DB_PATH)
+    env["MARKET_DB_PATH"] = str(MARKET_DB_PATH)
+    env["DATA_DIR"] = str(DATA_DIR)
+    with open(log_file, "a") as lf:
+        subprocess.Popen(
+            [sys.executable, "-u", str(engine_path), "evaluate-one", deploy_id],
+            stdout=lf, stderr=subprocess.STDOUT, env=env,
+            cwd=str(engine_path.parent), start_new_session=True,
+        )
 
 # ---------------------------------------------------------------------------
 # Config
@@ -3726,8 +3753,16 @@ async def deploy_portfolio_endpoint(body: PortfolioDeployRequest, _: str = Depen
         sleeve.setdefault("strategy_config", {}).setdefault("sizing", {})["shares"] = shares_mode
 
     try:
-        # Pass portfolio_id so deployment records the FK for lineage
-        result = await _run_sync(_deploy_portfolio, config, body.start_date, body.initial_capital, body.name, body.portfolio_id)
+        # Create the deployment row WITHOUT the (minutes-long) catch-up backtest so
+        # the request returns immediately; the backtest runs in a detached
+        # subprocess. The deployment is 'active' at once; last_evaluated stays null
+        # until the background eval finishes (frontend shows an "evaluating" state).
+        # Pass portfolio_id so deployment records the FK for lineage.
+        result = await _run_sync(
+            _deploy_portfolio, config, body.start_date, body.initial_capital,
+            body.name, body.portfolio_id, evaluate=False,
+        )
+        _spawn_deploy_evaluation(result["id"])
         return result
     except Exception as e:
         traceback.print_exc()
