@@ -134,6 +134,8 @@ def get_market_db():
 def get_app_db():
     """App state: strategies, portfolios, deployments, trades, alerts, regimes."""
     conn = sqlite3.connect(str(APP_DB_PATH), check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")   # readers don't block on writers
+    conn.execute("PRAGMA busy_timeout=5000")  # wait out write contention instead of erroring
     conn.row_factory = sqlite3.Row
     try:
         yield conn
