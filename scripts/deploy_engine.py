@@ -445,7 +445,7 @@ def persist_sleeves(source_type: str, source_id: str, portfolio_result: dict,
 # Deploy (unified)
 # ---------------------------------------------------------------------------
 def deploy(config_or_path, start_date: str, capital: float,
-           name: str = None, portfolio_id: str = None) -> dict:
+           name: str = None, portfolio_id: str = None, evaluate: bool = True) -> dict:
     """
     Deploy a strategy or portfolio for live paper-trading.
 
@@ -514,8 +514,11 @@ def deploy(config_or_path, start_date: str, capital: float,
     print(f"  Name: {deploy_name}")
     print(f"  Start: {start_date}, Capital: ${capital:,.0f}, Sleeves: {num_sleeves}")
 
-    # Run initial evaluation
-    evaluate_one(deploy_id)
+    # Run initial evaluation. Skipped when the caller will evaluate out-of-band
+    # (the API spawns a background subprocess so the deploy request returns
+    # immediately instead of blocking on a minutes-long catch-up backtest).
+    if evaluate:
+        evaluate_one(deploy_id)
 
     return {"id": deploy_id, "name": deploy_name, "type": deploy_type,
             "start_date": start_date, "capital": capital}
@@ -1325,6 +1328,9 @@ def main():
 
     sub.add_parser("evaluate", help="Evaluate all active deployments")
 
+    p_eval_one = sub.add_parser("evaluate-one", help="Evaluate a single deployment by id")
+    p_eval_one.add_argument("id")
+
     p_list = sub.add_parser("list", help="List deployments")
     p_list.add_argument("--all", action="store_true", help="Include stopped")
     p_list.add_argument("--type", choices=["strategy", "portfolio"], help="Filter by type")
@@ -1350,6 +1356,8 @@ def main():
     elif args.command == "evaluate":
         evaluate_all_regimes()
         evaluate_all()
+    elif args.command == "evaluate-one":
+        evaluate_one(args.id)
     elif args.command == "list":
         deployments = list_deployments(include_stopped=getattr(args, 'all', False),
                                         deploy_type=getattr(args, 'type', None))
@@ -1687,9 +1695,9 @@ def get_regime_alerts(deploy_id: str = None, date: str = None, limit: int = 50) 
 # Compatibility aliases for api.py (v1 portfolio function names → v2 unified)
 # ---------------------------------------------------------------------------
 
-def deploy_portfolio(portfolio_config, start_date, capital, name=None, portfolio_id=None):
+def deploy_portfolio(portfolio_config, start_date, capital, name=None, portfolio_id=None, evaluate=True):
     """Deploy a portfolio. Alias for deploy()."""
-    return deploy(portfolio_config, start_date, capital, name, portfolio_id)
+    return deploy(portfolio_config, start_date, capital, name, portfolio_id, evaluate=evaluate)
 
 def evaluate_portfolio_one(deploy_id):
     """Evaluate a portfolio deployment. Alias for evaluate_one()."""
