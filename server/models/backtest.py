@@ -136,7 +136,8 @@ class BacktestConfig(BaseModel):
     training_end: str = Field(description="ISO date YYYY-MM-DD.")
     initial_capital: float = Field(gt=0, description="Starting capital for the training-period backtest (and, independently, for each eval window).")
     sector: str | None = Field(default=None, description="Optional sector filter; passed through to the universe.")
-    benchmark: Literal["market", "sector"] = Field(default="market", description="Which benchmark to compute alpha against. 'sector' requires `sector` to be set.")
+    benchmark_sectors: list[str] | None = Field(default=None, description="Sectors whose ETFs form the sector benchmark. One → that ETF; many → cap-weighted blend. Defaults to [sector] when unset. Used when benchmark='sector'.")
+    benchmark: Literal["market", "sector"] = Field(default="market", description="Which benchmark to compute alpha against. 'sector' requires `sector` or `benchmark_sectors` to be set.")
     eval: EvalBlock | None = Field(default=None, description="Optional walk-forward eval block. Absent = single training-period backtest (today's behavior).")
 
     @model_validator(mode="after")
@@ -150,8 +151,8 @@ class BacktestConfig(BaseModel):
             raise ValueError(
                 f"training_start ({self.training_start}) must be strictly before training_end ({self.training_end})"
             )
-        if self.benchmark == "sector" and not self.sector:
-            raise ValueError("benchmark='sector' requires `sector` to be set")
+        if self.benchmark == "sector" and not (self.sector or self.benchmark_sectors):
+            raise ValueError("benchmark='sector' requires `sector` or `benchmark_sectors` to be set")
         return self
 
     @classmethod
@@ -162,6 +163,7 @@ class BacktestConfig(BaseModel):
         capital: float,
         sector: str | None = None,
         benchmark: str = "market",
+        benchmark_sectors: list[str] | None = None,
     ) -> "BacktestConfig":
         """Build a `BacktestConfig` from today's flat-arg call sites (no eval)."""
         return cls(
@@ -169,6 +171,7 @@ class BacktestConfig(BaseModel):
             training_end=end,
             initial_capital=capital,
             sector=sector,
+            benchmark_sectors=benchmark_sectors,
             benchmark=benchmark,  # type: ignore[arg-type]
             eval=None,
         )

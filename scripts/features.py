@@ -164,10 +164,10 @@ def _load_symbol_bundles(conn: sqlite3.Connection, symbol: str):
     Income columns (positional, 9 fields):
       date, revenue, net_income, ebitda, eps_diluted, shares_diluted,
       gross_profit, operating_income, available_from
-    Balance (5):
-      date, total_equity, net_debt, total_debt, available_from
-    Cashflow (4):
-      date, free_cash_flow, dividends_paid, available_from
+    Balance (6):
+      date, total_equity, net_debt, total_debt, total_assets, available_from
+    Cashflow (5):
+      date, free_cash_flow, dividends_paid, operating_cf, available_from
     Prices (2):
       date, close
 
@@ -184,11 +184,11 @@ def _load_symbol_bundles(conn: sqlite3.Connection, symbol: str):
         "FROM income WHERE symbol=? ORDER BY date ASC", (symbol,)
     ).fetchall()
     balance = cur.execute(
-        "SELECT date, total_equity, net_debt, total_debt "
+        "SELECT date, total_equity, net_debt, total_debt, total_assets "
         "FROM balance WHERE symbol=? ORDER BY date ASC", (symbol,)
     ).fetchall()
     cashflow = cur.execute(
-        "SELECT date, free_cash_flow, dividends_paid "
+        "SELECT date, free_cash_flow, dividends_paid, operating_cf "
         "FROM cashflow WHERE symbol=? ORDER BY date ASC", (symbol,)
     ).fetchall()
     prices = cur.execute(
@@ -210,6 +210,15 @@ def _load_earnings_dates(conn: sqlite3.Connection, symbol: str) -> list[str]:
     """Ascending list of earnings event dates (past actuals + scheduled future)."""
     return [r[0] for r in conn.execute(
         "SELECT date FROM earnings WHERE symbol=? ORDER BY date ASC", (symbol,)
+    ).fetchall()]
+
+
+def _load_earnings_history(conn: sqlite3.Connection, symbol: str) -> list[tuple]:
+    """Ascending (date, eps_actual, eps_estimated) — for SUE / earnings-surprise.
+    date is the announcement date (point-in-time)."""
+    return [tuple(r) for r in conn.execute(
+        "SELECT date, eps_actual, eps_estimated FROM earnings WHERE symbol=? ORDER BY date ASC",
+        (symbol,)
     ).fetchall()]
 
 
@@ -350,6 +359,7 @@ def build_symbol(conn: sqlite3.Connection, symbol: str, start_date: str | None =
     if not income or not prices:
         return 0
     earnings_dates = _load_earnings_dates(conn, symbol)
+    earnings_history = _load_earnings_history(conn, symbol)
     grades = _load_grades(conn, symbol)
 
     cols = _materialized_columns()
@@ -363,7 +373,7 @@ def build_symbol(conn: sqlite3.Connection, symbol: str, start_date: str | None =
         ctx = build_context(
             symbol, date, close, income, balance, cashflow,
             earnings_dates=earnings_dates, grades=grades,
-            prices=prices,
+            prices=prices, earnings_history=earnings_history,
         )
         if ctx is None:
             continue

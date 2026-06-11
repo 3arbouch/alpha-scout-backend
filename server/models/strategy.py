@@ -145,48 +145,22 @@ class AlwaysCondition(BaseModel):
 # Values are point-in-time: latest quarterly report as-of the trading day,
 # combined with that day's close for price-dependent ratios. Same values are
 # queryable via `data-query` so agent research and engine execution agree.
+#
+# FeatureName is DERIVED from the factor registry (server/factors) — the single
+# source of truth — so every registered factor is automatically usable as a
+# feature_threshold / feature_percentile condition. It used to be a hand-kept
+# Literal that drifted as new factors landed (e.g. gross_profitability worked in
+# composite_score ranking but was rejected as an entry filter). Per-factor
+# descriptions/units now live on each FeatureDef; tests/test_featurename_registry.py
+# guards against drift. NOTE: built at import time — a running server must be
+# restarted to pick up newly added factors.
 # ---------------------------------------------------------------------------
-FeatureName = Literal[
-    # --- Valuation ---
-    "pe",          # market_cap / TTM net_income
-    "ps",          # market_cap / TTM revenue
-    "p_b",         # market_cap / total_equity
-    "ev_ebitda",   # (market_cap + net_debt) / TTM ebitda
-    "ev_sales",    # (market_cap + net_debt) / TTM revenue
-    # --- Yield ---
-    "fcf_yield",   # TTM free_cash_flow / market_cap, percent
-    "div_yield",   # TTM |dividends_paid| / market_cap, percent
-    # --- Growth ---
-    "eps_yoy",     # latest Q eps_diluted vs same-Q prior year, percent
-    "rev_yoy",     # latest Q revenue vs same-Q prior year, percent
-    # --- Quality (current margins, percent) ---
-    "gross_margin",  # TTM gross_profit / TTM revenue × 100
-    "op_margin",     # TTM operating_income / TTM revenue × 100
-    "net_margin",    # TTM net_income / TTM revenue × 100
-    # --- Quality (margin trajectory) ---
-    "op_margin_yoy_delta",   # current op_margin minus same-Q prior year, percentage points
-    "net_margin_yoy_delta",  # current net_margin minus same-Q prior year, percentage points
-    # --- Growth acceleration ---
-    "rev_yoy_accel",  # latest rev_yoy minus prior-quarter rev_yoy, percentage points
-    "eps_yoy_accel",  # latest eps_yoy minus prior-quarter eps_yoy, percentage points
-    # --- Balance-sheet quality ---
-    "roe",            # TTM net_income / total_equity × 100, percent
-    "roic",           # TTM operating_income / (total_equity + total_debt) × 100, percent — proxy (no tax adjustment)
-    "debt_to_equity", # total_debt / total_equity, ratio
-    # --- Returns / momentum (point-in-time, percent) ---
-    "ret_1m",         # 21-trading-day total return
-    "ret_3m",         # 63-trading-day total return
-    "ret_6m",         # 126-trading-day total return
-    "ret_12m",        # 252-trading-day total return
-    "ret_12_1m",      # 12-month return excluding the most recent month — "Asness momentum"
-    # --- Analyst flow ---
-    "analyst_net_upgrades_30d",  # net analyst upgrades minus downgrades over trailing 30 days
-    "analyst_net_upgrades_90d",  # same over trailing 90 days
-    # --- Calendar / event ---
-    "days_since_last_earnings",  # trading days since last reported earnings
-    "days_to_next_earnings",     # trading days until next expected earnings (None if unknown)
-    "pre_earnings_window_5d",    # 1 if days_to_next_earnings ≤ 5, else 0
-]
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))  # repo root, for `server.factors`
+from server.factors import all_features as _all_features
+
+FeatureName = Literal[tuple(sorted(f.name for f in _all_features()))]
 
 
 class FeatureThresholdCondition(BaseModel):
@@ -296,7 +270,8 @@ class UniverseConfig(BaseModel):
                     "'index' is point-in-time membership of a major index (set 'index' field to sp500|nasdaq|dowjones). "
                     "'index' is the only PIT-aware option and is the recommended type for survivorship-correct backtests.",
     )
-    sector: str | None = Field(default=None, description="GICS sector name. Required when type='sector'.")
+    sector: str | None = Field(default=None, description="Single GICS sector name. Use with type='sector'. For multiple sectors use 'sectors' instead.")
+    sectors: list[str] | None = Field(default=None, description="Multiple GICS sector names with type='sector': the universe is the UNION of all of them (e.g. ['Technology', 'Communication Services']). Takes precedence over 'sector'.")
     symbols: list[str] | None = Field(default=None, description="Explicit ticker list. Required when type='symbols'.")
     index: Literal["sp500", "nasdaq", "dowjones"] | None = Field(
         default=None,

@@ -2065,6 +2065,76 @@ async def get_deployment_ranking_event(
     return _sanitize_floats(ev)
 
 
+# --- Daily composite-score panel (dense; backed by deployment_scores table) ---
+# NOTE: the literal sub-routes (/scores/series, /scores/ranks) MUST be declared
+# before /scores/{date} so "series"/"ranks" aren't captured as a date param.
+
+@app.get("/deployments/{deploy_id}/scores/series", tags=["Deployments (Unified)"])
+async def get_deployment_score_series(
+    deploy_id: str,
+    symbols: str = Query(None, description="Comma-separated tickers. Omit for the whole universe."),
+    start: str = Query(None), end: str = Query(None),
+    sleeve: str = Query(None),
+    _: str = Depends(verify_api_key),
+):
+    """Per-symbol daily score+rank time series (for score / rank line charts).
+
+    Returns {sleeve_label: {symbol: [{date, score, rank, selected, held}, ...]}}.
+    `selected` = within the ranking cutoff that day; `held` = actually in the
+    portfolio. Backfill first via POST /scores/backfill if empty."""
+    from deployment_scores import series as _series
+    syms = [s.strip() for s in symbols.split(",")] if symbols else None
+    data = await _run_sync(_series, deploy_id, syms, start, end, sleeve)
+    return _sanitize_floats({"deployment_id": deploy_id, "series": data})
+
+
+@app.get("/deployments/{deploy_id}/scores/ranks", tags=["Deployments (Unified)"])
+async def get_deployment_score_ranks(
+    deploy_id: str,
+    start: str = Query(None), end: str = Query(None),
+    sleeve: str = Query(None),
+    _: str = Depends(verify_api_key),
+):
+    """Per-day FULL-universe leaderboard (no cap) for the rank-movement view.
+
+    One entry per (date, sleeve): every scored symbol ordered by rank, each
+    tagged selected/held so the frontend can render the whole field and filter."""
+    from deployment_scores import ranks as _ranks
+    data = await _run_sync(_ranks, deploy_id, start, end, sleeve)
+    return _sanitize_floats({"deployment_id": deploy_id, "n_dates": len(data), "dates": data})
+
+
+@app.get("/deployments/{deploy_id}/scores/{date}", tags=["Deployments (Unified)"])
+async def get_deployment_scores_for_day(
+    deploy_id: str, date: str, sleeve: str = Query(None),
+    _: str = Depends(verify_api_key),
+):
+    """Full leaderboard for ONE day WITH per-bucket/per-factor breakdown
+    (recomputed on demand). Whole universe, picked and not-picked, with
+    selected/held tags — the 'why this score' drill-down for any date."""
+    from deployment_scores import day_detail
+    try:
+        data = await _run_sync(day_detail, deploy_id, date, sleeve)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    return _sanitize_floats(data)
+
+
+@app.post("/deployments/{deploy_id}/scores/backfill", tags=["Deployments (Unified)"])
+async def backfill_deployment_scores(
+    deploy_id: str, full: bool = Query(False, description="Recompute the entire history (default: only fill missing recent dates)."),
+    _: str = Depends(verify_api_key),
+):
+    """Compute + persist the daily score panel for this deployment. Idempotent.
+    Cheap incrementally; pass ?full=true for a one-time full rebuild."""
+    from deployment_scores import compute_and_persist
+    try:
+        summary = await _run_sync(compute_and_persist, deploy_id, full)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    return summary
+
+
 def _build_position_book(sleeves: list[dict], initial_capital: float) -> dict:
     """Merge open positions + closed trades across sleeves into per-ticker book.
 

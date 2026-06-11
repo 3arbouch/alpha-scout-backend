@@ -20,7 +20,7 @@ from .registry import (
 from .library import (
     valuation, yield_, growth, quality, balance_quality,
     momentum, returns, drawdowns, volume,
-    calendar_, analyst,
+    calendar_, analyst, risk, profitability, investment, surprise,
 )  # noqa: F401
 
 __all__ = [

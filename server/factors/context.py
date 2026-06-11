@@ -26,12 +26,12 @@ from functools import cached_property
 I_DATE, I_REV, I_NI, I_EBITDA, I_EPS_D, I_SHARES = 0, 1, 2, 3, 4, 5
 I_GROSS_PROFIT, I_OP_INCOME = 6, 7
 I_AVAIL = 8
-# Balance: (period_end, total_equity, net_debt, total_debt, available_from)
-B_EQUITY, B_NET_DEBT, B_TOTAL_DEBT = 1, 2, 3
-B_AVAIL = 4
-# Cashflow: (period_end, free_cash_flow, dividends_paid, available_from)
-C_FCF, C_DIV = 1, 2
-C_AVAIL = 3
+# Balance: (period_end, total_equity, net_debt, total_debt, total_assets, available_from)
+B_EQUITY, B_NET_DEBT, B_TOTAL_DEBT, B_TOTAL_ASSETS = 1, 2, 3, 4
+B_AVAIL = 5
+# Cashflow: (period_end, free_cash_flow, dividends_paid, operating_cf, available_from)
+C_FCF, C_DIV, C_OPERATING_CF = 1, 2, 3
+C_AVAIL = 4
 
 
 def _ttm(quarters: list[tuple], col_idx: int) -> float | None:
@@ -84,7 +84,9 @@ class ComputeContext:
     income_slice: list[tuple]      # ascending, all rows with date <= self.date
     balance_asof: tuple | None     # last balance row with date <= self.date
     cashflow_slice: list[tuple]    # ascending, all rows with date <= self.date
+    balance_slice: list[tuple] = field(default_factory=list)  # ascending balance rows with date <= self.date (for YoY)
     earnings_dates: list[str] = field(default_factory=list)   # ascending, all symbol earnings (past + scheduled)
+    earnings_history: list[tuple] = field(default_factory=list)  # ascending (date, eps_actual, eps_estimated); date IS the announce date
     grades_slice: list[tuple] = field(default_factory=list)   # ascending (date, action), all rows with date <= self.date
     prices_history: list[tuple] = field(default_factory=list)  # ascending (date, close); the symbol's full price history. Used by return-based features that need T-N day lookback.
 
@@ -129,6 +131,18 @@ class ComputeContext:
         return self.balance_asof[B_EQUITY] if self.balance_asof else None
 
     @cached_property
+    def total_assets(self) -> float | None:
+        return self.balance_asof[B_TOTAL_ASSETS] if self.balance_asof else None
+
+    @cached_property
+    def prior_year_balance(self) -> tuple | None:
+        """Balance row 4 quarters before the latest as-of row, or None."""
+        if not self.balance_slice:
+            return None
+        idx = len(self.balance_slice) - 1 - 4
+        return self.balance_slice[idx] if idx >= 0 else None
+
+    @cached_property
     def net_debt(self) -> float | None:
         return self.balance_asof[B_NET_DEBT] if self.balance_asof else None
 
@@ -141,6 +155,10 @@ class ComputeContext:
     @cached_property
     def ttm_fcf(self) -> float | None:
         return _ttm(self.cashflow_slice, C_FCF) if self.cashflow_slice else None
+
+    @cached_property
+    def ttm_operating_cf(self) -> float | None:
+        return _ttm(self.cashflow_slice, C_OPERATING_CF) if self.cashflow_slice else None
 
     @cached_property
     def ttm_dividends(self) -> float | None:
@@ -191,6 +209,17 @@ class ComputeContext:
         d1 = datetime.strptime(self.next_earnings_date, "%Y-%m-%d")
         return (d1 - d0).days
 
+    def surprises_asof(self, max_n: int = 8) -> list[float]:
+        """Last up-to-max_n EPS surprises (eps_actual − eps_estimated) announced on or
+        before self.date, ascending. Skips rows missing either value. The earnings
+        date IS the announcement date, so date <= self.date is point-in-time."""
+        out: list[float] = []
+        for row in self.earnings_history:
+            d, act, est = row[0], row[1], row[2]
+            if d <= self.date and act is not None and est is not None:
+                out.append(act - est)
+        return out[-max_n:]
+
     @cached_property
     def days_since_last_earnings(self) -> int | None:
         """Calendar days from last earnings to self.date. None if no past earnings."""
@@ -233,6 +262,28 @@ class ComputeContext:
             return None
         return (cur / prev - 1.0) * 100.0
 
+    def trailing_daily_returns(self, window: int) -> list[float] | None:
+        """The last `window` simple daily returns ending at self.date.
+
+        r_t = close_t / close_{t-1} − 1. The most recent return is the one
+        realized at self.date's close — point-in-time (known by today's close,
+        never forward-looking). Returns None when self.date isn't a price date
+        or there's insufficient history (needs window+1 prior closes).
+        """
+        if not self.prices_history:
+            return None
+        idx = self._current_price_idx()
+        if idx is None or idx - window < 0:
+            return None
+        rets: list[float] = []
+        for j in range(idx - window + 1, idx + 1):
+            prev = self.prices_history[j - 1][1]
+            cur = self.prices_history[j][1]
+            if not prev or prev <= 0 or cur is None:
+                return None
+            rets.append(cur / prev - 1.0)
+        return rets
+
     # ---- Analyst-grade window helpers --------------------------------------
     def grades_in_window(self, days: int) -> list[tuple]:
         """Grade rows with date in [self.date - days + 1, self.date]."""
@@ -255,6 +306,7 @@ def build_context(
     earnings_dates: list[str] | None = None,
     grades: list[tuple] | None = None,
     prices: list[tuple] | None = None,
+    earnings_history: list[tuple] | None = None,
 ) -> ComputeContext | None:
     """Slice raw symbol bundles to the as-of view for `date` and wrap them.
 
@@ -282,8 +334,12 @@ def build_context(
         close=close,
         income_slice=income_slice,
         balance_asof=_as_of(balance, date, key_idx=B_AVAIL),
+        balance_slice=_as_of_slice(balance, date, key_idx=B_AVAIL),
         cashflow_slice=_as_of_slice(cashflow, date, key_idx=C_AVAIL),
         earnings_dates=list(earnings_dates) if earnings_dates else [],
+        # Earnings actual/estimate history (date, eps_actual, eps_estimated), ascending.
+        # date IS the announce date, so surprises_asof filters date<=self.date (PIT).
+        earnings_history=list(earnings_history) if earnings_history else [],
         # Grades and earnings are real-world events — date IS the announce date,
         # so legacy index-0 bisect remains correct for them.
         grades_slice=_as_of_slice(grades, date) if grades else [],

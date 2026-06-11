@@ -395,6 +395,12 @@ def build_history_context(run_id: str, target_metric: str, limit: int = 20,
             "ledger, realized P&L, NAV, and factor attribution after each "
             "experiment. Third-party, data-grounded. The analyst sees what "
             "actually happened in the books, not what your thesis predicted.\n"
+            "  - Some analyst observations carry a **Validation** tag from an "
+            "independent point-in-time out-of-sample test. Weight them by it: a "
+            "claim that **held out-of-sample** is evidence you can act on; a "
+            "claim validated **only in specific regimes** applies only when that "
+            "regime currently holds; an **UNVALIDATED candidate** is an untested "
+            "hypothesis — do not size into it as if it were proven.\n"
         )
     else:
         lines.append(
@@ -642,6 +648,24 @@ def check_conditions(metrics: dict, conditions: list[dict]) -> tuple[bool, list[
     return all_met, detail
 
 
+def conditions_namespace(metrics: dict, eval_aggregated: dict | None) -> dict:
+    """Lookup namespace for conditions: overall metrics + per-window eval aggregates.
+
+    Bare names (e.g. `alpha_ann_pct`) resolve to the overall training-period
+    value. `<metric>.<aggregator>` (e.g. `alpha_ann_pct.min`, `sharpe_ratio.p10`)
+    resolves to that aggregate across the walk-forward eval windows — so a
+    condition like `alpha_ann_pct.min > 3` means "alpha > 3% in EVERY window"
+    (the worst window clears 3%). Aggregators come from _aggregate_window_metrics:
+    mean, median, min, max, p10, p25, stdev, iqr, range, snr.
+    """
+    ns = dict(metrics)
+    for m, aggs in (eval_aggregated or {}).items():
+        for agg, v in aggs.items():
+            if v is not None:
+                ns[f"{m}.{agg}"] = v
+    return ns
+
+
 def normalize_config(portfolio_config: dict) -> dict:
     """Fix common config issues from LLM output before passing to engine."""
     config = dict(portfolio_config)
@@ -687,7 +711,8 @@ def save_portfolio(portfolio_config: dict) -> str | None:
 
 
 def _run_one_backtest(portfolio_config: dict, start: str, end: str, capital: float,
-                      sector: str | None = None) -> dict | None:
+                      sector: str | None = None,
+                      benchmark_sectors: list[str] | None = None) -> dict | None:
     """Run a single backtest over one [start, end] window.
 
     Returns: {"metrics": {...}, "sleeve_trades": [{"label", "trades"}, ...]}
@@ -739,9 +764,12 @@ def _run_one_backtest(portfolio_config: dict, start: str, end: str, capital: flo
                 metrics["market_benchmark_return_pct"] = market_bench["metrics"]["total_return_pct"]
                 metrics["market_benchmark_ann_return_pct"] = market_bench["metrics"]["annualized_return_pct"]
 
-            # Sector benchmark — compute if sector is set
-            if sector and sector in SECTOR_ETF_MAP:
-                sector_bench = compute_benchmark(trading_dates, capital, sector=sector)
+            # Sector benchmark — single sector ETF, or a cap-weighted blend of
+            # the chosen benchmark sectors (when more than one is selected).
+            bench_sectors = benchmark_sectors or ([sector] if sector else [])
+            bench_sectors = [s for s in bench_sectors if s in SECTOR_ETF_MAP]
+            if bench_sectors:
+                sector_bench = compute_benchmark(trading_dates, capital, sectors=bench_sectors)
                 if sector_bench:
                     sector_ann = sector_bench["metrics"]["annualized_return_pct"]
                     metrics["alpha_vs_sector_pct"] = round(ann_return - sector_ann, 2)
@@ -950,6 +978,7 @@ def run_backtest(
         portfolio_config,
         config.training_start, config.training_end,
         config.initial_capital, config.sector,
+        benchmark_sectors=config.benchmark_sectors,
     )
     if training is None:
         return None
@@ -977,6 +1006,7 @@ def run_backtest(
         res = _run_one_backtest(
             portfolio_config, w_start, w_end,
             config.initial_capital, config.sector,
+            benchmark_sectors=config.benchmark_sectors,
         )
         if res is None:
             print(f"  [warn] eval window {w_label} failed; skipping")
@@ -1067,6 +1097,8 @@ async def run_agent_iteration(
     alpha_benchmark: str = "market",
     eval_block: dict | None = None,
     target_aggregator: str = "overall",
+    sectors: list[str] | None = None,
+    benchmark_sectors: list[str] | None = None,
 ) -> dict:
     """Run a single agent iteration. Returns experiment result.
 
@@ -1100,6 +1132,14 @@ async def run_agent_iteration(
 
     t0 = time.time()
 
+    # Universe sectors (trade-from) vs benchmark sectors (alpha-vs) are
+    # independent. `sector` (single) is the back-compat alias for a one-element
+    # `sectors` list. When benchmarking against sectors, default the benchmark
+    # to the universe sectors unless an explicit benchmark set is given.
+    sectors = sectors or ([sector] if sector else None)
+    sector = sectors[0] if sectors else None  # primary — single-sector callsites
+    benchmark_sectors = (benchmark_sectors or sectors) if alpha_benchmark == "sector" else None
+
     # Build the prompt
     program = load_program()
     history = build_history_context(run_id, target_metric, aggregator=target_aggregator,
@@ -1109,8 +1149,19 @@ async def run_agent_iteration(
         f"{c['metric']} {c['operator']} {c['value']}" for c in conditions
     )
 
-    sector_desc = f"\n**Sector:** {sector} — All data queries are restricted to {sector} stocks only. Alpha is measured against the {sector} sector ETF." if sector else ""
-    benchmark_desc = f"sector ETF" if alpha_benchmark == "sector" else "S&P 500 (SPY)"
+    if sectors:
+        uni = ", ".join(sectors)
+        bench_txt = (" + ".join(benchmark_sectors) + " ETF blend") if benchmark_sectors and len(benchmark_sectors) > 1 else \
+                    (f"{benchmark_sectors[0]} sector ETF" if benchmark_sectors else "S&P 500")
+        sector_desc = (f"\n**Sectors:** {uni} — All data queries are restricted to stocks in "
+                       f"these sectors (their union). Alpha is measured against {bench_txt}.")
+    else:
+        sector_desc = ""
+    if alpha_benchmark == "sector":
+        benchmark_desc = ("cap-weighted ETF blend of " + ", ".join(benchmark_sectors)) \
+            if benchmark_sectors and len(benchmark_sectors) > 1 else "sector ETF"
+    else:
+        benchmark_desc = "S&P 500 (SPY)"
 
     # Frame the objective so the agent knows whether it's climbing the
     # training-period scalar or the eval-window aggregator. When eval is set
@@ -1180,7 +1231,7 @@ You are researching as of {backtest_end}. You do not know what happens after thi
     tool_calls = 0
     session_id = None
     auto_trader_tools = create_auto_trader_tools(
-        stop_date=backtest_end, sector=sector, start_date=backtest_start,
+        stop_date=backtest_end, sectors=sectors, start_date=backtest_start,
         run_id=run_id,
         # Enforce the agent's allowlist at the MCP server boundary so forbidden
         # tools don't appear in the model's tool catalog at all.
@@ -1195,7 +1246,11 @@ You are researching as of {backtest_end}. You do not know what happens after thi
         cwd=str(PROJECT_ROOT / "auto_trader"),
         model=resolved_model,
         setting_sources=["project"],
-        allowed_tools=["Skill", "Read"] + _resolve_allowed_mcp_tools(),
+        allowed_tools=["Skill", "Read", "Bash"] + _resolve_allowed_mcp_tools(),
+        # The agent may run Bash (scratch scripts, inspect the factor library,
+        # query data) but must not modify code — so the file-editing tools are
+        # removed entirely.
+        disallowed_tools=["Edit", "Write", "NotebookEdit"],
         mcp_servers={"auto_trader": auto_trader_tools},
         permission_mode="acceptEdits",
         max_turns=50,
@@ -1334,6 +1389,7 @@ You are researching as of {backtest_end}. You do not know what happens after thi
     bt_cfg_kwargs = dict(
         training_start=backtest_start, training_end=backtest_end,
         initial_capital=initial_capital, sector=sector,
+        benchmark_sectors=benchmark_sectors,
         benchmark="sector" if alpha_benchmark == "sector" else "market",
     )
     if eval_block:
@@ -1386,7 +1442,10 @@ You are researching as of {backtest_end}. You do not know what happens after thi
     # Score — resolve the single scalar the agent climbs.
     eval_aggregated = (eval_data or {}).get("aggregated", {})
     target_value = _resolve_target_value(metrics, eval_aggregated, target_metric, target_aggregator)
-    conditions_met, conditions_detail = check_conditions(metrics, conditions)
+    # Conditions may reference per-window eval aggregates via `<metric>.<aggregator>`
+    # (e.g. alpha_ann_pct.min > 3 → alpha > 3% in every walk-forward window).
+    conditions_met, conditions_detail = check_conditions(
+        conditions_namespace(metrics, eval_aggregated), conditions)
 
     improved = (
         target_value is not None
@@ -1535,7 +1594,9 @@ async def main():
                         help="JSON array of MCP tool names this agent may call. "
                              "Omit (or pass empty) for 'all current tools'. '[]' disables all MCP tools.")
     parser.add_argument("--starting-portfolio", type=str, default=None, help="Path to starting portfolio config JSON")
-    parser.add_argument("--sector", type=str, default=None, help="Restrict data queries to this sector")
+    parser.add_argument("--sector", type=str, default=None, help="Restrict data queries to this sector (single; back-compat)")
+    parser.add_argument("--sectors", type=str, default=None, help="Comma-separated sectors for the trade universe (union), e.g. 'Technology,Communication Services'")
+    parser.add_argument("--benchmark-sectors", type=str, default=None, help="Comma-separated sectors whose ETFs form the sector benchmark (cap-weighted blend if many). Defaults to --sectors.")
     parser.add_argument("--alpha-benchmark", type=str, default="market", help="Benchmark: sector or market")
     parser.add_argument("--eval-file", type=str, default=None,
                         help="Path to JSON file with walk-forward eval block: "
@@ -1549,6 +1610,14 @@ async def main():
     parser.add_argument("--no-analyst-notes", action="store_true",
                         help="Don't surface analyst notes in the agent's history context. "
                              "Memos are still generated; the agent just doesn't see them.")
+    parser.add_argument("--validate-lessons", action="store_true",
+                        help="After the run, validate this run's candidate factor-interaction "
+                             "lessons on a held-out window (per regime) and persist the verdict. "
+                             "OFF by default. Requires --holdout-start/--holdout-end.")
+    parser.add_argument("--holdout-start", type=str, default=None,
+                        help="Lesson-validation holdout start — MUST be disjoint from --start/--end.")
+    parser.add_argument("--holdout-end", type=str, default=None,
+                        help="Lesson-validation holdout end.")
     args = parser.parse_args()
 
     # Load eval block from sidecar file.
@@ -1730,6 +1799,8 @@ async def main():
             initial_capital=args.capital,
             model=args.model,
             sector=args.sector,
+            sectors=[s.strip() for s in args.sectors.split(",")] if args.sectors else None,
+            benchmark_sectors=[s.strip() for s in args.benchmark_sectors.split(",")] if args.benchmark_sectors else None,
             alpha_benchmark=args.alpha_benchmark,
             eval_block=eval_block,
             target_aggregator=args.target_aggregator,
@@ -1756,6 +1827,49 @@ async def main():
     print(f"Discards:     {summary['discards']}")
     print(f"Errors:       {summary['errors']}")
     print(f"Best {args.metric}: {summary['best_value']}")
+
+    # --- Lesson validation (opt-in; auxiliary — must NEVER crash the run) ---
+    if args.validate_lessons:
+        # Prefer the per-window × per-regime PANEL over the walk-forward eval
+        # blocks (discovery on training, tested across the eval windows,
+        # IS/OOS-tagged). Fall back to the single clean holdout when no eval
+        # block is configured.
+        _windows = None
+        if eval_block:
+            try:
+                from server.models.backtest import EvalBlock, WindowSpec
+                _eb = EvalBlock(start=eval_block["start"], end=eval_block["end"],
+                                spec=WindowSpec(**eval_block.get("spec", {})))
+                _windows = _generate_eval_windows(_eb)
+            except Exception as e:
+                print(f"  ⚠ could not build eval windows for lesson panel: {e}")
+        if not _windows and not (args.holdout_start and args.holdout_end):
+            print("  ⚠ --validate-lessons set but no eval block and no "
+                  "--holdout-start/--holdout-end given; skipping "
+                  "(refusing to validate on training data).")
+        else:
+            try:
+                import sqlite3 as _sqlite
+                from auto_trader.lesson_pipeline import (
+                    validate_candidate_lessons, validate_candidate_regimes,
+                )
+                from auto_trader.schema import get_db as _get_db
+                _mkt = _sqlite.connect(os.environ.get(
+                    "MARKET_DB_PATH",
+                    str(Path(__file__).parent.parent / "data" / "market_dev.db")))
+                # First gate any regimes this run's analyst proposed, so the
+                # panel can slice by them (seed + accepted).
+                _rsum = validate_candidate_regimes(
+                    _get_db(), _mkt, args.start, args.end, run_id=run_id)
+                _summary = validate_candidate_lessons(
+                    _get_db(), _mkt, args.holdout_start, args.holdout_end, run_id=run_id,
+                    eval_windows=_windows,
+                    train_span=(args.start, args.end) if _windows else None)
+                _mode = f"panel/{len(_windows)} windows" if _windows else \
+                    f"holdout {args.holdout_start}..{args.holdout_end}"
+                print(f"  🔎 lesson validation ({_mode}): regimes={_rsum} lessons={_summary}")
+            except Exception as e:
+                print(f"  ⚠ lesson validation failed (non-fatal): {e}")
 
     # Mark run as completed (reached max_experiments)
     _update_run_status(run_id, "completed")

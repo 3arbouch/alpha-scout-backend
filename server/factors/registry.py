@@ -14,7 +14,8 @@ from typing import Callable, Literal
 
 Materialization = Literal["precomputed", "on_the_fly"]
 Category = Literal["value", "yield", "growth", "quality", "momentum",
-                    "volatility", "volume", "calendar", "sentiment", "macro"]
+                    "volatility", "volume", "calendar", "sentiment", "macro",
+                    "risk", "investment"]
 
 
 @dataclass(frozen=True)
