@@ -1409,6 +1409,20 @@ You are researching as of {backtest_end}. You do not know what happens after thi
         thesis = str(thesis_obj)
         assumptions = thesis_data.get("assumptions", [])
     portfolio_config = thesis_data.get("portfolio", {})
+    # The agent occasionally emits the portfolio as a JSON string (or prose)
+    # instead of an object. Coerce a JSON string back to a dict; anything that
+    # still isn't a dict is unusable — raise so the per-experiment guard in the
+    # main loop skips this iteration instead of crashing the whole run.
+    if isinstance(portfolio_config, str):
+        try:
+            portfolio_config = json.loads(portfolio_config)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    if not isinstance(portfolio_config, dict):
+        raise ValueError(
+            "agent returned a non-dict portfolio config "
+            f"(type={type(thesis_data.get('portfolio')).__name__})"
+        )
     # Agent's reflection on prior experiments. Stored for UI display only —
     # deliberately NOT surfaced in build_history_context to keep next
     # iterations unbiased by prior self-interpretation.
@@ -1835,23 +1849,33 @@ async def main():
         # Update progress in DB
         _update_run_status(run_id, "running", current_iteration=i)
 
-        result = await run_agent_iteration(
-            run_id=run_id,
-            iteration=i,
-            target_metric=args.metric,
-            conditions=conditions,
-            best_value=best_value,
-            backtest_start=args.start,
-            backtest_end=args.end,
-            initial_capital=args.capital,
-            model=args.model,
-            sector=args.sector,
-            sectors=[s.strip() for s in args.sectors.split(",")] if args.sectors else None,
-            benchmark_sectors=[s.strip() for s in args.benchmark_sectors.split(",")] if args.benchmark_sectors else None,
-            alpha_benchmark=args.alpha_benchmark,
-            eval_block=eval_block,
-            target_aggregator=args.target_aggregator,
-        )
+        # A single experiment must never kill the whole run. The agent can emit
+        # malformed output (e.g. a non-dict portfolio config) or a tool/backtest
+        # can fail; log it, record the error, and continue to the next iteration.
+        try:
+            result = await run_agent_iteration(
+                run_id=run_id,
+                iteration=i,
+                target_metric=args.metric,
+                conditions=conditions,
+                best_value=best_value,
+                backtest_start=args.start,
+                backtest_end=args.end,
+                initial_capital=args.capital,
+                model=args.model,
+                sector=args.sector,
+                sectors=[s.strip() for s in args.sectors.split(",")] if args.sectors else None,
+                benchmark_sectors=[s.strip() for s in args.benchmark_sectors.split(",")] if args.benchmark_sectors else None,
+                alpha_benchmark=args.alpha_benchmark,
+                eval_block=eval_block,
+                target_aggregator=args.target_aggregator,
+            )
+        except Exception as e:
+            import traceback
+            print(f"\n  ⚠ Experiment {i} failed ({e}); skipping to next.")
+            traceback.print_exc()
+            emit_event(run_id, "experiment_failed", {"experiment_number": i, "error": str(e)})
+            continue
 
         if result["decision"] == "keep" and result.get("target_value") is not None:
             best_value = result["target_value"]
