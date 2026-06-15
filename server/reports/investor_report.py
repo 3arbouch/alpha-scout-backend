@@ -156,6 +156,53 @@ def _drawdown_chart(data: dict) -> str | None:
     return _fig_to_data_uri(fig)
 
 
+def _monthly_returns(points: list[dict], nav_key: str = "nav") -> dict:
+    """Per-calendar-month % return from a date-ascending daily NAV series."""
+    pts = [(p["date"], p[nav_key]) for p in points if p.get(nav_key) is not None]
+    if len(pts) < 2:
+        return {}
+    month_end: dict[str, float] = {}
+    for d, v in pts:
+        month_end[d[:7]] = v  # last value within each YYYY-MM (pts ascending)
+    out, prev = {}, pts[0][1]
+    for ym, v in month_end.items():
+        out[ym] = (v / prev - 1.0) * 100.0 if prev else 0.0
+        prev = v
+    return out
+
+
+def _month_label(ym: str) -> str:
+    return datetime.strptime(ym, "%Y-%m").strftime("%b %y")
+
+
+def _monthly_bar_chart(data: dict) -> str | None:
+    port = _monthly_returns(data["nav_history"])
+    if not port:
+        return None
+    mkt = _monthly_returns(data["benchmark_nav"])
+    sec = _monthly_returns(data["sector_nav"])
+    months = list(port.keys())
+    xs = list(range(len(months)))
+    w = 0.26
+    fig, ax = plt.subplots(figsize=(8.2, 2.6))
+    ax.bar([i - w for i in xs], [port.get(m, 0) for m in months], w,
+           color=PORTFOLIO_COLOR, label="Portfolio")
+    ax.bar(xs, [mkt.get(m, 0) for m in months], w,
+           color=MARKET_COLOR, label=f"S&P 500 ({data.get('market_symbol') or 'SPY'})")
+    ax.bar([i + w for i in xs], [sec.get(m, 0) for m in months], w,
+           color=SECTOR_COLOR, label=f"Sector ({data.get('sector_symbol') or 'benchmark'})")
+    ax.axhline(0, color="#cccccc", linewidth=0.8)
+    ax.set_ylabel("Monthly return (%)", fontsize=9)
+    ax.set_xticks(xs)
+    ax.set_xticklabels([_month_label(m) for m in months], fontsize=8)
+    ax.grid(True, axis="y", color="#eeeeee", linewidth=0.8)
+    ax.legend(loc="upper left", fontsize=8, frameon=False, ncol=3)
+    ax.tick_params(labelsize=8)
+    for s in ("top", "right"):
+        ax.spines[s].set_visible(False)
+    return _fig_to_data_uri(fig)
+
+
 # --------------------------------------------------------------------------- #
 # Rendering
 # --------------------------------------------------------------------------- #
@@ -208,6 +255,7 @@ def build_report_pdf(deploy_id: str) -> bytes | None:
 
     data["perf_chart"] = _performance_chart(data)
     data["dd_chart"] = _drawdown_chart(data)
+    data["monthly_chart"] = _monthly_bar_chart(data)
 
     env = _build_env()
     html = env.from_string(_TEMPLATE).render(**data)
@@ -320,7 +368,6 @@ _TEMPLATE = r"""
       <tr><td class="k">Cash</td><td class="v">{{ book.cash|money }}</td></tr>
       <tr><td class="k">Securities Value</td><td class="v">{{ book.positions_value|money }}</td></tr>
       <tr><td class="k">Initial Capital</td><td class="v">{{ initial_capital|money }}</td></tr>
-      <tr><td class="k">Avg Invested Capital</td><td class="v">{{ metrics.get('avg_utilized_capital')|money }}</td></tr>
     </table>
   </div>
   <div class="panel">
@@ -334,8 +381,6 @@ _TEMPLATE = r"""
           <td class="v {{ book.total_pnl|sign_class }}">{{ book.total_pnl|arrow }} {{ book.total_pnl|money }}</td></tr>
       <tr><td class="k">Return</td>
           <td class="v {{ ret|sign_class }}">{{ ret|arrow }} {{ ret|pct(2) }}</td></tr>
-      <tr><td class="k">Return on Invested Capital</td>
-          <td class="v {{ metrics.get('return_on_utilized_capital_pct')|sign_class }}">{{ metrics.get('return_on_utilized_capital_pct')|arrow }} {{ metrics.get('return_on_utilized_capital_pct')|pct(2) }}</td></tr>
     </table>
   </div>
 </div>
@@ -344,6 +389,7 @@ _TEMPLATE = r"""
 {% if perf_chart %}<div class="chart avoid-break"><img src="{{ perf_chart }}"></div>
 {% else %}<div class="note">No NAV history available yet.</div>{% endif %}
 {% if dd_chart %}<div class="chart avoid-break"><img src="{{ dd_chart }}"></div>{% endif %}
+{% if monthly_chart %}<div class="chart avoid-break"><img src="{{ monthly_chart }}"></div>{% endif %}
 
 <table class="avoid-break">
   <tr><th class="l">Metric</th><th>Value</th><th class="l">Metric</th><th>Value</th></tr>
