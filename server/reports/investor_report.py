@@ -184,6 +184,14 @@ def _monthly_bar_chart(data: dict) -> str | None:
     mkt = _monthly_returns(data["benchmark_nav"])
     sec = _monthly_returns(data["sector_nav"])
     months = list(port.keys())
+    # Drop the current, still-in-progress calendar month: its bar would only be a
+    # partial month-to-date figure (portfolio and benchmark), not a real monthly
+    # return — misleading next to completed months.
+    current_ym = datetime.now(timezone.utc).strftime("%Y-%m")
+    if months and months[-1] == current_ym:
+        months = months[:-1]
+    if not months:
+        return None
     xs = list(range(len(months)))
 
     series = [
