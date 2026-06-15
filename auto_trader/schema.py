@@ -21,6 +21,8 @@ def get_db():
     sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
     from schema import init_db
     conn = sqlite3.connect(str(APP_DB_PATH))
+    conn.execute("PRAGMA journal_mode=WAL")   # readers don't block on writers
+    conn.execute("PRAGMA busy_timeout=5000")  # wait out write contention instead of erroring
     conn.row_factory = sqlite3.Row
     init_db(conn)
     return conn

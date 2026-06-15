@@ -2,6 +2,8 @@ fastapi>=0.104.0
 uvicorn[standard]>=0.24.0
 pydantic>=2.0.0
 matplotlib>=3.7.0
+weasyprint>=60
+jinja2>=3.1
 anthropic>=0.18.0
 # >=0.2.88 ships Claude CLI 2.1.161, which supports Opus 4.8's adaptive thinking.
 # Earlier bundles (e.g. 0.1.61's CLI 2.1.112) predate Opus 4.8 and still emit the
