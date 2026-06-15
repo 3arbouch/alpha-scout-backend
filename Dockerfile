@@ -2,9 +2,12 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# System deps for matplotlib
+# System deps: curl/cron + WeasyPrint runtime libs (Pango/Cairo/GDK-Pixbuf)
+# for PDF report rendering, plus a base font.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl cron \
+    libpango-1.0-0 libpangocairo-1.0-0 libgdk-pixbuf-2.0-0 libffi-dev \
+    libjpeg62-turbo shared-mime-info fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 # Python deps

@@ -2164,97 +2164,7 @@ async def backfill_deployment_scores(
     return summary
 
 
-def _build_position_book(sleeves: list[dict], initial_capital: float) -> dict:
-    """Merge open positions + closed trades across sleeves into per-ticker book.
-
-    Returns a dict with ``positions``, ``positions_value``, ``cash``,
-    ``portfolio_value``, and P&L totals.  The accounting identity
-    ``cash + positions_value == portfolio_value`` always holds, and
-    ``total_realized + total_unrealized == portfolio_value - initial_capital``.
-    """
-    book: dict[str, dict] = {}
-    total_open_cost = 0  # capital currently tied up in open positions
-
-    def _ensure(sym: str) -> dict:
-        if sym not in book:
-            book[sym] = {
-                "symbol": sym,
-                "shares_held": 0, "current_price": 0,
-                "market_value": 0, "cost_basis_open": 0,
-                "unrealized_pnl": 0, "realized_pnl": 0,
-                "realized_cost": 0,
-                "num_round_trips": 0, "sleeves": [],
-            }
-        return book[sym]
-
-    for sleeve in sleeves or []:
-        label = sleeve.get("label", "")
-
-        for pos in sleeve.get("open_positions") or []:
-            b = _ensure(pos["symbol"])
-            shares = pos.get("shares", 0)
-            entry = pos.get("entry_price", 0)
-            cost = pos.get("cost_basis", shares * entry)
-            mv = pos.get("market_value", shares * pos.get("current_price", 0))
-            b["shares_held"] += shares
-            b["cost_basis_open"] += cost
-            b["market_value"] += mv
-            b["current_price"] = pos.get("current_price", b["current_price"])
-            b["unrealized_pnl"] += mv - cost
-            if label and label not in b["sleeves"]:
-                b["sleeves"].append(label)
-
-        for ct in sleeve.get("closed_trades") or []:
-            b = _ensure(ct["symbol"])
-            b["realized_pnl"] += ct.get("pnl", 0)
-            b["realized_cost"] += ct.get("shares", 0) * ct.get("entry_price", 0)
-            b["num_round_trips"] += 1
-            if label and label not in b["sleeves"]:
-                b["sleeves"].append(label)
-
-    total_realized = 0
-    total_unrealized = 0
-    positions_value = 0
-    positions = []
-
-    for b in book.values():
-        b["status"] = "open" if b["shares_held"] > 0 else "closed"
-        b["avg_entry"] = (b["cost_basis_open"] / b["shares_held"]) if b["shares_held"] else 0
-        b["total_pnl"] = b["realized_pnl"] + b["unrealized_pnl"]
-        total_cost = b["cost_basis_open"] + b["realized_cost"]
-        b["total_pnl_pct"] = (b["total_pnl"] / total_cost * 100) if total_cost else 0
-
-        total_realized += b["realized_pnl"]
-        total_unrealized += b["unrealized_pnl"]
-        positions_value += b["market_value"]
-        total_open_cost += b["cost_basis_open"]
-
-        del b["cost_basis_open"]
-        del b["realized_cost"]
-        positions.append(b)
-
-    # cash = initial_capital - cost_of_open_positions + realized_pnl
-    cash = initial_capital - total_open_cost + total_realized
-    portfolio_value = cash + positions_value
-    total_pnl = total_realized + total_unrealized
-
-    # weight_pct relative to portfolio_value
-    for p in positions:
-        p["weight_pct"] = (p["market_value"] / portfolio_value * 100) if portfolio_value and p["market_value"] else 0
-
-    positions.sort(key=lambda p: p["total_pnl"], reverse=True)
-
-    return {
-        "positions": positions,
-        "cash": cash,
-        "positions_value": positions_value,
-        "portfolio_value": portfolio_value,
-        "total_pnl": total_pnl,
-        "total_realized_pnl": total_realized,
-        "total_unrealized_pnl": total_unrealized,
-        "open_count": sum(1 for p in positions if p["status"] == "open"),
-        "closed_count": sum(1 for p in positions if p["status"] == "closed"),
-    }
+from deploy_engine import build_position_book as _build_position_book
 
 
 @app.get("/deployments/{deploy_id}/positions", tags=["Deployments (Unified)"])
@@ -2280,6 +2190,25 @@ async def get_deployment_positions(deploy_id: str, _: str = Depends(verify_api_k
         "initial_capital": initial_capital,
         **result,
     })
+
+
+@app.get("/deployments/{deploy_id}/report.pdf", tags=["Deployments (Unified)"])
+async def get_deployment_report_pdf(deploy_id: str, _: str = Depends(verify_api_key)):
+    """Investor PDF report: account + P&L, performance vs benchmarks, positions, trades."""
+    from fastapi.responses import Response
+    from reports.investor_report import build_report_pdf
+    pdf = await _run_sync(build_report_pdf, deploy_id)
+    if pdf is None:
+        raise HTTPException(404, f"Deployment '{deploy_id}' not found")
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'inline; filename="{deploy_id}_report.pdf"',
+            # Regenerated per request from live numbers — never serve a stale copy.
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @app.post("/deployments/{deploy_id}/stop", tags=["Deployments (Unified)"])
