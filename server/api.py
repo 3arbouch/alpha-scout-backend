@@ -4773,6 +4773,68 @@ async def investor_statement_api(fund_id: str, investor_id: str, _: str = Depend
         raise HTTPException(404, str(e))
 
 
+@app.get("/funds/{fund_id}/book", tags=["Funds"])
+async def fund_book_api(fund_id: str, _: str = Depends(verify_api_key)):
+    """The fund's REAL book (commingled): holdings from fills + cash from flows, marked to market."""
+    from funds import fund_actual_book
+    try:
+        return _sanitize_floats(await _run_sync(fund_actual_book, fund_id))
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.post("/funds/{fund_id}/orders/generate", tags=["Funds"])
+async def generate_orders_api(
+    fund_id: str,
+    whole: bool = Query(False, description="Whole (true) or fractional (false) shares."),
+    source: str = Query("daily", description="subscription|redemption|rebalance|daily (label only)."),
+    _: str = Depends(verify_api_key),
+):
+    """Generate the pending order batch to bring the real book to target weights × AUM."""
+    from funds import generate_orders
+    try:
+        return _sanitize_floats(await _run_sync(generate_orders, fund_id, whole, source))
+    except ValueError as e:
+        raise HTTPException(404 if "not found" in str(e).lower() else 400, str(e))
+
+
+@app.get("/funds/{fund_id}/orders", tags=["Funds"])
+async def list_orders_api(
+    fund_id: str,
+    status: Optional[str] = Query(None, description="pending|executed|cancelled"),
+    batch_id: Optional[str] = Query(None),
+    _: str = Depends(verify_api_key),
+):
+    """The execution blotter — pending orders are your IB to-do list."""
+    from funds import list_orders
+    orders = await _run_sync(list_orders, fund_id, status, batch_id)
+    return _sanitize_floats({"fund_id": fund_id, "total": len(orders), "data": orders})
+
+
+class FillBody(_BM):
+    fill_price: float | None = Field(default=None, gt=0)
+    fill_shares: float | None = Field(default=None, gt=0)
+
+
+@app.post("/funds/{fund_id}/orders/{order_id}/fill", tags=["Funds"])
+async def fill_order_api(fund_id: str, order_id: str, body: FillBody, _: str = Depends(verify_api_key)):
+    """Record an IB fill (defaults to the estimated price/shares if omitted)."""
+    from funds import record_fill
+    try:
+        return _sanitize_floats(await _run_sync(record_fill, order_id, body.fill_price, body.fill_shares))
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except PermissionError as e:
+        raise HTTPException(409, str(e))
+
+
+@app.post("/funds/{fund_id}/orders/batch/{batch_id}/fill", tags=["Funds"])
+async def fill_batch_api(fund_id: str, batch_id: str, _: str = Depends(verify_api_key)):
+    """Mark all pending orders in a batch executed at their estimated prices."""
+    from funds import fill_batch
+    return await _run_sync(fill_batch, batch_id)
+
+
 @app.get("/funds/{fund_id}/subscription-orders", tags=["Funds"])
 async def subscription_orders_api(
     fund_id: str,

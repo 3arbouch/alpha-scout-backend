@@ -499,6 +499,209 @@ def subscription_orders(fund_id: str, amount: float, whole: bool = False) -> dic
 
 
 # --------------------------------------------------------------------------- #
+# Commingled execution ledger (fund_orders)
+# --------------------------------------------------------------------------- #
+def _targets_and_prices(deployment_id: str):
+    """(target weights, prices, deployment) from the deployment's current holdings."""
+    from deploy_engine import get_deployment, build_position_book
+    d = get_deployment(deployment_id)
+    if not d:
+        raise ValueError(f"Deployment '{deployment_id}' not found")
+    book = build_position_book(d.get("sleeves") or [], d.get("initial_capital") or 0)
+    pv = book.get("portfolio_value") or 0
+    weights, prices = {}, {}
+    for p in book["positions"]:
+        if p.get("status") == "open" and (p.get("current_price") or 0) > 0:
+            if pv:
+                weights[p["symbol"]] = p["market_value"] / pv
+            prices[p["symbol"]] = p["current_price"]
+    return weights, prices, d
+
+
+def _market_prices(symbols) -> dict:
+    """Latest close per symbol from market.db — fallback for names the deployment
+    no longer holds (dropped from the ranking) but the fund still owns."""
+    symbols = [s for s in symbols]
+    if not symbols:
+        return {}
+    mdb = os.environ.get("MARKET_DB_PATH", str(_BASE / "market.db"))
+    conn = sqlite3.connect(mdb)
+    out = {}
+    try:
+        for s in symbols:
+            r = conn.execute(
+                "SELECT close FROM prices WHERE symbol = ? ORDER BY date DESC LIMIT 1", (s,)).fetchone()
+            if r and r[0]:
+                out[s] = r[0]
+    finally:
+        conn.close()
+    return out
+
+
+def fund_actual_book(fund_id: str) -> dict:
+    """The fund's REAL book: holdings from executed fills, cash from investor
+    net flows +/- fills, marked at current prices. This is what IB should hold."""
+    fund = get_fund(fund_id)
+    if not fund:
+        raise ValueError(f"Fund '{fund_id}' not found")
+    _, prices, d = _targets_and_prices(fund["deployment_id"])
+    conn = _conn()
+    try:
+        net_cash_in = conn.execute(
+            "SELECT COALESCE(SUM(amount),0) a FROM investor_transactions WHERE fund_id = ?",
+            (fund_id,)).fetchone()["a"] or 0.0
+        fills = conn.execute(
+            "SELECT symbol, side, fill_shares, fill_price FROM fund_orders "
+            "WHERE fund_id = ? AND status = 'executed'", (fund_id,)).fetchall()
+    finally:
+        conn.close()
+    holdings: dict[str, float] = {}
+    cash = net_cash_in
+    for f in fills:
+        sh, px = (f["fill_shares"] or 0.0), (f["fill_price"] or 0.0)
+        if f["side"] == "BUY":
+            holdings[f["symbol"]] = holdings.get(f["symbol"], 0.0) + sh
+            cash -= sh * px
+        else:
+            holdings[f["symbol"]] = holdings.get(f["symbol"], 0.0) - sh
+            cash += sh * px
+    missing = [s for s, sh in holdings.items() if abs(sh) > 1e-9 and s not in prices]
+    if missing:
+        prices = {**prices, **_market_prices(missing)}
+
+    positions, holdings_mv = [], 0.0
+    for sym, sh in holdings.items():
+        if abs(sh) < 1e-4:   # sub-0.0001-share dust (rounding) is not a real position
+            continue
+        px = prices.get(sym, 0.0)
+        mv = sh * px
+        holdings_mv += mv
+        positions.append({"symbol": sym, "shares": round(sh, 6),
+                          "price": round(px, 4), "market_value": round(mv, 2)})
+    positions.sort(key=lambda p: p["market_value"], reverse=True)
+    nav_history = d.get("nav_history") or []
+    return {
+        "fund_id": fund_id,
+        "as_of": d.get("last_evaluated") or (nav_history[-1]["date"] if nav_history else None),
+        "cash": round(cash, 2), "holdings_value": round(holdings_mv, 2),
+        "aum": round(cash + holdings_mv, 2), "positions": positions,
+    }
+
+
+def generate_orders(fund_id: str, whole: bool = False, source: str = "daily") -> dict:
+    """Compute the orders to bring the fund's real book to the deployed target
+    weights (× current AUM), and write them as a pending batch. Run this daily /
+    after subscriptions: it absorbs new cash (buys), redemptions (sells), and
+    rebalances (deltas) in one shot."""
+    fund = get_fund(fund_id)
+    if not fund:
+        raise ValueError(f"Fund '{fund_id}' not found")
+    weights, prices, _ = _targets_and_prices(fund["deployment_id"])
+    book = fund_actual_book(fund_id)
+    aum = book["aum"]
+    if aum <= 0:
+        raise ValueError("Fund has no AUM yet (no subscriptions)")
+    cur = {p["symbol"]: p for p in book["positions"]}
+    now = _now()
+    batch_id = _gen_id(f"{fund_id[:12]}_batch")
+    batch_date = book["as_of"] or now[:10]
+
+    orders = []
+    for sym in set(weights) | set(cur):
+        price = prices.get(sym) or cur.get(sym, {}).get("price") or 0
+        if price <= 0:
+            continue
+        delta_val = weights.get(sym, 0.0) * aum - cur.get(sym, {}).get("market_value", 0.0)
+        raw = delta_val / price
+        shares = float(int(raw)) if whole else round(raw, 6)
+        if (whole and abs(shares) < 1) or (not whole and abs(shares) < 1e-4):
+            continue
+        mag = abs(shares)
+        orders.append({
+            "id": _gen_id(f"ord_{sym}"), "fund_id": fund_id, "batch_id": batch_id,
+            "batch_date": batch_date, "source": source, "symbol": sym,
+            "side": "BUY" if shares > 0 else "SELL", "shares": round(mag, 6),
+            "est_price": round(price, 4), "est_value": round(mag * price, 2),
+            "status": "pending", "created_at": now,
+        })
+    orders.sort(key=lambda o: (o["side"], -o["est_value"]))
+    conn = _conn()
+    try:
+        conn.executemany(
+            """INSERT INTO fund_orders (id, fund_id, batch_id, batch_date, source, symbol,
+                   side, shares, est_price, est_value, status, created_at)
+               VALUES (:id,:fund_id,:batch_id,:batch_date,:source,:symbol,:side,:shares,
+                       :est_price,:est_value,:status,:created_at)""", orders)
+        conn.commit()
+    finally:
+        conn.close()
+    return {
+        "fund_id": fund_id, "batch_id": batch_id, "batch_date": batch_date, "source": source,
+        "share_mode": "whole" if whole else "fractional", "aum": aum,
+        "order_count": len(orders),
+        "buy_value": round(sum(o["est_value"] for o in orders if o["side"] == "BUY"), 2),
+        "sell_value": round(sum(o["est_value"] for o in orders if o["side"] == "SELL"), 2),
+        "orders": orders,
+    }
+
+
+def list_orders(fund_id: str, status: str | None = None, batch_id: str | None = None) -> list[dict]:
+    q = "SELECT * FROM fund_orders WHERE fund_id = ?"
+    params: list = [fund_id]
+    if status:
+        q += " AND status = ?"; params.append(status)
+    if batch_id:
+        q += " AND batch_id = ?"; params.append(batch_id)
+    q += " ORDER BY created_at DESC, side, est_value DESC"
+    conn = _conn()
+    try:
+        rows = conn.execute(q, params).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def record_fill(order_id: str, fill_price: float | None = None,
+                fill_shares: float | None = None) -> dict:
+    """Mark an order executed with the actual IB fill (defaults to est_price/shares)."""
+    conn = _conn()
+    try:
+        row = conn.execute("SELECT * FROM fund_orders WHERE id = ?", (order_id,)).fetchone()
+        if not row:
+            raise ValueError(f"Order '{order_id}' not found")
+        if row["status"] == "executed":
+            raise PermissionError("Order already executed")
+        fp = fill_price if fill_price is not None else row["est_price"]
+        fs = fill_shares if fill_shares is not None else row["shares"]
+        conn.execute(
+            "UPDATE fund_orders SET status='executed', fill_price=?, fill_shares=?, fill_time=? WHERE id=?",
+            (fp, fs, _now(), order_id))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"order_id": order_id, "status": "executed", "fill_price": fp, "fill_shares": fs}
+
+
+def fill_batch(batch_id: str, at_estimate: bool = True) -> dict:
+    """Mark every pending order in a batch executed at its estimated price
+    (convenience when you fill the whole batch at/near the marks)."""
+    conn = _conn()
+    try:
+        rows = conn.execute(
+            "SELECT id, est_price, shares FROM fund_orders WHERE batch_id = ? AND status = 'pending'",
+            (batch_id,)).fetchall()
+        now = _now()
+        for r in rows:
+            conn.execute(
+                "UPDATE fund_orders SET status='executed', fill_price=?, fill_shares=?, fill_time=? WHERE id=?",
+                (r["est_price"], r["shares"], now, r["id"]))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"batch_id": batch_id, "filled": len(rows)}
+
+
+# --------------------------------------------------------------------------- #
 # Deletion (guarded: refuse to drop anything with live units unless forced)
 # --------------------------------------------------------------------------- #
 def delete_fund(fund_id: str, force: bool = False) -> dict:
@@ -518,6 +721,7 @@ def delete_fund(fund_id: str, force: bool = False) -> dict:
                          (fund_id,)).fetchone()["c"]
         conn.execute("DELETE FROM investor_transactions WHERE fund_id = ?", (fund_id,))
         conn.execute("DELETE FROM fund_nav_history WHERE fund_id = ?", (fund_id,))
+        conn.execute("DELETE FROM fund_orders WHERE fund_id = ?", (fund_id,))
         conn.execute("DELETE FROM funds WHERE id = ?", (fund_id,))
         conn.commit()
     finally:

@@ -735,6 +735,31 @@ CREATE TABLE IF NOT EXISTS investor_transactions (
 );
 CREATE INDEX IF NOT EXISTS idx_inv_tx_investor ON investor_transactions(investor_id, fund_id);
 CREATE INDEX IF NOT EXISTS idx_inv_tx_fund ON investor_transactions(fund_id);
+
+-- Execution blotter for a commingled fund (one pooled IB account). Each
+-- daily generation writes a batch of orders to bring the fund's real book
+-- (cash from subscriptions + prior fills) to the deployed target weights.
+-- Execute in IB, then record the fill — the executed rows ARE the fund's
+-- real positions.
+CREATE TABLE IF NOT EXISTS fund_orders (
+    id            TEXT PRIMARY KEY,
+    fund_id       TEXT NOT NULL,
+    batch_id      TEXT NOT NULL,            -- one generation run
+    batch_date    TEXT NOT NULL,            -- pricing/as-of date
+    source        TEXT NOT NULL,            -- subscription|redemption|rebalance|daily
+    symbol        TEXT NOT NULL,
+    side          TEXT NOT NULL,            -- BUY|SELL
+    shares        REAL NOT NULL,            -- positive magnitude to trade
+    est_price     REAL,
+    est_value     REAL,
+    status        TEXT NOT NULL DEFAULT 'pending',  -- pending|executed|cancelled
+    fill_price    REAL,
+    fill_shares   REAL,
+    fill_time     TEXT,
+    created_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_fund_orders_fund ON fund_orders(fund_id, status);
+CREATE INDEX IF NOT EXISTS idx_fund_orders_batch ON fund_orders(batch_id);
 """
 
 
