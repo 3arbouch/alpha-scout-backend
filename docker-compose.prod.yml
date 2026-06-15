@@ -1,0 +1,34 @@
+services:
+  api-prod:
+    image: alphascout-prod:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: alphascout-prod
+    # Run as the host user so files written into the bind-mounted repo
+    # (logs, app.db WAL) stay owned by mohamed, not root.
+    user: "1000:1003"
+    env_file:
+      - .env
+    environment:
+      # The container serves the API only; the nightly pipeline runs from the
+      # host crontab (22:00). Never install cron inside this container.
+      ENABLE_CRON: "false"
+      PYTHONDONTWRITEBYTECODE: "1"
+      # Non-root user has no home; give fontconfig/matplotlib a writable cache
+      # so WeasyPrint PDF rendering doesn't warn + rescan fonts every call.
+      HOME: "/tmp"
+      XDG_CACHE_HOME: "/tmp/cache"
+    working_dir: /home/mohamed/alpha-scout-backend/server
+    # Bypass entrypoint.sh (cron + hardcoded port) and run the API directly.
+    # PORT is unset in prod .env, so api.py defaults to 8090.
+    entrypoint: []
+    command: ["python3", "-u", "api.py"]
+    ports:
+      - "8090:8090"
+    volumes:
+      # Whole prod repo at its real path: code + data + DBs + DATA_DIR all live
+      # under here, and the absolute paths in .env resolve. RW (manual evaluate
+      # writes app.db).
+      - /home/mohamed/alpha-scout-backend:/home/mohamed/alpha-scout-backend
+    restart: unless-stopped
