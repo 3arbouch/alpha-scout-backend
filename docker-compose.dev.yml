@@ -1,0 +1,36 @@
+services:
+  api-dev:
+    image: alphascout-dev:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: alphascout-dev
+    # Run as the host user so any files written into the bind-mounted repo
+    # (logs, .pyc) stay owned by mohamed, not root.
+    user: "1000:1003"
+    env_file:
+      - .env
+    environment:
+      # The dev container serves the API only; the nightly pipeline still runs
+      # from the host crontab. Never install cron inside this container.
+      ENABLE_CRON: "false"
+      PYTHONDONTWRITEBYTECODE: "1"
+      # Non-root user has no home; give fontconfig/matplotlib a writable cache
+      # so WeasyPrint PDF rendering doesn't warn + rescan fonts every call.
+      HOME: "/tmp"
+      XDG_CACHE_HOME: "/tmp/cache"
+    working_dir: /home/mohamed/alpha-scout-backend-dev/server
+    # Bypass entrypoint.sh (which installs cron + hardcodes the prod port) and
+    # run the API directly. PORT comes from .env (8091).
+    entrypoint: []
+    command: ["python3", "-u", "api.py"]
+    ports:
+      - "8091:8091"
+    volumes:
+      # Dev repo: code + market_dev.db + (after relocation) app_dev.db — RW.
+      # Mounted at its real host path so the absolute paths in .env resolve.
+      - /home/mohamed/alpha-scout-backend-dev:/home/mohamed/alpha-scout-backend-dev
+      # Shared reference data (fundamentals/prices/earnings/...) — RO.
+      # Shared across environments by design; the container only reads it.
+      - /home/mohamed/alpha-scout-backend/data:/home/mohamed/alpha-scout-backend/data:ro
+    restart: unless-stopped
