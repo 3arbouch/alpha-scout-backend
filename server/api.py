@@ -4701,6 +4701,104 @@ async def publish_fund_nav_api(fund_id: str, _: str = Depends(verify_api_key)):
         raise HTTPException(404, str(e))
 
 
+class InvestorCreateBody(_BM):
+    name: str = Field(min_length=1, max_length=200)
+    email: str | None = None
+    notes: str | None = None
+
+
+@app.post("/investors", tags=["Funds"])
+async def create_investor_api(body: InvestorCreateBody, _: str = Depends(verify_api_key)):
+    from funds import create_investor
+    return _sanitize_floats(await _run_sync(create_investor, body.name, body.email, body.notes))
+
+
+@app.get("/investors", tags=["Funds"])
+async def list_investors_api(_: str = Depends(verify_api_key)):
+    from funds import list_investors
+    investors = await _run_sync(list_investors)
+    return {"total": len(investors), "data": investors}
+
+
+class SubscribeBody(_BM):
+    investor_id: str = Field(min_length=1)
+    amount: float = Field(gt=0)
+    as_of: str | None = Field(default=None, description="Dealing date YYYY-MM-DD; defaults to latest NAV.")
+
+
+@app.post("/funds/{fund_id}/subscribe", tags=["Funds"])
+async def subscribe_api(fund_id: str, body: SubscribeBody, _: str = Depends(verify_api_key)):
+    """Buy units worth `amount` at the dealing-date NAV/unit (units = amount / NAV)."""
+    from funds import subscribe
+    try:
+        return _sanitize_floats(await _run_sync(subscribe, fund_id, body.investor_id, body.amount, body.as_of))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+class RedeemBody(_BM):
+    investor_id: str = Field(min_length=1)
+    amount: float | None = Field(default=None, gt=0)
+    units: float | None = Field(default=None, gt=0)
+    as_of: str | None = None
+
+
+@app.post("/funds/{fund_id}/redeem", tags=["Funds"])
+async def redeem_api(fund_id: str, body: RedeemBody, _: str = Depends(verify_api_key)):
+    """Redeem by amount or units at the dealing-date NAV/unit."""
+    from funds import redeem
+    try:
+        return _sanitize_floats(await _run_sync(redeem, fund_id, body.investor_id, body.amount, body.units, body.as_of))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/funds/{fund_id}/investors", tags=["Funds"])
+async def fund_investors_api(fund_id: str, _: str = Depends(verify_api_key)):
+    """All investor positions + reconciliation (Σ value == AUM)."""
+    from funds import fund_investors
+    try:
+        return _sanitize_floats(await _run_sync(fund_investors, fund_id))
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.get("/funds/{fund_id}/investors/{investor_id}/statement", tags=["Funds"])
+async def investor_statement_api(fund_id: str, investor_id: str, _: str = Depends(verify_api_key)):
+    """Per-account performance: value, $ gain, return on capital (simple + IRR), fund return."""
+    from funds import investor_statement
+    try:
+        return _sanitize_floats(await _run_sync(investor_statement, fund_id, investor_id))
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.get("/funds/{fund_id}/report.pdf", tags=["Funds"])
+async def fund_report_pdf_api(fund_id: str, _: str = Depends(verify_api_key)):
+    """Fund tear sheet: NAV/unit chart, key stats, investor positions."""
+    from fastapi.responses import Response
+    from reports.fund_report import build_fund_report_pdf
+    pdf = await _run_sync(build_fund_report_pdf, fund_id)
+    if pdf is None:
+        raise HTTPException(404, f"Fund '{fund_id}' not found")
+    return Response(content=pdf, media_type="application/pdf",
+                    headers={"Content-Disposition": f'inline; filename="{fund_id}_fund.pdf"',
+                             "Cache-Control": "no-store"})
+
+
+@app.get("/funds/{fund_id}/investors/{investor_id}/statement.pdf", tags=["Funds"])
+async def investor_statement_pdf_api(fund_id: str, investor_id: str, _: str = Depends(verify_api_key)):
+    """Per-investor statement PDF: capital, value, gain, return on capital + IRR, fund return."""
+    from fastapi.responses import Response
+    from reports.fund_report import build_investor_statement_pdf
+    pdf = await _run_sync(build_investor_statement_pdf, fund_id, investor_id)
+    if pdf is None:
+        raise HTTPException(404, "Fund/investor not found or no transactions")
+    return Response(content=pdf, media_type="application/pdf",
+                    headers={"Content-Disposition": f'inline; filename="{investor_id}_statement.pdf"',
+                             "Cache-Control": "no-store"})
+
+
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------

@@ -710,6 +710,31 @@ CREATE TABLE IF NOT EXISTS fund_nav_history (
     PRIMARY KEY (fund_id, date)
 );
 CREATE INDEX IF NOT EXISTS idx_fund_nav_history_fund ON fund_nav_history(fund_id, date);
+
+CREATE TABLE IF NOT EXISTS investors (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    email       TEXT,
+    notes       TEXT,
+    created_at  TEXT NOT NULL
+);
+
+-- The units ledger. One row per subscription/redemption. Units and amount are
+-- SIGNED: subscription positive, redemption negative — so SUM(units) is the
+-- holding and SUM(amount) is net capital invested. Units are fractional.
+CREATE TABLE IF NOT EXISTS investor_transactions (
+    id            TEXT PRIMARY KEY,
+    investor_id   TEXT NOT NULL,
+    fund_id       TEXT NOT NULL,
+    date          TEXT NOT NULL,            -- dealing date the trade is priced at
+    type          TEXT NOT NULL,            -- subscription|redemption
+    amount        REAL NOT NULL,            -- signed $ (sub +, redemption -)
+    nav_per_unit  REAL NOT NULL,            -- NAV/unit on the dealing date
+    units         REAL NOT NULL,            -- signed units (sub +, redemption -)
+    created_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_inv_tx_investor ON investor_transactions(investor_id, fund_id);
+CREATE INDEX IF NOT EXISTS idx_inv_tx_fund ON investor_transactions(fund_id);
 """
 
 
