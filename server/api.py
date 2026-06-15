@@ -4773,6 +4773,38 @@ async def investor_statement_api(fund_id: str, investor_id: str, _: str = Depend
         raise HTTPException(404, str(e))
 
 
+@app.delete("/funds/{fund_id}", tags=["Funds"])
+async def delete_fund_api(
+    fund_id: str,
+    force: bool = Query(False, description="Delete even if investors still hold units."),
+    _: str = Depends(verify_api_key),
+):
+    """Delete a fund + its NAV history + transactions. 409 if investors hold units (unless force)."""
+    from funds import delete_fund
+    try:
+        return await _run_sync(delete_fund, fund_id, force)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except PermissionError as e:
+        raise HTTPException(409, str(e))
+
+
+@app.delete("/investors/{investor_id}", tags=["Funds"])
+async def delete_investor_api(
+    investor_id: str,
+    force: bool = Query(False, description="Delete even if the investor still holds units."),
+    _: str = Depends(verify_api_key),
+):
+    """Delete an investor + their transactions. 409 if they still hold units (unless force)."""
+    from funds import delete_investor
+    try:
+        return await _run_sync(delete_investor, investor_id, force)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except PermissionError as e:
+        raise HTTPException(409, str(e))
+
+
 @app.get("/funds/{fund_id}/report.pdf", tags=["Funds"])
 async def fund_report_pdf_api(fund_id: str, _: str = Depends(verify_api_key)):
     """Fund tear sheet: NAV/unit chart, key stats, investor positions."""

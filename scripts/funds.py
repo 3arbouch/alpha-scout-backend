@@ -423,3 +423,53 @@ def fund_investors(fund_id: str) -> dict:
         "investor_count": len(positions),
         "positions": positions,
     }
+
+
+# --------------------------------------------------------------------------- #
+# Deletion (guarded: refuse to drop anything with live units unless forced)
+# --------------------------------------------------------------------------- #
+def delete_fund(fund_id: str, force: bool = False) -> dict:
+    """Delete a fund + its NAV history + its transactions. Blocked (PermissionError)
+    if investors still hold units, unless force=True. ValueError if not found."""
+    conn = _conn()
+    try:
+        if not conn.execute("SELECT 1 FROM funds WHERE id = ?", (fund_id,)).fetchone():
+            raise ValueError(f"Fund '{fund_id}' not found")
+        live = round(conn.execute(
+            "SELECT COALESCE(SUM(units), 0) u FROM investor_transactions WHERE fund_id = ?",
+            (fund_id,)).fetchone()["u"] or 0.0, 6)
+        if abs(live) > 1e-6 and not force:
+            raise PermissionError(
+                f"Fund has {live} units held by investors — redeem them or pass force=true")
+        n = conn.execute("SELECT COUNT(*) c FROM investor_transactions WHERE fund_id = ?",
+                         (fund_id,)).fetchone()["c"]
+        conn.execute("DELETE FROM investor_transactions WHERE fund_id = ?", (fund_id,))
+        conn.execute("DELETE FROM fund_nav_history WHERE fund_id = ?", (fund_id,))
+        conn.execute("DELETE FROM funds WHERE id = ?", (fund_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"deleted": fund_id, "transactions_removed": n, "live_units_at_delete": live}
+
+
+def delete_investor(investor_id: str, force: bool = False) -> dict:
+    """Delete an investor + their transactions. Blocked if they hold units anywhere
+    unless force=True. ValueError if not found."""
+    conn = _conn()
+    try:
+        if not conn.execute("SELECT 1 FROM investors WHERE id = ?", (investor_id,)).fetchone():
+            raise ValueError(f"Investor '{investor_id}' not found")
+        live = round(conn.execute(
+            "SELECT COALESCE(SUM(units), 0) u FROM investor_transactions WHERE investor_id = ?",
+            (investor_id,)).fetchone()["u"] or 0.0, 6)
+        if abs(live) > 1e-6 and not force:
+            raise PermissionError(
+                f"Investor still holds {live} units — redeem first or pass force=true")
+        n = conn.execute("SELECT COUNT(*) c FROM investor_transactions WHERE investor_id = ?",
+                         (investor_id,)).fetchone()["c"]
+        conn.execute("DELETE FROM investor_transactions WHERE investor_id = ?", (investor_id,))
+        conn.execute("DELETE FROM investors WHERE id = ?", (investor_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"deleted": investor_id, "transactions_removed": n, "live_units_at_delete": live}
