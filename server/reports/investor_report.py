@@ -176,6 +176,8 @@ def _month_label(ym: str) -> str:
 
 
 def _monthly_bar_chart(data: dict) -> str | None:
+    from matplotlib.ticker import FuncFormatter
+
     port = _monthly_returns(data["nav_history"])
     if not port:
         return None
@@ -183,23 +185,44 @@ def _monthly_bar_chart(data: dict) -> str | None:
     sec = _monthly_returns(data["sector_nav"])
     months = list(port.keys())
     xs = list(range(len(months)))
-    w = 0.26
-    fig, ax = plt.subplots(figsize=(8.2, 2.6))
-    ax.bar([i - w for i in xs], [port.get(m, 0) for m in months], w,
-           color=PORTFOLIO_COLOR, label="Portfolio")
-    ax.bar(xs, [mkt.get(m, 0) for m in months], w,
-           color=MARKET_COLOR, label=f"S&P 500 ({data.get('market_symbol') or 'SPY'})")
-    ax.bar([i + w for i in xs], [sec.get(m, 0) for m in months], w,
-           color=SECTOR_COLOR, label=f"Sector ({data.get('sector_symbol') or 'benchmark'})")
-    ax.axhline(0, color="#cccccc", linewidth=0.8)
-    ax.set_ylabel("Monthly return (%)", fontsize=9)
+
+    series = [
+        ("Portfolio", [port.get(m, 0) for m in months], PORTFOLIO_COLOR),
+        (f"S&P 500 ({data.get('market_symbol') or 'SPY'})",
+         [mkt.get(m, 0) for m in months], MARKET_COLOR),
+        (f"Sector ({data.get('sector_symbol') or 'benchmark'})",
+         [sec.get(m, 0) for m in months], SECTOR_COLOR),
+    ]
+    n = len(series)
+    group_w = 0.7
+    bar_w = group_w / n
+
+    fig, ax = plt.subplots(figsize=(8.2, 2.7))
+    for i, (label, vals, color) in enumerate(series):
+        offsets = [x - group_w / 2 + bar_w * (i + 0.5) for x in xs]
+        ax.bar(offsets, vals, bar_w * 0.86, color=color, label=label,
+               edgecolor="white", linewidth=0.5, zorder=3)
+
+    ax.axhline(0, color="#9aa0a6", linewidth=0.9, zorder=2)
     ax.set_xticks(xs)
-    ax.set_xticklabels([_month_label(m) for m in months], fontsize=8)
-    ax.grid(True, axis="y", color="#eeeeee", linewidth=0.8)
-    ax.legend(loc="upper left", fontsize=8, frameon=False, ncol=3)
-    ax.tick_params(labelsize=8)
-    for s in ("top", "right"):
+    ax.set_xticklabels([_month_label(m) for m in months], fontsize=8, color="#3c4043")
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:.0f}%"))
+    ax.locator_params(axis="y", nbins=5)
+    ax.tick_params(length=0, labelsize=8, colors="#5f6368")
+    ax.grid(True, axis="y", color="#eef0f2", linewidth=0.8, zorder=0)
+    ax.set_axisbelow(True)
+    for s in ("top", "right", "left"):
         ax.spines[s].set_visible(False)
+    ax.spines["bottom"].set_color("#dadce0")
+
+    allv = [v for _, vals, _ in series for v in vals]
+    lo, hi = min(allv + [0]), max(allv + [0])
+    pad = max(1.5, (hi - lo) * 0.16)
+    ax.set_ylim(lo - pad, hi + pad)
+
+    ax.legend(loc="lower center", bbox_to_anchor=(0.5, 1.0), ncol=n,
+              fontsize=8, frameon=False, handlelength=1.1, columnspacing=2.0)
+    fig.tight_layout()
     return _fig_to_data_uri(fig)
 
 
