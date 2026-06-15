@@ -426,6 +426,79 @@ def fund_investors(fund_id: str) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Execution helper — cash subscription -> order list (replicate the book)
+# --------------------------------------------------------------------------- #
+def subscription_orders(fund_id: str, amount: float, whole: bool = False) -> dict:
+    """Convert a cash subscription into the share orders to execute (e.g. in IB).
+
+    Replicates the fund deployment's CURRENT holdings weights (each open
+    position's market value / portfolio NAV), scaled to `amount`. Reports the
+    residual cash left after rounding (and, in whole-share mode, any names too
+    small to buy a single share)."""
+    fund = get_fund(fund_id)
+    if not fund:
+        raise ValueError(f"Fund '{fund_id}' not found")
+    if amount <= 0:
+        raise ValueError("amount must be positive")
+
+    from deploy_engine import get_deployment, build_position_book
+    d = get_deployment(fund["deployment_id"])
+    if not d:
+        raise ValueError(f"Deployment '{fund['deployment_id']}' not found")
+    book = build_position_book(d.get("sleeves") or [], d.get("initial_capital") or 0)
+    pv = book.get("portfolio_value") or 0
+    if pv <= 0:
+        raise ValueError("Deployment has no portfolio value to replicate")
+
+    nav_history = d.get("nav_history") or []
+    as_of = d.get("last_evaluated") or (nav_history[-1]["date"] if nav_history else None)
+
+    orders, skipped = [], []
+    invested = 0.0
+    for p in book["positions"]:
+        if p.get("status") != "open":
+            continue
+        price = p.get("current_price") or 0
+        weight = (p["market_value"] / pv) if pv else 0.0
+        target_value = weight * amount
+        if price <= 0:
+            skipped.append({"symbol": p["symbol"], "reason": "no price", "target_value": round(target_value, 2)})
+            continue
+        raw = target_value / price
+        shares = float(int(raw)) if whole else round(raw, 6)
+        if shares <= 0:
+            skipped.append({"symbol": p["symbol"], "reason": "below 1 share",
+                            "target_value": round(target_value, 2), "price": round(price, 4)})
+            continue
+        order_value = round(shares * price, 2)
+        invested += order_value
+        orders.append({
+            "symbol": p["symbol"], "side": "BUY",
+            "weight": round(weight, 6),
+            "target_value": round(target_value, 2),
+            "price": round(price, 4),
+            "shares": shares,
+            "order_value": order_value,
+            "weight_actual": round(order_value / amount, 6),
+        })
+
+    orders.sort(key=lambda o: o["order_value"], reverse=True)
+    invested = round(invested, 2)
+    residual = round(amount - invested, 2)
+    max_drift = max((abs(o["weight_actual"] - o["weight"]) for o in orders), default=0.0)
+    return {
+        "fund_id": fund_id, "deployment_id": fund["deployment_id"], "as_of": as_of,
+        "amount": round(amount, 2), "share_mode": "whole" if whole else "fractional",
+        "orders": orders, "order_count": len(orders),
+        "invested": invested,
+        "residual_cash": residual,
+        "residual_pct": round(residual / amount * 100, 3) if amount else 0,
+        "max_weight_drift_pct": round(max_drift * 100, 3),
+        "skipped": skipped,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Deletion (guarded: refuse to drop anything with live units unless forced)
 # --------------------------------------------------------------------------- #
 def delete_fund(fund_id: str, force: bool = False) -> dict:

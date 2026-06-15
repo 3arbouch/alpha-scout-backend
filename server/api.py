@@ -4773,6 +4773,22 @@ async def investor_statement_api(fund_id: str, investor_id: str, _: str = Depend
         raise HTTPException(404, str(e))
 
 
+@app.get("/funds/{fund_id}/subscription-orders", tags=["Funds"])
+async def subscription_orders_api(
+    fund_id: str,
+    amount: float = Query(..., gt=0, description="Cash to invest ($)."),
+    whole: bool = Query(False, description="Whole shares (true) or fractional (false, default)."),
+    _: str = Depends(verify_api_key),
+):
+    """Preview the share orders to execute for a cash subscription (replicates the
+    fund's current holdings weights). Records nothing — pure preview for IB."""
+    from funds import subscription_orders
+    try:
+        return _sanitize_floats(await _run_sync(subscription_orders, fund_id, amount, whole))
+    except ValueError as e:
+        raise HTTPException(404 if "not found" in str(e).lower() else 400, str(e))
+
+
 @app.delete("/funds/{fund_id}", tags=["Funds"])
 async def delete_fund_api(
     fund_id: str,
