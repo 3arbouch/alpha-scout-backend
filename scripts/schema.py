@@ -678,6 +678,42 @@ CREATE INDEX IF NOT EXISTS idx_memo_items_kind ON memo_items(kind);
 
 
 # ---------------------------------------------------------------------------
+# Funds — unitized NAV/share layer over a deployment (strategy return index).
+# The fund NAV/unit is the deployment's cumulative-return index rebased to
+# base_nav_per_unit at inception; investor units are notional (Option A).
+# ---------------------------------------------------------------------------
+FUNDS = """
+CREATE TABLE IF NOT EXISTS funds (
+    id                  TEXT PRIMARY KEY,
+    name                TEXT NOT NULL,
+    deployment_id       TEXT NOT NULL,            -- FK → deployments.id (index source)
+    inception_date      TEXT NOT NULL,            -- date NAV/unit == base_nav_per_unit
+    base_nav_per_unit   REAL NOT NULL DEFAULT 100.0,
+    currency            TEXT NOT NULL DEFAULT 'USD',
+    dealing_frequency   TEXT NOT NULL DEFAULT 'weekly',  -- weekly|daily
+    status              TEXT NOT NULL DEFAULT 'active',   -- active|closed
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT
+);
+
+-- Published, immutable NAV/unit series (one row per dealing date). The live
+-- index is recomputed from the deployment, but published rows are never
+-- rewritten — they are what investors are priced against.
+CREATE TABLE IF NOT EXISTS fund_nav_history (
+    fund_id             TEXT NOT NULL,
+    date                TEXT NOT NULL,           -- dealing/publish date (e.g. Friday)
+    nav_per_unit        REAL NOT NULL,
+    deployment_nav      REAL,                    -- underlying strategy NAV that day (audit)
+    units_outstanding   REAL,                    -- total notional units issued
+    aum                 REAL,                    -- units_outstanding * nav_per_unit
+    created_at          TEXT NOT NULL,
+    PRIMARY KEY (fund_id, date)
+);
+CREATE INDEX IF NOT EXISTS idx_fund_nav_history_fund ON fund_nav_history(fund_id, date);
+"""
+
+
+# ---------------------------------------------------------------------------
 # All schemas combined
 # ---------------------------------------------------------------------------
 
@@ -698,6 +734,7 @@ ALL_SCHEMAS = [
     ANALYST_MEMOS,
     MEMO_ITEMS,
     EXPERIMENTS,
+    FUNDS,
     LEGACY,
     # Note: universe_profiles is in market.db, not app.db — managed by server/api.py
 ]

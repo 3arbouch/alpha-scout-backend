@@ -4633,6 +4633,75 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
+# Funds — unitized NAV/share layer over a deployment
+# ---------------------------------------------------------------------------
+class FundCreateBody(_BM):
+    name: str = Field(min_length=1, max_length=200)
+    deployment_id: str = Field(min_length=1)
+    inception_date: str | None = Field(default=None, description="YYYY-MM-DD; defaults to the deployment start.")
+    base_nav_per_unit: float = Field(default=100.0, gt=0)
+    currency: str = Field(default="USD", max_length=8)
+
+
+@app.post("/funds", tags=["Funds"])
+async def create_fund_api(body: FundCreateBody, _: str = Depends(verify_api_key)):
+    """Create a fund wrapping a deployment. NAV/unit = the strategy return index rebased to base_nav_per_unit."""
+    from funds import create_fund
+    try:
+        fund = await _run_sync(
+            create_fund, body.name, body.deployment_id,
+            body.inception_date, body.base_nav_per_unit, body.currency)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return _sanitize_floats(fund)
+
+
+@app.get("/funds", tags=["Funds"])
+async def list_funds_api(_: str = Depends(verify_api_key)):
+    from funds import list_funds
+    funds = await _run_sync(list_funds)
+    return {"total": len(funds), "data": [_sanitize_floats(f) for f in funds]}
+
+
+@app.get("/funds/{fund_id}", tags=["Funds"])
+async def get_fund_api(fund_id: str, _: str = Depends(verify_api_key)):
+    from funds import get_fund
+    fund = await _run_sync(get_fund, fund_id)
+    if not fund:
+        raise HTTPException(404, f"Fund '{fund_id}' not found")
+    return _sanitize_floats(fund)
+
+
+@app.get("/funds/{fund_id}/nav", tags=["Funds"])
+async def get_fund_nav_api(
+    fund_id: str,
+    weekly: bool = Query(False, description="Weekly dealing NAV/unit instead of daily."),
+    published: bool = Query(False, description="Return the immutable published series instead of the live index."),
+    _: str = Depends(verify_api_key),
+):
+    """NAV/unit series for a fund (rebased so inception == base_nav_per_unit)."""
+    from funds import nav_per_unit_series, published_nav
+    try:
+        if published:
+            series = await _run_sync(published_nav, fund_id)
+        else:
+            series = await _run_sync(nav_per_unit_series, fund_id, weekly)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    return _sanitize_floats({"fund_id": fund_id, "points": len(series), "series": series})
+
+
+@app.post("/funds/{fund_id}/publish", tags=["Funds"])
+async def publish_fund_nav_api(fund_id: str, _: str = Depends(verify_api_key)):
+    """Snapshot the weekly NAV/unit into the immutable published series. Idempotent."""
+    from funds import publish_weekly
+    try:
+        return await _run_sync(publish_weekly, fund_id)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+# ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
