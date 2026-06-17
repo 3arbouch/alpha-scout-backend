@@ -1099,6 +1099,57 @@ async def get_run(run_id: str):
     return run
 
 
+def _row_to_report(r) -> dict:
+    """Deserialize a run_reports row, expanding the JSON columns."""
+    d = dict(r)
+    d["status_counts"] = json.loads(d["status_counts"]) if d.get("status_counts") else {}
+    d["report_json"] = json.loads(d["report_json"]) if d.get("report_json") else {}
+    return d
+
+
+@router.get("/reports")
+async def list_reports(
+    universe: Optional[str] = Query(None, description="Filter by universe (e.g. 'sp500', 'mixed')"),
+):
+    """List per-run synthesis reports (lightweight — no full markdown/clusters).
+
+    One report per run. Cross-run thematic search over deduplicated lessons is a
+    Phase-2 (lessons library) capability — these are per-run artifacts.
+    """
+    conn = get_db()
+    if universe:
+        rows = conn.execute(
+            "SELECT run_id, universe, iterations_covered, n_lessons, status_counts, "
+            "model, generated_at FROM run_reports WHERE universe = ? "
+            "ORDER BY generated_at DESC", (universe,)).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT run_id, universe, iterations_covered, n_lessons, status_counts, "
+            "model, generated_at FROM run_reports ORDER BY generated_at DESC").fetchall()
+    conn.close()
+    data = []
+    for r in rows:
+        d = dict(r)
+        d["status_counts"] = json.loads(d["status_counts"]) if d.get("status_counts") else {}
+        data.append(d)
+    return {"total": len(data), "data": data}
+
+
+@router.get("/runs/{run_id}/report")
+async def get_run_report(run_id: str):
+    """Get the synthesis report for a run (full markdown + structured clusters)."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT * FROM run_reports WHERE run_id = ?", (run_id,)).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No report for run '{run_id}'. Reports are generated on run "
+                   "completion; this run may be unfinished or pre-date the feature.")
+    return _row_to_report(row)
+
+
 @router.get("/runs/{run_id}/experiments")
 async def list_experiments(
     run_id: str,
