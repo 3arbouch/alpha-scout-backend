@@ -1150,6 +1150,67 @@ async def get_run_report(run_id: str):
     return _row_to_report(row)
 
 
+def _row_to_lesson(r) -> dict:
+    d = dict(r)
+    d["source_runs"] = json.loads(d["source_runs"]) if d.get("source_runs") else []
+    d["has_conflict"] = bool(d.get("has_conflict"))
+    try:
+        d["test_spec"] = json.loads(d["test_spec"]) if d.get("test_spec") else None
+    except Exception:
+        pass
+    return d
+
+
+@router.get("/lessons")
+async def search_lessons(
+    universe: Optional[str] = Query(None, description="Filter by universe"),
+    factor: Optional[str] = Query(None, description="Match primary or conditioning factor (substring)"),
+    regime: Optional[str] = Query(None, description="Match a regime condition (substring)"),
+    validated_only: bool = Query(False, description="Only claims that held in ≥1 run"),
+    min_repetitions: int = Query(1, ge=1, description="Min distinct runs that produced the claim"),
+    conflicted_only: bool = Query(False, description="Only claims with a regime sign conflict"),
+    limit: int = Query(200, ge=1, le=2000),
+):
+    """Search the cross-run lessons library (deduplicated spec'd market claims).
+
+    This is the Phase-2 INDEX: one row per canonical claim, accumulated across
+    runs. For a single run's raw narrative, use /runs/{run_id}/report.
+    """
+    where, params = ["scope_type = 'market'"], []
+    if universe:
+        where.append("universe = ?"); params.append(universe)
+    if factor:
+        where.append("(primary_factor LIKE ? OR conditioning_factor LIKE ?)")
+        params += [f"%{factor}%", f"%{factor}%"]
+    if regime:
+        where.append("regime_conditions LIKE ?"); params.append(f"%{regime}%")
+    if validated_only:
+        where.append("times_validated > 0")
+    if conflicted_only:
+        where.append("has_conflict = 1")
+    where.append("repetition_count >= ?"); params.append(min_repetitions)
+
+    conn = get_db()
+    rows = conn.execute(
+        f"SELECT * FROM lesson_library WHERE {' AND '.join(where)} "
+        "ORDER BY repetition_count DESC, times_validated DESC, updated_at DESC "
+        "LIMIT ?", params + [limit]).fetchall()
+    conn.close()
+    return {"total": len(rows), "data": [_row_to_lesson(r) for r in rows]}
+
+
+@router.get("/lessons/{lesson_id}")
+async def get_lesson(lesson_id: str):
+    """Get one library claim, with full spec and provenance (source_runs)."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT * FROM lesson_library WHERE id = ?", (lesson_id,)).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"No library claim '{lesson_id}'.")
+    return _row_to_lesson(row)
+
+
 @router.get("/runs/{run_id}/experiments")
 async def list_experiments(
     run_id: str,

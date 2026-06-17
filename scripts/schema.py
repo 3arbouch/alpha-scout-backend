@@ -702,6 +702,42 @@ CREATE INDEX IF NOT EXISTS idx_run_reports_universe ON run_reports(universe);
 
 
 # ---------------------------------------------------------------------------
+# Lesson library — Phase 2. The cross-run INDEX over per-run reports: one row
+# per canonical market claim, keyed by hash(universe + canonical test_spec).
+# Per-run reports stay the raw documents; this folds their spec'd lessons into
+# accumulated, deduplicated, searchable beliefs. Provenance (source_runs) rides
+# along; nothing is overwritten — repeats bump counts and union regimes.
+# Only scope_type='market' (spec'd factor lessons) is populated today;
+# 'construction' is reserved for later.
+# ---------------------------------------------------------------------------
+LESSON_LIBRARY = """
+CREATE TABLE IF NOT EXISTS lesson_library (
+    id                  TEXT PRIMARY KEY,          -- hash(universe + canonical test_spec)
+    scope_type          TEXT NOT NULL DEFAULT 'market',
+    universe            TEXT,
+    test_spec           TEXT NOT NULL,             -- canonical (sorted) JSON
+    primary_factor      TEXT,                       -- extracted for search
+    conditioning_factor TEXT,                       -- extracted for search
+    claim               TEXT,                       -- representative claim text
+    mechanism           TEXT,                       -- representative mechanism
+    regime_conditions   TEXT,                       -- unioned, distinct
+    latest_status       TEXT,                       -- most recent fold's verdict
+    latest_confidence   TEXT,
+    repetition_count    INTEGER NOT NULL DEFAULT 0, -- distinct runs producing it
+    times_validated     INTEGER NOT NULL DEFAULT 0, -- runs where verdict held
+    times_rejected      INTEGER NOT NULL DEFAULT 0,
+    has_conflict        INTEGER NOT NULL DEFAULT 0, -- regime sign conflict seen
+    source_runs         TEXT,                       -- JSON list of run_ids
+    first_seen_at       TEXT,
+    updated_at          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_lesson_library_universe ON lesson_library(universe);
+CREATE INDEX IF NOT EXISTS idx_lesson_library_primary ON lesson_library(primary_factor);
+CREATE INDEX IF NOT EXISTS idx_lesson_library_reps ON lesson_library(repetition_count);
+"""
+
+
+# ---------------------------------------------------------------------------
 # Funds — unitized NAV/share layer over a deployment (strategy return index).
 # The fund NAV/unit is the deployment's cumulative-return index rebased to
 # base_nav_per_unit at inception; investor units are notional (Option A).
@@ -809,6 +845,7 @@ ALL_SCHEMAS = [
     MEMO_ITEMS,
     EXPERIMENTS,
     RUN_REPORTS,
+    LESSON_LIBRARY,
     FUNDS,
     LEGACY,
     # Note: universe_profiles is in market.db, not app.db — managed by server/api.py
