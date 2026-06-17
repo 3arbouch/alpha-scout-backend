@@ -1942,6 +1942,17 @@ async def main():
             except Exception as e:
                 print(f"  ⚠ lesson validation failed (non-fatal): {e}")
 
+    # --- Per-run synthesis report (auxiliary — must NEVER crash the run) ---
+    # One report per run, regenerated over the FULL memo_item history (so an
+    # extended/resumed run supersedes its earlier report, not just the new batch).
+    try:
+        from auto_trader.run_report import generate_run_report
+        _rep = generate_run_report(run_id, model=args.model)
+        print(f"  📝 run report: {_rep['stats']['n_lessons']} lessons, "
+              f"{_rep['stats']['iterations_covered']} experiments synthesized")
+    except Exception as e:
+        print(f"  ⚠ run report generation failed (non-fatal): {e}")
+
     # Mark run as completed (reached max_experiments)
     _update_run_status(run_id, "completed")
 

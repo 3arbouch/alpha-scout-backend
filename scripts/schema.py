@@ -678,6 +678,30 @@ CREATE INDEX IF NOT EXISTS idx_memo_items_kind ON memo_items(kind);
 
 
 # ---------------------------------------------------------------------------
+# Run reports — one per optimization run (Phase 1 of the lessons library).
+# A synthesis of the run's memo_items: the LLM clusters/canonicalizes the
+# free-text lessons; every count/confidence field is taken from the validator's
+# verdicts already on memo_items, never asserted by the LLM. PRIMARY KEY on
+# run_id means regenerating an extended run UPSERTs — one report per run, latest
+# version current.
+# ---------------------------------------------------------------------------
+RUN_REPORTS = """
+CREATE TABLE IF NOT EXISTS run_reports (
+    run_id              TEXT PRIMARY KEY,          -- one report per run (upsert)
+    universe            TEXT,                       -- dominant universe, or 'mixed'
+    iterations_covered  INTEGER NOT NULL DEFAULT 0, -- distinct experiments synthesized
+    n_lessons           INTEGER NOT NULL DEFAULT 0, -- memo_items synthesized
+    status_counts       TEXT,                       -- JSON: {validation_status: n} (from data)
+    report_md           TEXT,                       -- human-readable synthesis
+    report_json         TEXT,                       -- structured: clusters + deterministic stats
+    model               TEXT,
+    generated_at        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_run_reports_universe ON run_reports(universe);
+"""
+
+
+# ---------------------------------------------------------------------------
 # Funds — unitized NAV/share layer over a deployment (strategy return index).
 # The fund NAV/unit is the deployment's cumulative-return index rebased to
 # base_nav_per_unit at inception; investor units are notional (Option A).
@@ -784,6 +808,7 @@ ALL_SCHEMAS = [
     ANALYST_MEMOS,
     MEMO_ITEMS,
     EXPERIMENTS,
+    RUN_REPORTS,
     FUNDS,
     LEGACY,
     # Note: universe_profiles is in market.db, not app.db — managed by server/api.py
