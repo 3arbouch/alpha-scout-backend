@@ -86,6 +86,24 @@ def get_fund(fund_id: str) -> dict | None:
     return dict(row) if row else None
 
 
+def rename_fund(fund_id: str, name: str) -> dict:
+    name = name.strip()
+    if not name:
+        raise ValueError("Fund name cannot be empty")
+    conn = _conn()
+    try:
+        cur = conn.execute(
+            "UPDATE funds SET name = ?, updated_at = ? WHERE id = ?",
+            (name, _now(), fund_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    if cur.rowcount == 0:
+        raise ValueError(f"Fund '{fund_id}' not found")
+    return get_fund(fund_id)
+
+
 def list_funds() -> list[dict]:
     conn = _conn()
     try:

@@ -4656,6 +4656,21 @@ async def create_fund_api(body: FundCreateBody, _: str = Depends(verify_api_key)
     return _sanitize_floats(fund)
 
 
+class FundUpdateBody(_BM):
+    name: str = Field(min_length=1, max_length=200)
+
+
+@app.patch("/funds/{fund_id}", tags=["Funds"])
+async def rename_fund_api(fund_id: str, body: FundUpdateBody, _: str = Depends(verify_api_key)):
+    """Rename a fund."""
+    from funds import rename_fund
+    try:
+        fund = await _run_sync(rename_fund, fund_id, body.name)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    return _sanitize_floats(fund)
+
+
 @app.get("/funds", tags=["Funds"])
 async def list_funds_api(_: str = Depends(verify_api_key)):
     from funds import list_funds
