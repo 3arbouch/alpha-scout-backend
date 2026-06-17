@@ -4633,6 +4633,283 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
+# Funds — unitized NAV/share layer over a deployment
+# ---------------------------------------------------------------------------
+class FundCreateBody(_BM):
+    name: str = Field(min_length=1, max_length=200)
+    deployment_id: str = Field(min_length=1)
+    inception_date: str | None = Field(default=None, description="YYYY-MM-DD; defaults to the deployment start.")
+    base_nav_per_unit: float = Field(default=100.0, gt=0)
+    currency: str = Field(default="USD", max_length=8)
+
+
+@app.post("/funds", tags=["Funds"])
+async def create_fund_api(body: FundCreateBody, _: str = Depends(verify_api_key)):
+    """Create a fund wrapping a deployment. NAV/unit = the strategy return index rebased to base_nav_per_unit."""
+    from funds import create_fund
+    try:
+        fund = await _run_sync(
+            create_fund, body.name, body.deployment_id,
+            body.inception_date, body.base_nav_per_unit, body.currency)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return _sanitize_floats(fund)
+
+
+@app.get("/funds", tags=["Funds"])
+async def list_funds_api(_: str = Depends(verify_api_key)):
+    from funds import list_funds
+    funds = await _run_sync(list_funds)
+    return {"total": len(funds), "data": [_sanitize_floats(f) for f in funds]}
+
+
+@app.get("/funds/{fund_id}", tags=["Funds"])
+async def get_fund_api(fund_id: str, _: str = Depends(verify_api_key)):
+    from funds import get_fund
+    fund = await _run_sync(get_fund, fund_id)
+    if not fund:
+        raise HTTPException(404, f"Fund '{fund_id}' not found")
+    return _sanitize_floats(fund)
+
+
+@app.get("/funds/{fund_id}/nav", tags=["Funds"])
+async def get_fund_nav_api(
+    fund_id: str,
+    weekly: bool = Query(False, description="Weekly dealing NAV/unit instead of daily."),
+    published: bool = Query(False, description="Return the immutable published series instead of the live index."),
+    _: str = Depends(verify_api_key),
+):
+    """NAV/unit series for a fund (rebased so inception == base_nav_per_unit)."""
+    from funds import nav_per_unit_series, published_nav
+    try:
+        if published:
+            series = await _run_sync(published_nav, fund_id)
+        else:
+            series = await _run_sync(nav_per_unit_series, fund_id, weekly)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    return _sanitize_floats({"fund_id": fund_id, "points": len(series), "series": series})
+
+
+@app.post("/funds/{fund_id}/publish", tags=["Funds"])
+async def publish_fund_nav_api(fund_id: str, _: str = Depends(verify_api_key)):
+    """Snapshot the weekly NAV/unit into the immutable published series. Idempotent."""
+    from funds import publish_weekly
+    try:
+        return await _run_sync(publish_weekly, fund_id)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+class InvestorCreateBody(_BM):
+    name: str = Field(min_length=1, max_length=200)
+    email: str | None = None
+    notes: str | None = None
+
+
+@app.post("/investors", tags=["Funds"])
+async def create_investor_api(body: InvestorCreateBody, _: str = Depends(verify_api_key)):
+    from funds import create_investor
+    return _sanitize_floats(await _run_sync(create_investor, body.name, body.email, body.notes))
+
+
+@app.get("/investors", tags=["Funds"])
+async def list_investors_api(_: str = Depends(verify_api_key)):
+    from funds import list_investors
+    investors = await _run_sync(list_investors)
+    return {"total": len(investors), "data": investors}
+
+
+class SubscribeBody(_BM):
+    investor_id: str = Field(min_length=1)
+    amount: float = Field(gt=0)
+    as_of: str | None = Field(default=None, description="Dealing date YYYY-MM-DD; defaults to latest NAV.")
+
+
+@app.post("/funds/{fund_id}/subscribe", tags=["Funds"])
+async def subscribe_api(fund_id: str, body: SubscribeBody, _: str = Depends(verify_api_key)):
+    """Buy units worth `amount` at the dealing-date NAV/unit (units = amount / NAV)."""
+    from funds import subscribe
+    try:
+        return _sanitize_floats(await _run_sync(subscribe, fund_id, body.investor_id, body.amount, body.as_of))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+class RedeemBody(_BM):
+    investor_id: str = Field(min_length=1)
+    amount: float | None = Field(default=None, gt=0)
+    units: float | None = Field(default=None, gt=0)
+    as_of: str | None = None
+
+
+@app.post("/funds/{fund_id}/redeem", tags=["Funds"])
+async def redeem_api(fund_id: str, body: RedeemBody, _: str = Depends(verify_api_key)):
+    """Redeem by amount or units at the dealing-date NAV/unit."""
+    from funds import redeem
+    try:
+        return _sanitize_floats(await _run_sync(redeem, fund_id, body.investor_id, body.amount, body.units, body.as_of))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.get("/funds/{fund_id}/investors", tags=["Funds"])
+async def fund_investors_api(fund_id: str, _: str = Depends(verify_api_key)):
+    """All investor positions + reconciliation (Σ value == AUM)."""
+    from funds import fund_investors
+    try:
+        return _sanitize_floats(await _run_sync(fund_investors, fund_id))
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.get("/funds/{fund_id}/investors/{investor_id}/statement", tags=["Funds"])
+async def investor_statement_api(fund_id: str, investor_id: str, _: str = Depends(verify_api_key)):
+    """Per-account performance: value, $ gain, return on capital (simple + IRR), fund return."""
+    from funds import investor_statement
+    try:
+        return _sanitize_floats(await _run_sync(investor_statement, fund_id, investor_id))
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.get("/funds/{fund_id}/book", tags=["Funds"])
+async def fund_book_api(fund_id: str, _: str = Depends(verify_api_key)):
+    """The fund's REAL book (commingled): holdings from fills + cash from flows, marked to market."""
+    from funds import fund_actual_book
+    try:
+        return _sanitize_floats(await _run_sync(fund_actual_book, fund_id))
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.post("/funds/{fund_id}/orders/generate", tags=["Funds"])
+async def generate_orders_api(
+    fund_id: str,
+    whole: bool = Query(False, description="Whole (true) or fractional (false) shares."),
+    source: str = Query("daily", description="subscription|redemption|rebalance|daily (label only)."),
+    _: str = Depends(verify_api_key),
+):
+    """Generate the pending order batch to bring the real book to target weights × AUM."""
+    from funds import generate_orders
+    try:
+        return _sanitize_floats(await _run_sync(generate_orders, fund_id, whole, source))
+    except ValueError as e:
+        raise HTTPException(404 if "not found" in str(e).lower() else 400, str(e))
+
+
+@app.get("/funds/{fund_id}/orders", tags=["Funds"])
+async def list_orders_api(
+    fund_id: str,
+    status: Optional[str] = Query(None, description="pending|executed|cancelled"),
+    batch_id: Optional[str] = Query(None),
+    _: str = Depends(verify_api_key),
+):
+    """The execution blotter — pending orders are your IB to-do list."""
+    from funds import list_orders
+    orders = await _run_sync(list_orders, fund_id, status, batch_id)
+    return _sanitize_floats({"fund_id": fund_id, "total": len(orders), "data": orders})
+
+
+class FillBody(_BM):
+    fill_price: float | None = Field(default=None, gt=0)
+    fill_shares: float | None = Field(default=None, gt=0)
+
+
+@app.post("/funds/{fund_id}/orders/{order_id}/fill", tags=["Funds"])
+async def fill_order_api(fund_id: str, order_id: str, body: FillBody, _: str = Depends(verify_api_key)):
+    """Record an IB fill (defaults to the estimated price/shares if omitted)."""
+    from funds import record_fill
+    try:
+        return _sanitize_floats(await _run_sync(record_fill, order_id, body.fill_price, body.fill_shares))
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except PermissionError as e:
+        raise HTTPException(409, str(e))
+
+
+@app.post("/funds/{fund_id}/orders/batch/{batch_id}/fill", tags=["Funds"])
+async def fill_batch_api(fund_id: str, batch_id: str, _: str = Depends(verify_api_key)):
+    """Mark all pending orders in a batch executed at their estimated prices."""
+    from funds import fill_batch
+    return await _run_sync(fill_batch, batch_id)
+
+
+@app.get("/funds/{fund_id}/subscription-orders", tags=["Funds"])
+async def subscription_orders_api(
+    fund_id: str,
+    amount: float = Query(..., gt=0, description="Cash to invest ($)."),
+    whole: bool = Query(False, description="Whole shares (true) or fractional (false, default)."),
+    _: str = Depends(verify_api_key),
+):
+    """Preview the share orders to execute for a cash subscription (replicates the
+    fund's current holdings weights). Records nothing — pure preview for IB."""
+    from funds import subscription_orders
+    try:
+        return _sanitize_floats(await _run_sync(subscription_orders, fund_id, amount, whole))
+    except ValueError as e:
+        raise HTTPException(404 if "not found" in str(e).lower() else 400, str(e))
+
+
+@app.delete("/funds/{fund_id}", tags=["Funds"])
+async def delete_fund_api(
+    fund_id: str,
+    force: bool = Query(False, description="Delete even if investors still hold units."),
+    _: str = Depends(verify_api_key),
+):
+    """Delete a fund + its NAV history + transactions. 409 if investors hold units (unless force)."""
+    from funds import delete_fund
+    try:
+        return await _run_sync(delete_fund, fund_id, force)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except PermissionError as e:
+        raise HTTPException(409, str(e))
+
+
+@app.delete("/investors/{investor_id}", tags=["Funds"])
+async def delete_investor_api(
+    investor_id: str,
+    force: bool = Query(False, description="Delete even if the investor still holds units."),
+    _: str = Depends(verify_api_key),
+):
+    """Delete an investor + their transactions. 409 if they still hold units (unless force)."""
+    from funds import delete_investor
+    try:
+        return await _run_sync(delete_investor, investor_id, force)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except PermissionError as e:
+        raise HTTPException(409, str(e))
+
+
+@app.get("/funds/{fund_id}/report.pdf", tags=["Funds"])
+async def fund_report_pdf_api(fund_id: str, _: str = Depends(verify_api_key)):
+    """Fund tear sheet: NAV/unit chart, key stats, investor positions."""
+    from fastapi.responses import Response
+    from reports.fund_report import build_fund_report_pdf
+    pdf = await _run_sync(build_fund_report_pdf, fund_id)
+    if pdf is None:
+        raise HTTPException(404, f"Fund '{fund_id}' not found")
+    return Response(content=pdf, media_type="application/pdf",
+                    headers={"Content-Disposition": f'inline; filename="{fund_id}_fund.pdf"',
+                             "Cache-Control": "no-store"})
+
+
+@app.get("/funds/{fund_id}/investors/{investor_id}/statement.pdf", tags=["Funds"])
+async def investor_statement_pdf_api(fund_id: str, investor_id: str, _: str = Depends(verify_api_key)):
+    """Per-investor statement PDF: capital, value, gain, return on capital + IRR, fund return."""
+    from fastapi.responses import Response
+    from reports.fund_report import build_investor_statement_pdf
+    pdf = await _run_sync(build_investor_statement_pdf, fund_id, investor_id)
+    if pdf is None:
+        raise HTTPException(404, "Fund/investor not found or no transactions")
+    return Response(content=pdf, media_type="application/pdf",
+                    headers={"Content-Disposition": f'inline; filename="{investor_id}_statement.pdf"',
+                             "Cache-Control": "no-store"})
+
+
+# ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":

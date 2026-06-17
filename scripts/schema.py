@@ -678,6 +678,92 @@ CREATE INDEX IF NOT EXISTS idx_memo_items_kind ON memo_items(kind);
 
 
 # ---------------------------------------------------------------------------
+# Funds — unitized NAV/share layer over a deployment (strategy return index).
+# The fund NAV/unit is the deployment's cumulative-return index rebased to
+# base_nav_per_unit at inception; investor units are notional (Option A).
+# ---------------------------------------------------------------------------
+FUNDS = """
+CREATE TABLE IF NOT EXISTS funds (
+    id                  TEXT PRIMARY KEY,
+    name                TEXT NOT NULL,
+    deployment_id       TEXT NOT NULL,            -- FK → deployments.id (index source)
+    inception_date      TEXT NOT NULL,            -- date NAV/unit == base_nav_per_unit
+    base_nav_per_unit   REAL NOT NULL DEFAULT 100.0,
+    currency            TEXT NOT NULL DEFAULT 'USD',
+    dealing_frequency   TEXT NOT NULL DEFAULT 'weekly',  -- weekly|daily
+    status              TEXT NOT NULL DEFAULT 'active',   -- active|closed
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT
+);
+
+-- Published, immutable NAV/unit series (one row per dealing date). The live
+-- index is recomputed from the deployment, but published rows are never
+-- rewritten — they are what investors are priced against.
+CREATE TABLE IF NOT EXISTS fund_nav_history (
+    fund_id             TEXT NOT NULL,
+    date                TEXT NOT NULL,           -- dealing/publish date (e.g. Friday)
+    nav_per_unit        REAL NOT NULL,
+    deployment_nav      REAL,                    -- underlying strategy NAV that day (audit)
+    units_outstanding   REAL,                    -- total notional units issued
+    aum                 REAL,                    -- units_outstanding * nav_per_unit
+    created_at          TEXT NOT NULL,
+    PRIMARY KEY (fund_id, date)
+);
+CREATE INDEX IF NOT EXISTS idx_fund_nav_history_fund ON fund_nav_history(fund_id, date);
+
+CREATE TABLE IF NOT EXISTS investors (
+    id          TEXT PRIMARY KEY,
+    name        TEXT NOT NULL,
+    email       TEXT,
+    notes       TEXT,
+    created_at  TEXT NOT NULL
+);
+
+-- The units ledger. One row per subscription/redemption. Units and amount are
+-- SIGNED: subscription positive, redemption negative — so SUM(units) is the
+-- holding and SUM(amount) is net capital invested. Units are fractional.
+CREATE TABLE IF NOT EXISTS investor_transactions (
+    id            TEXT PRIMARY KEY,
+    investor_id   TEXT NOT NULL,
+    fund_id       TEXT NOT NULL,
+    date          TEXT NOT NULL,            -- dealing date the trade is priced at
+    type          TEXT NOT NULL,            -- subscription|redemption
+    amount        REAL NOT NULL,            -- signed $ (sub +, redemption -)
+    nav_per_unit  REAL NOT NULL,            -- NAV/unit on the dealing date
+    units         REAL NOT NULL,            -- signed units (sub +, redemption -)
+    created_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_inv_tx_investor ON investor_transactions(investor_id, fund_id);
+CREATE INDEX IF NOT EXISTS idx_inv_tx_fund ON investor_transactions(fund_id);
+
+-- Execution blotter for a commingled fund (one pooled IB account). Each
+-- daily generation writes a batch of orders to bring the fund's real book
+-- (cash from subscriptions + prior fills) to the deployed target weights.
+-- Execute in IB, then record the fill — the executed rows ARE the fund's
+-- real positions.
+CREATE TABLE IF NOT EXISTS fund_orders (
+    id            TEXT PRIMARY KEY,
+    fund_id       TEXT NOT NULL,
+    batch_id      TEXT NOT NULL,            -- one generation run
+    batch_date    TEXT NOT NULL,            -- pricing/as-of date
+    source        TEXT NOT NULL,            -- subscription|redemption|rebalance|daily
+    symbol        TEXT NOT NULL,
+    side          TEXT NOT NULL,            -- BUY|SELL
+    shares        REAL NOT NULL,            -- positive magnitude to trade
+    est_price     REAL,
+    est_value     REAL,
+    status        TEXT NOT NULL DEFAULT 'pending',  -- pending|executed|cancelled
+    fill_price    REAL,
+    fill_shares   REAL,
+    fill_time     TEXT,
+    created_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_fund_orders_fund ON fund_orders(fund_id, status);
+CREATE INDEX IF NOT EXISTS idx_fund_orders_batch ON fund_orders(batch_id);
+"""
+
+
+# ---------------------------------------------------------------------------
 # All schemas combined
 # ---------------------------------------------------------------------------
 
@@ -698,6 +784,7 @@ ALL_SCHEMAS = [
     ANALYST_MEMOS,
     MEMO_ITEMS,
     EXPERIMENTS,
+    FUNDS,
     LEGACY,
     # Note: universe_profiles is in market.db, not app.db — managed by server/api.py
 ]
