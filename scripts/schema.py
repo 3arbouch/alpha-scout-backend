@@ -470,6 +470,10 @@ CREATE TABLE IF NOT EXISTS experiments (
     -- Walk-forward eval block: per-window metrics + aggregates as JSON.
     -- NULL when no eval was configured for the run.
     eval_metrics_json               TEXT,
+    -- Full training-period metrics dict as JSON (every metric the backtest
+    -- produced, incl. benchmark-relative beta/TE/IR/vol-ratio). Lets the UI
+    -- show any metric without a column per metric.
+    training_metrics_json           TEXT,
     -- Backtest metrics
     total_return_pct                REAL,
     annualized_return_pct           REAL,
@@ -959,6 +963,8 @@ def _apply_migrations(conn: sqlite3.Connection):
         # plus the aggregator name so target_value semantics are recoverable.
         _add_column_if_missing(conn, "experiments", "eval_metrics_json", "TEXT")
         _add_column_if_missing(conn, "experiments", "target_aggregator", "TEXT")
+        # Full training-period metrics dict as JSON (any metric, no per-metric column).
+        _add_column_if_missing(conn, "experiments", "training_metrics_json", "TEXT")
     if "trades" in existing_tables:
         # NULL = training-period trade (today's behavior). Non-null =
         # 'YYYY-MM-DD_YYYY-MM-DD' label of the eval window this trade belongs to.

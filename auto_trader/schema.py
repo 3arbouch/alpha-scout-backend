@@ -8,10 +8,22 @@ Stores the thesis, portfolio config, backtest metrics, and KEEP/DISCARD decision
 import os
 import sys
 import json
+import math
 import sqlite3
 import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
+
+
+def _json_safe(obj):
+    """Recursively replace non-finite floats with None so the JSON is strict-valid."""
+    if isinstance(obj, float):
+        return obj if math.isfinite(obj) else None
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_json_safe(v) for v in obj]
+    return obj
 
 APP_DB_PATH = Path(os.environ.get("APP_DB_PATH",
     os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "app.db")))
@@ -78,7 +90,7 @@ def log_experiment(
         """INSERT INTO experiments
            (id, run_id, iteration, thesis, assumptions, lessons, portfolio_id, portfolio_config,
             target_metric, target_aggregator, target_value, conditions, conditions_met,
-            eval_metrics_json,
+            eval_metrics_json, training_metrics_json,
             total_return_pct, annualized_return_pct,
             sharpe_ratio, sharpe_basis, sharpe_ratio_annualized, sharpe_ratio_period,
             sortino_ratio,
@@ -91,11 +103,11 @@ def log_experiment(
             backtest_start, backtest_end, initial_capital,
             model, session_id, tokens_used, duration_seconds, error,
             smoothing_summary, created_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (exp_id, run_id, iteration,
          thesis, json.dumps(assumptions), lessons, portfolio_id, json.dumps(portfolio_config),
          target_metric, target_aggregator, target_value, json.dumps(conditions), 1 if conditions_met else 0,
-         eval_metrics_json,
+         eval_metrics_json, json.dumps(_json_safe(metrics)),
          metrics.get("total_return_pct"), metrics.get("annualized_return_pct"),
          metrics.get("sharpe_ratio"),
          metrics.get("sharpe_basis"),
