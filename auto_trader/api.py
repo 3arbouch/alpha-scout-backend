@@ -1405,7 +1405,8 @@ async def list_experiments(
                    sector_benchmark_return_pct, sector_benchmark_ann_return_pct,
                    profit_factor, win_rate_pct, total_trades,
                    decision, best_value_so_far, improvement_pct,
-                   session_id, duration_seconds, created_at
+                   session_id, duration_seconds, created_at,
+                   training_metrics_json
             FROM experiments
             {where}
             ORDER BY iteration
@@ -1418,6 +1419,15 @@ async def list_experiments(
     for r in rows:
         d = dict(r)
         d["experiment_number"] = d.pop("iteration")
+        # Parse the full-metrics blob so the table can show any metric
+        # (beta/TE/IR/vol-ratio) without a column per metric.
+        raw_tm = d.pop("training_metrics_json", None)
+        d["training_metrics"] = None
+        if raw_tm:
+            try:
+                d["training_metrics"] = json.loads(raw_tm)
+            except (json.JSONDecodeError, TypeError):
+                pass
         data.append(d)
 
     return {
@@ -1449,6 +1459,16 @@ async def get_experiment(run_id: str, experiment_id: str):
                 result[field] = json.loads(result[field])
             except (json.JSONDecodeError, TypeError):
                 pass
+
+    # Full training-period metrics (every metric incl. beta/TE/IR/vol-ratio),
+    # parsed from the JSON blob into `training_metrics`.
+    raw_tm = result.pop("training_metrics_json", None)
+    result["training_metrics"] = None
+    if raw_tm:
+        try:
+            result["training_metrics"] = json.loads(raw_tm)
+        except (json.JSONDecodeError, TypeError):
+            pass
 
     return result
 
