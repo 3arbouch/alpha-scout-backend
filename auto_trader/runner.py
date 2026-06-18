@@ -192,6 +192,66 @@ def _resolve_allowed_mcp_tools() -> list[str]:
     return [mcp_tool_id(n) for n in names]
 
 
+# Value-neutral, mechanical descriptions of each rebalancing Literal value.
+# The legal *values* are introspected from RebalancingConfig (the schema is the
+# single source of truth); these only supply human-readable behavior text. A new
+# Literal value renders even without an entry here (shown with a '—' placeholder),
+# so the catalog can never silently omit a supported value.
+_REBAL_FREQUENCY_DESC = {
+    "none":        "never re-evaluates after entry",
+    "weekly":      "re-checks ~every 7 calendar days",
+    "monthly":     "re-checks ~every 30 calendar days",
+    "quarterly":   "re-checks ~every 90 calendar days",
+    "on_earnings": "re-checks on each holding's earnings date",
+}
+_REBAL_MODE_DESC = {
+    "trim":         "trims overweight / earnings-flagged positions toward max_position_pct; holdings set unchanged",
+    "equal_weight": "re-ranks and holds ranking.top_n at equal weight every check",
+    "target_weight": "rebalances toward explicit target weights, skipping positions within rebalance_band_pct of target",
+    "rank_buffer":  "rank hysteresis (buy when rank ≤ entry_rank, sell when rank falls past exit_rank); lowest turnover",
+}
+
+
+def _load_rebalance_catalog() -> str:
+    """Build the Rebalancing Options block from the config schema.
+
+    Values are introspected from the Literal annotations on RebalancingConfig
+    so a newly-supported frequency/mode appears automatically — no prompt edit.
+    Descriptions come from the maps above; a value with no description still
+    renders (with '—') rather than being dropped.
+    """
+    try:
+        from typing import get_args
+        sys.path.insert(0, str(Path(__file__).parent.parent))
+        from server.models.strategy import RebalancingConfig
+
+        def _table(field: str, desc: dict) -> list[str]:
+            f = RebalancingConfig.model_fields[field]
+            values = get_args(f.annotation)
+            default = f.default
+            width = max(len(v) for v in values)
+            lines = []
+            for v in values:
+                tag = "  (default)" if v == default else ""
+                lines.append(f"  {v.ljust(width)}  {desc.get(v, '—')}{tag}")
+            return lines
+
+        out = [
+            "### Rebalancing Options",
+            "(`rebalancing.frequency` / `rebalancing.mode` — values from the config schema; "
+            "see the Schema block for full rules/fields)",
+            "",
+            "frequency — how often the rebalance/buffer check fires:",
+            *_table("frequency", _REBAL_FREQUENCY_DESC),
+            "",
+            "mode — what the check does when it fires:",
+            *_table("mode", _REBAL_MODE_DESC),
+        ]
+        return "\n".join(out)
+    except Exception as e:
+        return f"### Rebalancing Options\n(Failed to load: {e})"
+
+
 def _resolve_model_api_id(model_id: str) -> str:
     """Map a short model id ('opus', 'opus-4-7') to its full Anthropic API id.
 
@@ -234,8 +294,9 @@ def load_program(agent_prompt: str | None = None) -> str:
 
     schemas = _load_schemas()
     catalog = _load_factor_catalog()
+    rebalance_catalog = _load_rebalance_catalog()
 
-    parts = [agent_prompt, system_instructions, catalog, schemas]
+    parts = [agent_prompt, system_instructions, rebalance_catalog, catalog, schemas]
     return "\n\n---\n\n".join(p for p in parts if p)
 
 
