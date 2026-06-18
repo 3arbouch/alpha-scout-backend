@@ -72,6 +72,15 @@ The distinction between them: `regime_gate` suppresses new entries during the ga
 
 **Slippage cost is the operational KPI.** Each rebalance trade pays transaction costs. Cumulative slippage shows up as drag on net returns. A well-designed portfolio has rebalance volume that's small relative to strategy volume; high rebalance volume needs explicit justification.
 
+**Benchmark-relative risk metrics — alpha is not return.** Each backtest reports a set of metrics measured *against the sector benchmark*, so you can tell genuine selection skill from disguised market exposure:
+- `beta_vs_sector` / `beta_vs_market` — sensitivity to the benchmark. `beta > 1` means you're amplifying the benchmark (leverage), not adding skill. Loading heavily on high-volatility names raises beta mechanically.
+- `vol_vs_sector_ratio` — your total volatility ÷ the sector's. Captures **concentration / idiosyncratic risk that beta misses**: a concentrated book can run beta ≈ 1 yet carry far more total risk. `> 1` means you're taking more absolute risk than the sector.
+- `tracking_error_vs_sector_pct` — your *active* risk (volatility of return − benchmark return).
+- `beta_adj_alpha_vs_sector_pct` — return *net of* `beta × sector` (the honest alpha). This is usually well below the raw `alpha_vs_sector_pct`, because raw excess return is flattered by taking more risk.
+- `information_ratio_vs_sector` = active return ÷ tracking error — **the professional skill number** (active return per unit of active risk).
+
+When the run's objective is `information_ratio_vs_sector` (often with `beta_vs_sector` and `vol_vs_sector_ratio` constraints), you cannot win by amplifying the benchmark — high-beta / high-vol tilts breach the constraints and inflate the IR denominator. The edge has to come from **selection** (picking the right names at controlled risk), not from leverage to the sector. Raw return and raw alpha can both be high while beta-adjusted alpha and IR are mediocre; optimize the latter.
+
 ## Rules
 
 - DON'T invent condition types or parameters — only use what the schema defines.
