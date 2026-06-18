@@ -1150,6 +1150,159 @@ async def get_run_report(run_id: str):
     return _row_to_report(row)
 
 
+# ---------------------------------------------------------------------------
+# Run OOS evaluation — re-run a run's kept survivors over a single window and
+# compare each survivor's out-of-sample result to its in-sample (training) one.
+# The parallel backtest job lives in auto_trader/oos_eval.py. Engine: v2 only.
+# ---------------------------------------------------------------------------
+class OOSEvalRequest(BaseModel):
+    eval_start: str = Field(..., description="OOS window start (YYYY-MM-DD)")
+    eval_end: str = Field(..., description="OOS window end (YYYY-MM-DD)")
+    recompute_is: bool = Field(
+        False,
+        description="Recompute each survivor's IS metrics over its training window with v2 "
+                    "(default: use the stored selection-time IS metrics).",
+    )
+
+
+def _spawn_oos_eval(eval_id: str) -> None:
+    """Run the parallel OOS backtests in a detached subprocess (CPU-bound)."""
+    script = PROJECT_ROOT / "auto_trader" / "oos_eval.py"
+    log_file = PROJECT_ROOT / "logs" / f"oos_eval_{eval_id}.log"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_file, "a") as lf:
+        subprocess.Popen(
+            [sys.executable, "-u", str(script), "run", eval_id],
+            stdout=lf, stderr=subprocess.STDOUT, env=os.environ.copy(),
+            cwd=str(PROJECT_ROOT), start_new_session=True,
+        )
+
+
+@router.post("/runs/{run_id}/oos-evals", status_code=201)
+async def create_oos_eval(run_id: str, body: OOSEvalRequest):
+    """Evaluate every kept (decision='keep') experiment of a run over one OOS window.
+
+    Returns immediately with the batch id; the parallel backtests run in a
+    background subprocess. Poll GET /oos-evals/{eval_id} for status + results.
+    """
+    from auto_trader.oos_eval import create_eval
+    try:
+        res = create_eval(run_id, body.eval_start, body.eval_end, body.recompute_is)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    _spawn_oos_eval(res["eval_id"])
+    return res
+
+
+@router.get("/runs/{run_id}/oos-evals")
+async def list_oos_evals(run_id: str):
+    """List OOS-eval batches for a run (summaries; newest first)."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM run_oos_evals WHERE run_id = ? ORDER BY created_at DESC", (run_id,)
+    ).fetchall()
+    conn.close()
+    return {"run_id": run_id, "evals": [dict(r) for r in rows]}
+
+
+def _oos_result_row(r) -> dict:
+    """Assemble one survivor's IS↔OOS comparison from a joined row."""
+    return {
+        "experiment_id": r["experiment_id"],
+        "portfolio_id": r["portfolio_id"],
+        "iteration": r["iteration"],
+        "thesis": r["thesis"],
+        "status": r["status"],
+        "error": r["error"],
+        "overlaps_training": bool(r["overlaps_training"]),
+        "is": {
+            "sharpe_ratio_annualized": r["is_sharpe_ratio_annualized"],
+            "annualized_return_pct": r["is_annualized_return_pct"],
+            "total_return_pct": r["is_total_return_pct"],
+            "max_drawdown_pct": r["is_max_drawdown_pct"],
+            "annualized_volatility_pct": r["is_annualized_volatility_pct"],
+            "alpha_ann_pct": r["is_alpha_ann_pct"],
+        },
+        "oos": {
+            "sharpe_ratio_annualized": r["oos_sharpe_ratio_annualized"],
+            "annualized_return_pct": r["oos_annualized_return_pct"],
+            "total_return_pct": r["oos_total_return_pct"],
+            "max_drawdown_pct": r["oos_max_drawdown_pct"],
+            "annualized_volatility_pct": r["oos_annualized_volatility_pct"],
+            "alpha_ann_pct": r["oos_alpha_ann_pct"],
+        },
+        "delta": {"d_sharpe_ann": r["d_sharpe_ann"], "sharpe_retention": r["sharpe_retention"]},
+    }
+
+
+@router.get("/oos-evals/{eval_id}")
+async def get_oos_eval(eval_id: str):
+    """Full OOS-eval batch: cohort diagnostics + per-survivor IS↔OOS comparison.
+
+    Raw NAV/trade series are excluded here (kept light); fetch them per survivor
+    via /oos-evals/{eval_id}/results/{experiment_id}.
+    """
+    conn = get_db()
+    batch = conn.execute("SELECT * FROM run_oos_evals WHERE id = ?", (eval_id,)).fetchone()
+    if not batch:
+        conn.close()
+        raise HTTPException(404, f"OOS eval '{eval_id}' not found")
+    rows = conn.execute(
+        """SELECT r.experiment_id, r.portfolio_id, r.iteration, r.status, r.error,
+                  r.overlaps_training, r.d_sharpe_ann, r.sharpe_retention,
+                  r.oos_sharpe_ratio_annualized, r.oos_annualized_return_pct,
+                  r.oos_total_return_pct, r.oos_max_drawdown_pct,
+                  r.oos_annualized_volatility_pct, r.oos_alpha_ann_pct,
+                  e.thesis AS thesis,
+                  e.sharpe_ratio_annualized AS is_sharpe_ratio_annualized,
+                  e.annualized_return_pct   AS is_annualized_return_pct,
+                  e.total_return_pct        AS is_total_return_pct,
+                  e.max_drawdown_pct        AS is_max_drawdown_pct,
+                  e.annualized_volatility_pct AS is_annualized_volatility_pct,
+                  e.alpha_ann_pct           AS is_alpha_ann_pct
+           FROM experiment_oos_results r
+           JOIN experiments e ON e.id = r.experiment_id
+           WHERE r.eval_id = ?
+           ORDER BY r.oos_sharpe_ratio_annualized IS NULL,
+                    r.oos_sharpe_ratio_annualized DESC""", (eval_id,)).fetchall()
+    conn.close()
+    b = dict(batch)
+    return {
+        "eval_id": b["id"], "run_id": b["run_id"],
+        "eval_start": b["eval_start"], "eval_end": b["eval_end"],
+        "recompute_is": bool(b["recompute_is"]),
+        "status": b["status"], "engine_version": b["engine_version"],
+        "n_experiments": b["n_experiments"], "n_done": b["n_done"], "n_error": b["n_error"],
+        "cohort": {
+            "is_oos_rank_corr": b["is_oos_rank_corr"],
+            "oos_sharpe_mean": b["oos_sharpe_mean"],
+            "oos_sharpe_std": b["oos_sharpe_std"],
+            "n": b["n_done"],
+        },
+        "results": [_oos_result_row(r) for r in rows],
+    }
+
+
+@router.get("/oos-evals/{eval_id}/results/{experiment_id}")
+async def get_oos_eval_result(eval_id: str, experiment_id: str):
+    """Raw OOS result for one survivor — full metrics + NAV/trade series for plotting."""
+    conn = get_db()
+    r = conn.execute(
+        "SELECT * FROM experiment_oos_results WHERE eval_id = ? AND experiment_id = ?",
+        (eval_id, experiment_id)).fetchone()
+    conn.close()
+    if not r:
+        raise HTTPException(404, f"No OOS result for experiment '{experiment_id}' in eval '{eval_id}'")
+    d = dict(r)
+    for jk in ("oos_metrics_json", "is_metrics_json", "raw_result_json"):
+        raw = d.pop(jk, None)
+        try:
+            d[jk.replace("_json", "")] = json.loads(raw) if raw else None
+        except (json.JSONDecodeError, TypeError):
+            d[jk.replace("_json", "")] = None
+    return d
+
+
 def _row_to_lesson(r) -> dict:
     d = dict(r)
     d["source_runs"] = json.loads(d["source_runs"]) if d.get("source_runs") else []

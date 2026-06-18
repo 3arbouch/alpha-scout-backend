@@ -738,6 +738,89 @@ CREATE INDEX IF NOT EXISTS idx_lesson_library_reps ON lesson_library(repetition_
 
 
 # ---------------------------------------------------------------------------
+# Run OOS evaluation — re-run a run's kept (decision='keep') experiments over a
+# single user-selected window and compare each survivor's out-of-sample result
+# to its in-sample (training) result. One `run_oos_evals` batch per (run, window)
+# trigger; one `experiment_oos_results` row per survivor. Engine is always v2.
+#
+# Storage tiers: the 19 canonical metrics are promoted to typed `oos_*` columns
+# (mirroring the `experiments` table, so IS↔OOS is a direct column comparison);
+# the full metrics dict rides in oos_metrics_json; the heavy series (nav/trades/
+# benchmark) ride in raw_result_json (fetched on demand, kept out of summaries).
+# IS baseline is JOINed from `experiments` (default) or, when recompute_is=1,
+# recomputed over the training window with v2 and stored in is_metrics_json.
+# ---------------------------------------------------------------------------
+RUN_OOS_EVALS = """
+CREATE TABLE IF NOT EXISTS run_oos_evals (
+    id                TEXT PRIMARY KEY,             -- batch id (one per run+window trigger)
+    run_id            TEXT NOT NULL,
+    eval_start        TEXT NOT NULL,
+    eval_end          TEXT NOT NULL,
+    recompute_is      INTEGER NOT NULL DEFAULT 0,
+    status            TEXT NOT NULL DEFAULT 'running', -- running | done | error
+    n_experiments     INTEGER NOT NULL DEFAULT 0,
+    n_done            INTEGER NOT NULL DEFAULT 0,
+    n_error           INTEGER NOT NULL DEFAULT 0,
+    -- cohort diagnostics (filled when done):
+    is_oos_rank_corr  REAL,                          -- Spearman IS-rank vs OOS-rank (headline)
+    oos_sharpe_mean   REAL,
+    oos_sharpe_std    REAL,                          -- cohort dispersion
+    engine_version    TEXT NOT NULL DEFAULT 'v2',
+    error             TEXT,
+    created_at        TEXT NOT NULL,
+    updated_at        TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES auto_trader_runs(id)
+);
+CREATE INDEX IF NOT EXISTS idx_run_oos_evals_run ON run_oos_evals(run_id);
+
+CREATE TABLE IF NOT EXISTS experiment_oos_results (
+    id                  TEXT PRIMARY KEY,
+    eval_id             TEXT NOT NULL,               -- FK → run_oos_evals.id
+    run_id              TEXT NOT NULL,
+    experiment_id       TEXT NOT NULL,               -- FK → experiments.id
+    portfolio_id        TEXT,
+    iteration           INTEGER,
+    overlaps_training   INTEGER NOT NULL DEFAULT 0,  -- 1 if window overlaps this exp's IS window
+    status              TEXT NOT NULL DEFAULT 'pending', -- pending | done | error
+    error               TEXT,
+    -- OOS metrics (mirror the 19 canonical experiments columns, prefixed oos_):
+    oos_total_return_pct            REAL,
+    oos_annualized_return_pct       REAL,
+    oos_sharpe_ratio                REAL,
+    oos_sharpe_basis                TEXT,
+    oos_sharpe_ratio_annualized     REAL,
+    oos_sharpe_ratio_period         REAL,
+    oos_sortino_ratio               REAL,
+    oos_max_drawdown_pct            REAL,
+    oos_annualized_volatility_pct   REAL,
+    oos_alpha_ann_pct               REAL,
+    oos_alpha_vs_market_pct         REAL,
+    oos_alpha_vs_sector_pct         REAL,
+    oos_market_benchmark_return_pct REAL,
+    oos_market_benchmark_ann_return_pct REAL,
+    oos_sector_benchmark_return_pct REAL,
+    oos_sector_benchmark_ann_return_pct REAL,
+    oos_profit_factor               REAL,
+    oos_win_rate_pct                REAL,
+    oos_total_trades                INTEGER,
+    -- per-strategy deviation (IS→OOS):
+    d_sharpe_ann        REAL,                        -- oos_sharpe_ann - is_sharpe_ann
+    sharpe_retention    REAL,                        -- oos_sharpe_ann / is_sharpe_ann
+    -- full payloads:
+    oos_metrics_json    TEXT,                        -- all metrics from the backtest
+    is_metrics_json     TEXT,                        -- only when recompute_is=1
+    raw_result_json     TEXT,                        -- nav_history + trades + benchmark series
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL,
+    FOREIGN KEY (eval_id) REFERENCES run_oos_evals(id),
+    FOREIGN KEY (experiment_id) REFERENCES experiments(id)
+);
+CREATE INDEX IF NOT EXISTS idx_exp_oos_results_eval ON experiment_oos_results(eval_id);
+CREATE INDEX IF NOT EXISTS idx_exp_oos_results_run ON experiment_oos_results(run_id);
+"""
+
+
+# ---------------------------------------------------------------------------
 # Funds — unitized NAV/share layer over a deployment (strategy return index).
 # The fund NAV/unit is the deployment's cumulative-return index rebased to
 # base_nav_per_unit at inception; investor units are notional (Option A).
@@ -846,6 +929,7 @@ ALL_SCHEMAS = [
     EXPERIMENTS,
     RUN_REPORTS,
     LESSON_LIBRARY,
+    RUN_OOS_EVALS,
     FUNDS,
     LEGACY,
     # Note: universe_profiles is in market.db, not app.db — managed by server/api.py
