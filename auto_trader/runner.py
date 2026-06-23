@@ -833,16 +833,12 @@ def _run_one_backtest(portfolio_config: dict, start: str, end: str, capital: flo
     This is the unit of work — `run_backtest` calls this once for the training
     period and N more times for each eval sub-window (when configured).
 
-    Engine dispatch: default is v2 (the unified-position-book engine that all
-    live deployments run). Set `engine_version: "v1"` on the portfolio config
-    to opt back into the legacy engine. Keeping the agent on the same engine
-    as deployments prevents optimize-vs-deploy metric drift.
+    Engine: v2 (the unified-position-book engine that all live deployments
+    run) is the only engine. Keeping the agent on the same engine as
+    deployments prevents optimize-vs-deploy metric drift.
     """
     try:
-        if portfolio_config.get("engine_version") == "v1":
-            from portfolio_engine import run_portfolio_backtest
-        else:
-            from portfolio_engine_v2 import run_portfolio_backtest
+        from portfolio_engine_v2 import run_portfolio_backtest
         from backtest_engine import compute_benchmark, SECTOR_ETF_MAP
 
         config = normalize_config(portfolio_config)
@@ -915,11 +911,9 @@ def _run_one_backtest(portfolio_config: dict, start: str, end: str, capital: flo
             for i, sr in enumerate(sleeve_results)
         ]
 
-        # Surface which engine actually executed — observability + audit.
-        # v2 tags its result with engine_version="v2"; v1 doesn't tag (legacy).
-        engine_version = result.get("engine_version") or (
-            "v1" if portfolio_config.get("engine_version") == "v1" else "v2"
-        )
+        # Surface which engine executed — observability + audit. v2 is the
+        # only engine; it tags its own result, fall back to "v2" defensively.
+        engine_version = result.get("engine_version") or "v2"
 
         return {
             "metrics": metrics,

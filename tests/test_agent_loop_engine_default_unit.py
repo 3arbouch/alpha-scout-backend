@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-Verifies the agent loop uses engine v2 by default.
+Verifies the agent loop always uses engine v2.
 
 Today's behavior: `runner._run_one_backtest` imports `run_portfolio_backtest`
-from `portfolio_engine_v2` UNLESS the portfolio config sets
-`engine_version: "v1"` (explicit opt-out).
+from `portfolio_engine_v2` unconditionally. The legacy v1 engine has been
+decommissioned, so the `engine_version` field is ignored — even an explicit
+`engine_version: "v1"` runs on v2.
 
 This is the operationally-load-bearing thing — the metrics the agent climbs
 must come from the same engine deployments run, otherwise we get
@@ -98,9 +99,9 @@ check("no engine_version → v2 (new default)",
       call_runner(engine_version=None) == "v2")
 check("engine_version='v2' → v2",
       call_runner(engine_version="v2") == "v2")
-check("engine_version='v1' → v1 (explicit opt-out)",
-      call_runner(engine_version="v1") == "v1")
-check("engine_version='bogus' → v2 (anything not 'v1' → default)",
+check("engine_version='v1' → v2 (v1 decommissioned, field ignored)",
+      call_runner(engine_version="v1") == "v2")
+check("engine_version='bogus' → v2 (field ignored)",
       call_runner(engine_version="bogus") == "v2")
 
 

@@ -129,16 +129,16 @@ class PortfolioConfig(BaseModel):
     name: str = Field(min_length=1)
     sleeves: list[SleeveConfig] = Field(min_length=1)
 
-    # Execution engine selection (Phase 2 unified position book rollout).
-    # v1 = legacy per-sleeve standalone-simulation + portfolio-level lerp
-    #      (default; backward compatible)
-    # v2 = unified PositionBook with clean broker-equivalent trade ledger
-    #      (no dual-bookkeeping, no phantom trades on gated days,
-    #      cum_shares structurally non-negative)
+    # Execution engine. v2 (unified PositionBook with a clean broker-equivalent
+    # trade ledger — no dual-bookkeeping, no phantom trades on gated days,
+    # cum_shares structurally non-negative) is the only engine. The legacy v1
+    # per-sleeve simulation has been decommissioned; this field is retained for
+    # backward compatibility and any value is treated as v2.
     engine_version: Literal["v1", "v2"] = Field(
-        default="v1",
-        description="Backtest/deploy engine. Default v1; set 'v2' to opt in "
-                    "to the unified-position-book executor (Phase 2 rollout).",
+        default="v2",
+        description="Deprecated/ignored. v2 (the unified-position-book "
+                    "executor) is the only engine; retained for backward "
+                    "compatibility and any 'v1' value is treated as v2.",
     )
 
     @model_validator(mode="before")
