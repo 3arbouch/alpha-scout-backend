@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """
-V2 engine_version router.
+V2 is the only engine.
 
-The API + deploy_engine + agent loop route a portfolio backtest to v1 or v2
-based on `config.engine_version`. Default is **v2** (the unified-position-book
-engine, what all live deployments and the agent loop run). Set
-engine_version="v1" to opt back into the legacy engine.
+The legacy v1 engine has been decommissioned. The API + deploy_engine +
+agent loop always run the v2 unified-position-book engine; the
+`config.engine_version` field is retained for backward compatibility but is
+ignored (any value — including "v1" — runs on v2).
 
 This test verifies:
-  - Default routing (no engine_version) → v2
-  - engine_version="v1" explicit → v1
-  - engine_version="v2" explicit → v2
-  - Both engines accept the same input shape
-  - Both return the same top-level response shape (trades, metrics,
-    sleeve_results, etc) so downstream UI code doesn't break
+  - Default config (no engine_version) → v2
+  - engine_version="v1" → v2 (field ignored, not an opt-out anymore)
+  - engine_version="v2" → v2
+  - Setting engine_version doesn't perturb results
+  - v2's response shape (trades, metrics, sleeve_results, etc)
 
-We don't reach through the FastAPI HTTP layer — we directly call the
-router function `_run_portfolio_bt` from server/api.py. That exercises
-exactly the path the API uses.
+We don't reach through the FastAPI HTTP layer — we mirror the now-trivial
+`_run_portfolio_bt` from server/api.py, which always calls v2.
+
+(Numerical v1-vs-v2 parity is covered separately by test_v1_v2_parity_e2e.py,
+which calls both executors directly.)
 
 Run:
     cd /home/mohamed/alpha-scout-backend-dev/tests
@@ -53,16 +54,13 @@ spec = importlib.util.spec_from_file_location(
     "_api_router",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "server", "api.py"),
 )
-# Hack: don't fully load api.py (it spins up FastAPI). Pull just the router
-# function and its dependencies via direct re-imports.
-from portfolio_engine import run_portfolio_backtest as run_v1
+# Hack: don't fully load api.py (it spins up FastAPI). Pull just the engine
+# function via direct re-import.
 from portfolio_engine_v2 import run_portfolio_backtest as run_v2
 
 
 def routed_run(config: dict, force_close_at_end: bool = True):
-    """Mirror server/api.py:_run_portfolio_bt routing — v2 default, v1 opt-out."""
-    if (config or {}).get("engine_version") == "v1":
-        return run_v1(config, force_close_at_end=force_close_at_end)
+    """Mirror server/api.py:_run_portfolio_bt — v2 is the only engine."""
     return run_v2(config, force_close_at_end=force_close_at_end)
 
 
@@ -114,12 +112,13 @@ check("default response includes engine_version=v2 tag (default is v2)",
 
 
 # ---------------------------------------------------------------------------
-# 2. engine_version="v1" explicit → v1 (opt-out)
+# 2. engine_version="v1" → V2 (field ignored, not an opt-out anymore)
 # ---------------------------------------------------------------------------
-print("\n=== 2. engine_version='v1' explicit routes to V1 (opt-out) ===")
+print("\n=== 2. engine_version='v1' is ignored, routes to V2 ===")
 r_v1 = routed_run(base_cfg(engine_version="v1"))
-check("explicit v1 missing 'engine_version' in response (v1 doesn't tag)",
-      "engine_version" not in r_v1)
+check("explicit v1 still runs v2 (tagged engine_version=v2)",
+      r_v1.get("engine_version") == "v2",
+      f"got engine_version={r_v1.get('engine_version')}")
 
 
 # ---------------------------------------------------------------------------
@@ -140,13 +139,10 @@ required_shared = ["metrics", "sleeve_results", "per_sleeve", "config"]
 for k in required_shared:
     check(f"default(v2) response has '{k}'", k in r_default,
           f"keys: {sorted(r_default.keys())[:6]}")
-    check(f"explicit-v1 response has '{k}'", k in r_v1,
+    check(f"v1-cfg(→v2) response has '{k}'", k in r_v1,
           f"keys: {sorted(r_v1.keys())[:6]}")
-# v2-specific top-level convenience block; v1 lives inside config["backtest"]
 check("default(v2) response has 'backtest' top-level convenience",
       "backtest" in r_default)
-check("v1 has backtest info via config.backtest",
-      r_v1.get("config", {}).get("backtest") is not None)
 
 check("both responses have len(sleeve_results) == 1",
       len(r_default.get("sleeve_results", [])) == 1
@@ -154,17 +150,17 @@ check("both responses have len(sleeve_results) == 1",
 
 
 # ---------------------------------------------------------------------------
-# 5. For a no-regime config, v1 and v2 produce comparable metrics
+# 5. Setting engine_version doesn't perturb results — all run on v2
 # ---------------------------------------------------------------------------
-print("\n=== 5. v1 vs v2 metrics agree on no-regime config ===")
+print("\n=== 5. engine_version field is inert (v1/v2/default all agree) ===")
 m1 = r_v1.get("metrics") or {}
 m2 = r_v2.get("metrics") or {}
 for k in ("total_return_pct", "max_drawdown_pct"):
-    v1 = m1.get(k)
-    v2 = m2.get(k)
-    check(f"metrics.{k} parity (v1={v1}, v2={v2})",
-          v1 == v2,
-          f"v1={v1} v2={v2}")
+    a = m1.get(k)
+    b = m2.get(k)
+    check(f"metrics.{k} identical regardless of engine_version (v1-cfg={a}, v2-cfg={b})",
+          a == b,
+          f"v1-cfg={a} v2-cfg={b}")
 
 
 # ---------------------------------------------------------------------------

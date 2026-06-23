@@ -141,10 +141,10 @@ check("routing", "agent loop runs v2 by default (no engine_version → v2)",
 check("routing", "result has metrics + sleeve_trades",
       "metrics" in result and "sleeve_trades" in result)
 
-# Explicit opt-out
+# engine_version is decommissioned — even an explicit "v1" runs on v2.
 result_v1 = run_backtest({**make_portfolio("V1Probe"), "engine_version": "v1"}, config=cfg)
-check("routing", "engine_version='v1' explicit → result tagged engine_version='v1'",
-      result_v1.get("engine_version") == "v1",
+check("routing", "engine_version='v1' is ignored → result still tagged engine_version='v2'",
+      result_v1.get("engine_version") == "v2",
       f"got {result_v1.get('engine_version')}")
 
 
@@ -332,9 +332,11 @@ if ann is not None and mkt_ann is not None and alpha is not None:
 
 
 # ===========================================================================
-# 5. v1 vs v2 parity on this no-regime config (sanity)
+# 5. engine_version field is inert — v1/v2 configs yield identical results
+#    (v1 is decommissioned; both run v2. Real v1-vs-v2 numerical parity is
+#    covered by test_v1_v2_parity_e2e.py, which calls the executors directly.)
 # ===========================================================================
-print("\n=== 5. v1 vs v2 PARITY (no-regime config) ===")
+print("\n=== 5. engine_version FIELD IS INERT (v1-cfg == v2-cfg) ===")
 
 result_v1 = run_backtest({**make_portfolio("ParityProbe"), "engine_version": "v1"}, config=cfg)
 result_v2 = run_backtest({**make_portfolio("ParityProbe"), "engine_version": "v2"}, config=cfg)
@@ -342,21 +344,17 @@ result_v2 = run_backtest({**make_portfolio("ParityProbe"), "engine_version": "v2
 m1 = result_v1["metrics"]
 m2 = result_v2["metrics"]
 
-# Note: v1's metrics schema doesn't always populate `total_trades` — it
-# reports `total_entries` for BUY count and that's it; v2 populates total_trades
-# explicitly. So we don't check total_trades for parity here, only the
-# load-bearing return/risk fields.
 for key in ("total_return_pct", "max_drawdown_pct", "annualized_return_pct"):
     v1 = m1.get(key)
     v2 = m2.get(key)
-    check("parity", f"{key}: v1={v1} v2={v2} (must be identical for no-regime config)",
+    check("parity", f"{key}: v1-cfg={v1} v2-cfg={v2} (field ignored → identical)",
           v1 == v2 or (v1 is None and v2 is None),
-          f"v1={v1} v2={v2}")
+          f"v1-cfg={v1} v2-cfg={v2}")
 
-# Trade counts must match between v1 and v2
+# Trade counts must match — same engine regardless of the field value
 n_trades_v1 = sum(len(s["trades"]) for s in result_v1["sleeve_trades"])
 n_trades_v2 = sum(len(s["trades"]) for s in result_v2["sleeve_trades"])
-check("parity", f"trade count: v1={n_trades_v1} v2={n_trades_v2}",
+check("parity", f"trade count: v1-cfg={n_trades_v1} v2-cfg={n_trades_v2}",
       n_trades_v1 == n_trades_v2)
 
 
