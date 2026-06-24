@@ -470,6 +470,10 @@ CREATE TABLE IF NOT EXISTS experiments (
     -- Walk-forward eval block: per-window metrics + aggregates as JSON.
     -- NULL when no eval was configured for the run.
     eval_metrics_json               TEXT,
+    -- Full training-period metrics dict as JSON (every metric the backtest
+    -- produced, incl. benchmark-relative beta/TE/IR/vol-ratio). Lets the UI
+    -- show any metric without a column per metric.
+    training_metrics_json           TEXT,
     -- Backtest metrics
     total_return_pct                REAL,
     annualized_return_pct           REAL,
@@ -903,6 +907,21 @@ CREATE TABLE IF NOT EXISTS fund_orders (
 );
 CREATE INDEX IF NOT EXISTS idx_fund_orders_fund ON fund_orders(fund_id, status);
 CREATE INDEX IF NOT EXISTS idx_fund_orders_batch ON fund_orders(batch_id);
+
+-- Cached LLM-generated narrative for the fund tear sheet (monthly commentary +
+-- outlook). The report endpoint is Cache-Control: no-store, so without this the
+-- LLM would be called on every fetch; data_hash guards against stale text when
+-- the underlying numbers change on the same as-of date. Regenerated lazily.
+CREATE TABLE IF NOT EXISTS fund_report_commentary (
+    fund_id     TEXT NOT NULL,
+    as_of       TEXT NOT NULL,           -- data as-of date the narrative describes
+    data_hash   TEXT NOT NULL,           -- sha256 of the facts the LLM was given
+    commentary  TEXT,
+    outlook     TEXT,
+    model       TEXT,
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (fund_id, as_of)
+);
 """
 
 
@@ -959,6 +978,8 @@ def _apply_migrations(conn: sqlite3.Connection):
         # plus the aggregator name so target_value semantics are recoverable.
         _add_column_if_missing(conn, "experiments", "eval_metrics_json", "TEXT")
         _add_column_if_missing(conn, "experiments", "target_aggregator", "TEXT")
+        # Full training-period metrics dict as JSON (any metric, no per-metric column).
+        _add_column_if_missing(conn, "experiments", "training_metrics_json", "TEXT")
     if "trades" in existing_tables:
         # NULL = training-period trade (today's behavior). Non-null =
         # 'YYYY-MM-DD_YYYY-MM-DD' label of the eval window this trade belongs to.

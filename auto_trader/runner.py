@@ -644,6 +644,14 @@ METRIC_DIRECTION = {
     "alpha_ann_pct": True,
     "annualized_volatility_pct": False,
     "max_drawdown_pct": True,  # less negative = better, so higher is better
+    # Benchmark-relative (vs sector) — the institutional objective set.
+    "information_ratio_vs_sector": True,    # active return per unit active risk
+    "beta_adj_alpha_vs_sector_pct": True,   # alpha net of beta×sector (honest alpha)
+    "tracking_error_vs_sector_pct": False,  # active risk — lower is better
+    "vol_vs_sector_ratio": False,           # total vol relative to sector — lower is better
+    # beta_vs_sector / beta_vs_market are NOT here on purpose: they're not
+    # "better" in either direction, they're constraint-only (used in conditions,
+    # which read the metrics dict directly and aren't restricted to VALID_METRICS).
 }
 
 VALID_METRICS = list(METRIC_DIRECTION.keys())
@@ -771,6 +779,49 @@ def save_portfolio(portfolio_config: dict) -> str | None:
         return None
 
 
+def _daily_returns_by_date(nav_history: list) -> dict:
+    """date -> daily simple return (decimal) from a nav_history carrying daily_pnl_pct."""
+    out = {}
+    for p in nav_history or []:
+        d, r = p.get("date"), p.get("daily_pnl_pct")
+        if d is not None and r is not None:
+            out[d] = r / 100.0
+    return out
+
+
+def _beta_te_vol(strat_nav: list, bench_nav: list):
+    """Benchmark-relative risk from aligned daily simple returns.
+
+    Aligns the two series by date, then computes:
+      beta    = cov(r_p, r_b) / var(r_b)              (sample, ddof=1)
+      te_ann  = stdev(r_p - r_b) * sqrt(252) * 100    (annualized tracking error %)
+      vp, vb  = stdev(r_p|r_b) * sqrt(252) * 100      (annualized vols %)
+
+    Returns (beta, te_ann_pct, strat_vol_ann_pct, bench_vol_ann_pct), or all
+    None if < 20 aligned points or zero benchmark variance.
+    """
+    sp, bp = _daily_returns_by_date(strat_nav), _daily_returns_by_date(bench_nav)
+    dates = sorted(set(sp) & set(bp))
+    n = len(dates)
+    if n < 20:
+        return None, None, None, None
+    rp = [sp[d] for d in dates]
+    rb = [bp[d] for d in dates]
+    mp, mb = sum(rp) / n, sum(rb) / n
+    var_b = sum((x - mb) ** 2 for x in rb) / (n - 1)
+    if var_b <= 0:
+        return None, None, None, None
+    cov = sum((rp[i] - mp) * (rb[i] - mb) for i in range(n)) / (n - 1)
+    beta = cov / var_b
+    diff = [rp[i] - rb[i] for i in range(n)]
+    md = sum(diff) / n
+    rt252 = 252 ** 0.5
+    te_ann = (sum((x - md) ** 2 for x in diff) / (n - 1)) ** 0.5 * rt252 * 100
+    vp = (sum((x - mp) ** 2 for x in rp) / (n - 1)) ** 0.5 * rt252 * 100
+    vb = (sum((x - mb) ** 2 for x in rb) / (n - 1)) ** 0.5 * rt252 * 100
+    return beta, te_ann, vp, vb
+
+
 def _run_one_backtest(portfolio_config: dict, start: str, end: str, capital: float,
                       sector: str | None = None,
                       benchmark_sectors: list[str] | None = None) -> dict | None:
@@ -782,16 +833,12 @@ def _run_one_backtest(portfolio_config: dict, start: str, end: str, capital: flo
     This is the unit of work — `run_backtest` calls this once for the training
     period and N more times for each eval sub-window (when configured).
 
-    Engine dispatch: default is v2 (the unified-position-book engine that all
-    live deployments run). Set `engine_version: "v1"` on the portfolio config
-    to opt back into the legacy engine. Keeping the agent on the same engine
-    as deployments prevents optimize-vs-deploy metric drift.
+    Engine: v2 (the unified-position-book engine that all live deployments
+    run) is the only engine. Keeping the agent on the same engine as
+    deployments prevents optimize-vs-deploy metric drift.
     """
     try:
-        if portfolio_config.get("engine_version") == "v1":
-            from portfolio_engine import run_portfolio_backtest
-        else:
-            from portfolio_engine_v2 import run_portfolio_backtest
+        from portfolio_engine_v2 import run_portfolio_backtest
         from backtest_engine import compute_benchmark, SECTOR_ETF_MAP
 
         config = normalize_config(portfolio_config)
@@ -824,6 +871,9 @@ def _run_one_backtest(portfolio_config: dict, start: str, end: str, capital: flo
                 metrics["alpha_vs_market_pct"] = round(ann_return - market_ann, 2)
                 metrics["market_benchmark_return_pct"] = market_bench["metrics"]["total_return_pct"]
                 metrics["market_benchmark_ann_return_pct"] = market_bench["metrics"]["annualized_return_pct"]
+                beta_m, _, _, _ = _beta_te_vol(nav_history, market_bench["nav_history"])
+                if beta_m is not None:
+                    metrics["beta_vs_market"] = round(beta_m, 3)
 
             # Sector benchmark — single sector ETF, or a cap-weighted blend of
             # the chosen benchmark sectors (when more than one is selected).
@@ -837,6 +887,19 @@ def _run_one_backtest(portfolio_config: dict, start: str, end: str, capital: flo
                     metrics["sector_benchmark_return_pct"] = sector_bench["metrics"]["total_return_pct"]
                     metrics["sector_benchmark_ann_return_pct"] = sector_bench["metrics"]["annualized_return_pct"]
 
+                    # Benchmark-relative risk (vs sector): beta, tracking error,
+                    # information ratio, beta-adjusted (honest) alpha, vol ratio.
+                    beta_s, te_s, vp, vb = _beta_te_vol(nav_history, sector_bench["nav_history"])
+                    if beta_s is not None and sector_ann is not None:
+                        metrics["beta_vs_sector"] = round(beta_s, 3)
+                        metrics["beta_adj_alpha_vs_sector_pct"] = round(ann_return - beta_s * sector_ann, 2)
+                    if te_s is not None and te_s > 0:
+                        metrics["tracking_error_vs_sector_pct"] = round(te_s, 2)
+                        metrics["information_ratio_vs_sector"] = round(
+                            metrics["alpha_vs_sector_pct"] / te_s, 3)
+                    if vp is not None and vb:
+                        metrics["vol_vs_sector_ratio"] = round(vp / vb, 3)
+
         # Build per-sleeve trade groups with labels attached
         sleeve_results = result.get("sleeve_results", [])
         per_sleeve = result.get("per_sleeve", [])
@@ -848,11 +911,9 @@ def _run_one_backtest(portfolio_config: dict, start: str, end: str, capital: flo
             for i, sr in enumerate(sleeve_results)
         ]
 
-        # Surface which engine actually executed — observability + audit.
-        # v2 tags its result with engine_version="v2"; v1 doesn't tag (legacy).
-        engine_version = result.get("engine_version") or (
-            "v1" if portfolio_config.get("engine_version") == "v1" else "v2"
-        )
+        # Surface which engine executed — observability + audit. v2 is the
+        # only engine; it tags its own result, fall back to "v2" defensively.
+        engine_version = result.get("engine_version") or "v2"
 
         return {
             "metrics": metrics,

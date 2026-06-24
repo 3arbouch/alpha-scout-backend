@@ -3201,7 +3201,6 @@ async def evaluate_multiple_regimes(
 # ---------------------------------------------------------------------------
 sys.path.insert(0, str(WORKSPACE / "scripts"))
 from portfolio_engine import (
-    run_portfolio_backtest as _run_portfolio_bt_v1,
     save_portfolio_results as _save_portfolio_results,
     compute_portfolio_id as _compute_portfolio_id,
 )
@@ -3209,16 +3208,11 @@ from portfolio_engine_v2 import run_portfolio_backtest as _run_portfolio_bt_v2
 
 
 def _run_portfolio_bt(config: dict, force_close_at_end: bool = True):
-    """Route the portfolio backtest to v1 or v2 based on config.engine_version.
+    """Run the portfolio backtest on the v2 engine (unified-position-book).
 
-    Default: v2 (the unified-position-book engine — what all live deployments
-    and the agent loop run). Set engine_version="v1" on the portfolio config
-    to opt back into the legacy engine, which keeps the 9d0fead reconciliation
-    patch but produces dual-bookkeeping artifacts for regime/allocation_profile
-    configs.
+    v2 is the only engine — what all live deployments and the agent loop run.
+    The legacy engine_version field is accepted on configs but no longer routed.
     """
-    if (config or {}).get("engine_version") == "v1":
-        return _run_portfolio_bt_v1(config, force_close_at_end=force_close_at_end)
     return _run_portfolio_bt_v2(config, force_close_at_end=force_close_at_end)
 
 
@@ -4899,11 +4893,14 @@ async def delete_investor_api(
 
 
 @app.get("/funds/{fund_id}/report.pdf", tags=["Funds"])
-async def fund_report_pdf_api(fund_id: str, _: str = Depends(verify_api_key)):
-    """Fund tear sheet: NAV/unit chart, key stats, investor positions."""
+async def fund_report_pdf_api(fund_id: str, include_commentary: bool = True,
+                              _: str = Depends(verify_api_key)):
+    """Fund monthly report: performance summary, NAV/unit chart, LLM commentary,
+    top contributors/detractors, sector exposure, outlook, investor positions.
+    Set include_commentary=false to skip LLM-generated narrative."""
     from fastapi.responses import Response
     from reports.fund_report import build_fund_report_pdf
-    pdf = await _run_sync(build_fund_report_pdf, fund_id)
+    pdf = await _run_sync(build_fund_report_pdf, fund_id, include_commentary)
     if pdf is None:
         raise HTTPException(404, f"Fund '{fund_id}' not found")
     return Response(content=pdf, media_type="application/pdf",
