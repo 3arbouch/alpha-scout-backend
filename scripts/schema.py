@@ -907,6 +907,21 @@ CREATE TABLE IF NOT EXISTS fund_orders (
 );
 CREATE INDEX IF NOT EXISTS idx_fund_orders_fund ON fund_orders(fund_id, status);
 CREATE INDEX IF NOT EXISTS idx_fund_orders_batch ON fund_orders(batch_id);
+
+-- Cached LLM-generated narrative for the fund tear sheet (monthly commentary +
+-- outlook). The report endpoint is Cache-Control: no-store, so without this the
+-- LLM would be called on every fetch; data_hash guards against stale text when
+-- the underlying numbers change on the same as-of date. Regenerated lazily.
+CREATE TABLE IF NOT EXISTS fund_report_commentary (
+    fund_id     TEXT NOT NULL,
+    as_of       TEXT NOT NULL,           -- data as-of date the narrative describes
+    data_hash   TEXT NOT NULL,           -- sha256 of the facts the LLM was given
+    commentary  TEXT,
+    outlook     TEXT,
+    model       TEXT,
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (fund_id, as_of)
+);
 """
 
 

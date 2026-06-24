@@ -4893,11 +4893,14 @@ async def delete_investor_api(
 
 
 @app.get("/funds/{fund_id}/report.pdf", tags=["Funds"])
-async def fund_report_pdf_api(fund_id: str, _: str = Depends(verify_api_key)):
-    """Fund tear sheet: NAV/unit chart, key stats, investor positions."""
+async def fund_report_pdf_api(fund_id: str, include_commentary: bool = True,
+                              _: str = Depends(verify_api_key)):
+    """Fund monthly report: performance summary, NAV/unit chart, LLM commentary,
+    top contributors/detractors, sector exposure, outlook, investor positions.
+    Set include_commentary=false to skip LLM-generated narrative."""
     from fastapi.responses import Response
     from reports.fund_report import build_fund_report_pdf
-    pdf = await _run_sync(build_fund_report_pdf, fund_id)
+    pdf = await _run_sync(build_fund_report_pdf, fund_id, include_commentary)
     if pdf is None:
         raise HTTPException(404, f"Fund '{fund_id}' not found")
     return Response(content=pdf, media_type="application/pdf",

@@ -556,6 +556,28 @@ def _market_prices(symbols) -> dict:
     return out
 
 
+def symbol_sectors(symbols) -> dict:
+    """symbol -> GICS sector from market.db universe_profiles (for exposure tables).
+    Symbols with no profile row are simply absent from the result."""
+    symbols = list(dict.fromkeys(symbols))
+    if not symbols:
+        return {}
+    mdb = os.environ.get("MARKET_DB_PATH", str(_BASE / "market.db"))
+    conn = sqlite3.connect(mdb)
+    out = {}
+    try:
+        qs = ",".join("?" * len(symbols))
+        for sym, sec in conn.execute(
+            f"SELECT symbol, sector FROM universe_profiles WHERE symbol IN ({qs})",
+            symbols,
+        ):
+            if sec:
+                out[sym] = sec
+    finally:
+        conn.close()
+    return out
+
+
 def fund_actual_book(fund_id: str) -> dict:
     """The fund's REAL book: holdings from executed fills, cash from investor
     net flows +/- fills, marked at current prices. This is what IB should hold."""
