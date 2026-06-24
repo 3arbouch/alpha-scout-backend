@@ -4782,6 +4782,21 @@ async def investor_statement_api(fund_id: str, investor_id: str, _: str = Depend
         raise HTTPException(404, str(e))
 
 
+@app.delete("/funds/{fund_id}/investors/{investor_id}", tags=["Funds"])
+async def remove_fund_investor_api(
+    fund_id: str, investor_id: str,
+    as_of: str | None = Query(None, description="Dealing date to price the exit redemption at (default: latest)."),
+    _: str = Depends(verify_api_key),
+):
+    """Exit an investor from this fund: redeem their full remaining holding at the
+    dealing-date NAV. The investor record and any holdings in other funds are kept."""
+    from funds import remove_investor_from_fund
+    try:
+        return _sanitize_floats(await _run_sync(remove_investor_from_fund, fund_id, investor_id, as_of))
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
 @app.get("/funds/{fund_id}/book", tags=["Funds"])
 async def fund_book_api(fund_id: str, _: str = Depends(verify_api_key)):
     """The fund's REAL book (commingled): holdings from fills + cash from flows, marked to market."""
