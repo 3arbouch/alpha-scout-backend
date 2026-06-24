@@ -303,6 +303,35 @@ def redeem(fund_id: str, investor_id: str, amount: float | None = None,
             "date": nav_date, "proceeds": proceeds, "nav_per_unit": nav, "units": -u}
 
 
+def remove_investor_from_fund(fund_id: str, investor_id: str,
+                              as_of: str | None = None) -> dict:
+    """Exit an investor from a single fund: redeem their full remaining holding at
+    the dealing-date NAV, leaving a redemption on the ledger. The investor record
+    and any holdings in OTHER funds are untouched. ValueError if the fund/investor
+    don't exist or the investor was never subscribed to this fund."""
+    if not get_fund(fund_id):
+        raise ValueError(f"Fund '{fund_id}' not found")
+    if not get_investor(investor_id):
+        raise ValueError(f"Investor '{investor_id}' not found")
+    conn = _conn()
+    try:
+        n_tx = conn.execute(
+            "SELECT COUNT(*) c FROM investor_transactions WHERE fund_id = ? AND investor_id = ?",
+            (fund_id, investor_id)).fetchone()["c"]
+        held = round(_holding_units(conn, fund_id, investor_id), 6)
+    finally:
+        conn.close()
+    if n_tx == 0:
+        raise ValueError(f"Investor '{investor_id}' is not subscribed to fund '{fund_id}'")
+    if held <= 1e-6:
+        return {"fund_id": fund_id, "investor_id": investor_id, "redeemed_units": 0.0,
+                "proceeds": 0.0, "redemption": None,
+                "note": "investor already holds no units in this fund"}
+    red = redeem(fund_id, investor_id, units=held, as_of=as_of)
+    return {"fund_id": fund_id, "investor_id": investor_id, "redeemed_units": held,
+            "proceeds": red["proceeds"], "redemption": red}
+
+
 # --------------------------------------------------------------------------- #
 # Per-account performance
 # --------------------------------------------------------------------------- #
