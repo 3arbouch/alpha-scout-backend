@@ -18,7 +18,8 @@ from weasyprint import HTML
 from datetime import datetime, timezone
 
 from reports.investor_report import (
-    _money, _pct, _num, _build_env, _fig_to_data_uri, PORTFOLIO_COLOR,
+    _money, _pct, _num, _build_env, _fig_to_data_uri,
+    PORTFOLIO_COLOR, MARKET_COLOR, SECTOR_COLOR,
     _monthly_returns, _month_label,
 )
 from reports import fund_commentary
@@ -30,19 +31,45 @@ import funds as _funds  # noqa: E402
 from deploy_engine import get_deployment, build_position_book  # noqa: E402
 
 
-def _nav_unit_chart(weekly: list[dict], base: float) -> str | None:
+def _rebased(series, start_date: str, base: float):
+    """Rebase a [{date, nav}] series to `base` at the first date >= start_date,
+    so a deployment benchmark overlays comparably on the fund's NAV/unit line."""
+    pts = [(p["date"], p["nav"]) for p in (series or [])
+           if p.get("nav") is not None and p["date"] >= start_date]
+    if len(pts) < 2 or not pts[0][1]:
+        return [], []
+    b0 = pts[0][1]
+    dates = [datetime.strptime(d, "%Y-%m-%d") for d, _ in pts]
+    vals = [base * v / b0 for _, v in pts]
+    return dates, vals
+
+
+def _nav_unit_chart(weekly: list[dict], base: float, market=None, sector=None,
+                    market_label: str | None = None, sector_label: str | None = None) -> str | None:
     pts = [(p["date"], p["nav_per_unit"]) for p in weekly if p.get("nav_per_unit") is not None]
     if len(pts) < 2:
         return None
-    from datetime import datetime
+    start_date = pts[0][0]
     dates = [datetime.strptime(d, "%Y-%m-%d") for d, _ in pts]
     vals = [v for _, v in pts]
     fig, ax = plt.subplots(figsize=(8.2, 3.0))
-    ax.plot(dates, vals, color=PORTFOLIO_COLOR, linewidth=2.0)
-    ax.axhline(base, color="#cccccc", linewidth=0.8)
+    ax.plot(dates, vals, color=PORTFOLIO_COLOR, linewidth=2.0, label="Fund (NAV/unit)", zorder=3)
+
+    md, mv = _rebased(market, start_date, base)
+    if md:
+        ax.plot(md, mv, color=MARKET_COLOR, linewidth=1.4,
+                label=f"Market ({market_label or 'SPY'})", zorder=2)
+    sd, sv = _rebased(sector, start_date, base)
+    if sd:
+        ax.plot(sd, sv, color=SECTOR_COLOR, linewidth=1.4,
+                label=f"Sector ({sector_label or 'benchmark'})", zorder=2)
+
+    ax.axhline(base, color="#cccccc", linewidth=0.8, zorder=1)
     ax.set_ylabel("NAV per unit ($)", fontsize=9, color="#5f6368")
     ax.grid(True, axis="y", color="#eef0f2", linewidth=0.8)
     ax.tick_params(length=0, labelsize=8, colors="#5f6368")
+    if md or sd:
+        ax.legend(loc="upper left", fontsize=8, frameon=False)
     for s in ("top", "right", "left"):
         ax.spines[s].set_visible(False)
     ax.spines["bottom"].set_color("#dadce0")
@@ -90,11 +117,16 @@ def _deployment_extras(fund: dict) -> dict:
         ({"sector": k, "weight_pct": v} for k, v in agg.items()),
         key=lambda x: x["weight_pct"], reverse=True,
     )
+    bench_sector = d.get("benchmark_sector") or {}
     return {
         "metrics": d.get("metrics") or {},
         "contributors": contributors,
         "detractors": detractors,
         "sector_exposure": sector_exposure,
+        "benchmark_nav": d.get("benchmark_nav") or [],
+        "sector_nav": (bench_sector.get("nav_history") if isinstance(bench_sector, dict) else None) or [],
+        "market_symbol": (d.get("benchmark_market") or {}).get("symbol"),
+        "sector_symbol": bench_sector.get("symbol") if isinstance(bench_sector, dict) else None,
     }
 
 
@@ -167,7 +199,10 @@ def build_fund_report_pdf(fund_id: str, include_commentary: bool = True) -> byte
         "period_label": period_label,
         "latest_month": latest_month,
         "book": book,
-        "chart": _nav_unit_chart(weekly, fund["base_nav_per_unit"]),
+        "chart": _nav_unit_chart(
+            weekly, fund["base_nav_per_unit"],
+            market=extras.get("benchmark_nav"), sector=extras.get("sector_nav"),
+            market_label=extras.get("market_symbol"), sector_label=extras.get("sector_symbol")),
         "weekly_points": len(weekly),
         "metrics": extras.get("metrics", {}),
         "contributors": extras.get("contributors", []),
