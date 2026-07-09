@@ -265,9 +265,11 @@ def _resolve_model_api_id(model_id: str) -> str:
     mapping = {
         "haiku": "claude-haiku-4-5-20251001",
         "sonnet": "claude-sonnet-4-6",
+        "sonnet-5": "claude-sonnet-5",
         "opus": "claude-opus-4-6",
         "opus-4-7": "claude-opus-4-7",
         "opus-4-8": "claude-opus-4-8",
+        "fable-5": "claude-fable-5",
     }
     return mapping.get(model_id, model_id)
 
@@ -394,6 +396,90 @@ def _get_trade_summary(exp_id: str) -> dict | None:
     }
 
 
+# Human labels for metrics surfaced in the agent's history context. Any metric
+# the backtest computes but that is absent here still renders — under its raw
+# key — so newly added metrics appear automatically (see _render_metrics).
+_METRIC_LABELS = {
+    "sharpe_ratio": "Sharpe",
+    "sortino_ratio": "Sortino",
+    "calmar_ratio": "Calmar",
+    "alpha_ann_pct": "Alpha",
+    "alpha_vs_market_pct": "AlphaVsMkt",
+    "alpha_vs_sector_pct": "AlphaVsSector",
+    "beta_adj_alpha_vs_sector_pct": "BetaAdjAlpha",
+    "annualized_return_pct": "AnnRet",
+    "total_return_pct": "Return",
+    "annualized_volatility_pct": "Vol",
+    "max_drawdown_pct": "MaxDD",
+    "win_rate_pct": "WinRate",
+    "profit_factor": "PF",
+    "total_trades": "Trades",
+    "beta_vs_market": "BetaVsMkt",
+    "beta_vs_sector": "BetaVsSector",
+    "tracking_error_pct": "TE",
+    "information_ratio": "IR",
+    "tracking_error_vs_market_pct": "TEvsMkt",
+    "information_ratio_vs_market": "IRvsMkt",
+    "tracking_error_vs_sector_pct": "TEvsSector",
+    "information_ratio_vs_sector": "IRvsSector",
+    "vol_vs_sector_ratio": "VolRatio",
+    "upside_capture_vs_sector": "UpCapture",
+    "downside_capture_vs_sector": "DownCapture",
+}
+
+# Redundant decompositions of the headline Sharpe — omit from the rendered lines
+# to avoid a confusing duplicate Sharpe. Still persisted + in the metrics blob.
+_METRIC_RENDER_SKIP = {"sharpe_basis", "sharpe_ratio_annualized", "sharpe_ratio_period"}
+
+
+def _fmt_metric(name: str, v) -> str | None:
+    """Format one metric value; None (→ skipped) if missing or non-numeric."""
+    if v is None or isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    if name.endswith("_pct"):
+        return f"{v:.1f}%"
+    if isinstance(v, int):
+        return str(v)
+    return f"{v:.2f}"
+
+
+def _metric_order(metrics: dict) -> list[str]:
+    """Labeled metrics first (in label order), then any extras alphabetically."""
+    labeled = [n for n in _METRIC_LABELS if n in metrics]
+    extras = sorted(n for n in metrics if n not in _METRIC_LABELS)
+    return labeled + extras
+
+
+def _render_metrics(metrics: dict) -> str:
+    """One compact line of ALL numeric metrics present, labeled then extras."""
+    parts = []
+    for name in _metric_order(metrics):
+        if name in _METRIC_RENDER_SKIP:
+            continue
+        s = _fmt_metric(name, metrics.get(name))
+        if s is not None:
+            parts.append(f"{_METRIC_LABELS.get(name, name)}={s}")
+    return ", ".join(parts)
+
+
+def _render_agg_spread(agg: dict) -> list[str]:
+    """min/med/max per aggregated eval metric — one entry per metric present."""
+    parts = []
+    for name in _metric_order(agg):
+        if name in _METRIC_RENDER_SKIP:
+            continue
+        b = agg.get(name)
+        if not b or b.get("median") is None:
+            continue
+        pct = name.endswith("_pct")
+        fmt = (lambda x: f"{x:.1f}%") if pct else (lambda x: f"{x:.2f}")
+        parts.append(
+            f"{_METRIC_LABELS.get(name, name)} min/med/max="
+            f"{fmt(b['min'])}/{fmt(b['median'])}/{fmt(b['max'])}"
+        )
+    return parts
+
+
 def build_history_context(run_id: str, target_metric: str, limit: int = 20,
                           aggregator: str = "overall",
                           include_analyst_notes: bool = True) -> str:
@@ -487,19 +573,20 @@ def build_history_context(run_id: str, target_metric: str, limit: int = 20,
                 for a in assumptions:
                     lines.append(f"- {a}")
 
-        # Full metrics
-        metrics = []
-        if exp.get("sharpe_ratio") is not None:
-            metrics.append(f"Sharpe={exp['sharpe_ratio']:.2f}")
-        if exp.get("alpha_ann_pct") is not None:
-            metrics.append(f"Alpha={exp['alpha_ann_pct']:.1f}%")
-        if exp.get("annualized_volatility_pct") is not None:
-            metrics.append(f"Vol={exp['annualized_volatility_pct']:.1f}%")
-        if exp.get("total_return_pct") is not None:
-            metrics.append(f"Return={exp['total_return_pct']:.1f}%")
-        if exp.get("max_drawdown_pct") is not None:
-            metrics.append(f"MaxDD={exp['max_drawdown_pct']:.1f}%")
-        lines.append(f"**Metrics (training-period):** {', '.join(metrics)}")
+        # Full metrics — render every metric the backtest computed, from the
+        # persisted training_metrics_json blob. Fall back to the row's column
+        # subset for older experiments saved before the blob existed.
+        tm = exp.get("training_metrics_json")
+        if isinstance(tm, str):
+            try:
+                tm = json.loads(tm)
+            except json.JSONDecodeError:
+                tm = None
+        if not isinstance(tm, dict) or not tm:
+            tm = {k: exp.get(k) for k in (
+                "sharpe_ratio", "alpha_ann_pct", "annualized_volatility_pct",
+                "total_return_pct", "max_drawdown_pct")}
+        lines.append(f"**Metrics (training-period):** {_render_metrics(tm)}")
 
         # Walk-forward eval block — render distribution stats so the agent
         # sees per-period stability, not just one aggregate number.
@@ -514,20 +601,8 @@ def build_history_context(run_id: str, target_metric: str, limit: int = 20,
                 spec = ev.get("spec", {}) or {}
                 windows = ev.get("windows", []) or []
                 n = len(windows)
-                # One concise spread-stats line. Skip metrics with no data.
-                parts = []
-                for name, label in (
-                    ("sharpe_ratio",          "Sharpe"),
-                    ("alpha_ann_pct",         "Alpha"),
-                    ("max_drawdown_pct",      "MaxDD"),
-                    ("annualized_volatility_pct", "Vol"),
-                ):
-                    b = agg.get(name)
-                    if not b:
-                        continue
-                    fmt = "{:+.1f}%" if name.endswith("_pct") else "{:.2f}"
-                    mn = fmt.format(b["min"]); md = fmt.format(b["median"]); mx = fmt.format(b["max"])
-                    parts.append(f"{label} min/med/max={mn}/{md}/{mx}")
+                # One spread-stats entry per aggregated metric (all of them).
+                parts = _render_agg_spread(agg)
                 if parts:
                     w_label = spec.get("window", "?")
                     o_label = spec.get("overlap", "?")
@@ -547,17 +622,9 @@ def build_history_context(run_id: str, target_metric: str, limit: int = 20,
                     lines.append("**Per-window:**")
                     for w in windows:
                         m = w.get("metrics", {}) or {}
-                        bits = []
-                        if m.get("sharpe_ratio") is not None:
-                            bits.append(f"Sharpe={m['sharpe_ratio']:.2f}")
-                        if m.get("alpha_ann_pct") is not None:
-                            bits.append(f"Alpha={m['alpha_ann_pct']:+.1f}%")
-                        if m.get("max_drawdown_pct") is not None:
-                            bits.append(f"MaxDD={m['max_drawdown_pct']:+.1f}%")
-                        if m.get("annualized_volatility_pct") is not None:
-                            bits.append(f"Vol={m['annualized_volatility_pct']:.1f}%")
-                        if bits:
-                            lines.append(f"- {w.get('label','?')}: {', '.join(bits)}")
+                        line = _render_metrics(m)
+                        if line:
+                            lines.append(f"- {w.get('label','?')}: {line}")
 
         # Full portfolio config
         portfolio_config = exp.get("portfolio_config")
@@ -641,14 +708,25 @@ def build_history_context(run_id: str, target_metric: str, limit: int = 20,
 # Metric direction: True = higher is better, False = lower is better
 METRIC_DIRECTION = {
     "sharpe_ratio": True,
+    "sortino_ratio": True,  # downside-only risk-adjusted return — rewards keeping upside vol
+    "calmar_ratio": True,   # annualized return / max drawdown
     "alpha_ann_pct": True,
     "annualized_volatility_pct": False,
     "max_drawdown_pct": True,  # less negative = better, so higher is better
+    # Benchmark-agnostic — follow the run's Alpha Benchmark selector (see
+    # _apply_benchmark_selector): resolve to the vs-sector or vs-market variant.
+    "information_ratio": True,     # active return per unit active risk vs chosen benchmark
+    "tracking_error_pct": False,   # active risk vs chosen benchmark — lower is better
+    # Benchmark-relative (vs market/SPY).
+    "information_ratio_vs_market": True,    # active return per unit active risk vs SPY
+    "tracking_error_vs_market_pct": False,  # active risk vs SPY — lower is better
     # Benchmark-relative (vs sector) — the institutional objective set.
     "information_ratio_vs_sector": True,    # active return per unit active risk
     "beta_adj_alpha_vs_sector_pct": True,   # alpha net of beta×sector (honest alpha)
     "tracking_error_vs_sector_pct": False,  # active risk — lower is better
     "vol_vs_sector_ratio": False,           # total vol relative to sector — lower is better
+    "upside_capture_vs_sector": True,       # ride the sector rally — higher is better
+    "downside_capture_vs_sector": False,    # shed the sector selloff — lower is better
     # beta_vs_sector / beta_vs_market are NOT here on purpose: they're not
     # "better" in either direction, they're constraint-only (used in conditions,
     # which read the metrics dict directly and aren't restricted to VALID_METRICS).
@@ -822,6 +900,37 @@ def _beta_te_vol(strat_nav: list, bench_nav: list):
     return beta, te_ann, vp, vb
 
 
+def _capture_ratios(strat_nav: list, bench_nav: list):
+    """Up/down capture vs benchmark from aligned daily simple returns.
+
+    Splits days by the sign of the benchmark return and takes the ratio of
+    AVERAGE daily returns on each side:
+      up_capture   = mean(strat return | bench up)   / mean(bench return | bench up)
+      down_capture = mean(strat return | bench down) / mean(bench return | bench down)
+
+    Both are ratios (1.0 = full participation). A vol-robust sleeve wants
+    up_capture high (rides the tech rally) and down_capture low (sheds the
+    selloff — and < 0 if it actually gains when the sector falls). We use the
+    arithmetic-mean form rather than compounding one side over the whole horizon,
+    which explodes super-exponentially over multi-year windows. Returns
+    (up_capture, down_capture), or (None, None) if either side has < 10 days or
+    a ~zero average benchmark move.
+    """
+    sp, bp = _daily_returns_by_date(strat_nav), _daily_returns_by_date(bench_nav)
+    dates = sorted(set(sp) & set(bp))
+    up = [d for d in dates if bp[d] > 0]
+    down = [d for d in dates if bp[d] < 0]
+    if len(up) < 10 or len(down) < 10:
+        return None, None
+    mb_up = sum(bp[d] for d in up) / len(up)
+    mb_down = sum(bp[d] for d in down) / len(down)
+    if mb_up == 0 or mb_down == 0:
+        return None, None
+    up_cap = (sum(sp[d] for d in up) / len(up)) / mb_up
+    down_cap = (sum(sp[d] for d in down) / len(down)) / mb_down
+    return up_cap, down_cap
+
+
 def _run_one_backtest(portfolio_config: dict, start: str, end: str, capital: float,
                       sector: str | None = None,
                       benchmark_sectors: list[str] | None = None) -> dict | None:
@@ -871,9 +980,17 @@ def _run_one_backtest(portfolio_config: dict, start: str, end: str, capital: flo
                 metrics["alpha_vs_market_pct"] = round(ann_return - market_ann, 2)
                 metrics["market_benchmark_return_pct"] = market_bench["metrics"]["total_return_pct"]
                 metrics["market_benchmark_ann_return_pct"] = market_bench["metrics"]["annualized_return_pct"]
-                beta_m, _, _, _ = _beta_te_vol(nav_history, market_bench["nav_history"])
+                # Benchmark-relative risk (vs market/SPY): beta, tracking error,
+                # information ratio. TE/IR here are the market-relative analogs of
+                # the vs-sector versions below — active risk & active return per
+                # unit of it, measured against SPY.
+                beta_m, te_m, _, _ = _beta_te_vol(nav_history, market_bench["nav_history"])
                 if beta_m is not None:
                     metrics["beta_vs_market"] = round(beta_m, 3)
+                if te_m is not None and te_m > 0:
+                    metrics["tracking_error_vs_market_pct"] = round(te_m, 2)
+                    metrics["information_ratio_vs_market"] = round(
+                        metrics["alpha_vs_market_pct"] / te_m, 3)
 
             # Sector benchmark — single sector ETF, or a cap-weighted blend of
             # the chosen benchmark sectors (when more than one is selected).
@@ -899,6 +1016,13 @@ def _run_one_backtest(portfolio_config: dict, start: str, end: str, capital: flo
                             metrics["alpha_vs_sector_pct"] / te_s, 3)
                     if vp is not None and vb:
                         metrics["vol_vs_sector_ratio"] = round(vp / vb, 3)
+
+                    # Up/down capture vs sector: the asymmetry we optimize for —
+                    # keep upside (rides the tech rally), shed downside.
+                    up_cap, down_cap = _capture_ratios(nav_history, sector_bench["nav_history"])
+                    if up_cap is not None:
+                        metrics["upside_capture_vs_sector"] = round(up_cap, 3)
+                        metrics["downside_capture_vs_sector"] = round(down_cap, 3)
 
         # Build per-sleeve trade groups with labels attached
         sleeve_results = result.get("sleeve_results", [])
@@ -977,23 +1101,6 @@ def _eval_max_workers() -> int:
     return max(1, n)
 
 
-# Metric names whose distribution we aggregate across eval windows.
-_AGG_METRIC_NAMES = (
-    "sharpe_ratio",
-    "sortino_ratio",
-    "calmar_ratio",
-    "alpha_ann_pct",
-    "alpha_vs_market_pct",
-    "alpha_vs_sector_pct",
-    "annualized_return_pct",
-    "annualized_volatility_pct",
-    "total_return_pct",
-    "max_drawdown_pct",
-    "win_rate_pct",
-    "profit_factor",
-)
-
-
 def _quantile(sorted_xs: list[float], q: float) -> float | None:
     """Linear-interp quantile (type-7, R default)."""
     if not sorted_xs:
@@ -1024,20 +1131,32 @@ def _sample_stdev(xs: list[float]) -> float | None:
 
 
 def _aggregate_window_metrics(windows: list[dict]) -> dict:
-    """Reduce per-window metric scalars to a fixed set of summary stats.
+    """Reduce per-window metric scalars to summary stats, for EVERY numeric
+    metric any window reports (no allowlist — so every computed metric is
+    targetable and usable in `<metric>.<aggregator>` conditions).
 
     Per metric, returns: {mean, median, min, max, p10, p25, stdev, iqr, range,
     snr, count}. Some are None when the sample is too small:
       - stdev / snr / iqr / range are None when count < 2.
       - snr clamps stdev to _SNR_STD_FLOOR to avoid explosions; sign-preserving.
 
-    Skips metrics not present in any window. Skips windows where the metric is
+    Skips non-numeric values (e.g. sharpe_basis) and windows where the metric is
     None. Returns an empty dict for any metric that no window reports.
     """
+    # Union of metric keys across all windows, in first-seen order.
+    names: list[str] = []
+    seen: set[str] = set()
+    for w in windows:
+        for k in (w.get("metrics") or {}):
+            if k not in seen:
+                seen.add(k)
+                names.append(k)
+
     out: dict[str, dict] = {}
-    for name in _AGG_METRIC_NAMES:
+    for name in names:
         vals = [w["metrics"].get(name) for w in windows if w.get("metrics")]
-        vals = [v for v in vals if v is not None]
+        vals = [v for v in vals
+                if isinstance(v, (int, float)) and not isinstance(v, bool)]
         if not vals:
             continue
         srt = sorted(vals)
@@ -1252,6 +1371,28 @@ def aggregator_higher_is_better(aggregator: str, metric_name: str) -> bool:
     return False  # "minimize"
 
 
+def _apply_benchmark_selector(m: dict, alpha_benchmark: str) -> None:
+    """Map benchmark-relative metrics onto benchmark-agnostic names in-place.
+
+    So a run can reference one metric — `alpha_ann_pct`, `tracking_error_pct`,
+    `information_ratio` — and it resolves to the sector-relative or market-
+    relative variant per the Alpha Benchmark selector, exactly like the strategy
+    focus works: pick a sector → measure within that sector; all sectors →
+    measure against the S&P 500. `sector` uses the vs-sector value when present;
+    otherwise (and for `market`) it falls back to the vs-market (SPY) value.
+    """
+    want_sector = alpha_benchmark == "sector"
+    for agnostic, sect, mkt in (
+        ("alpha_ann_pct",      "alpha_vs_sector_pct",       "alpha_vs_market_pct"),
+        ("tracking_error_pct", "tracking_error_vs_sector_pct", "tracking_error_vs_market_pct"),
+        ("information_ratio",  "information_ratio_vs_sector",  "information_ratio_vs_market"),
+    ):
+        if want_sector and m.get(sect) is not None:
+            m[agnostic] = m[sect]
+        elif m.get(mkt) is not None:
+            m[agnostic] = m[mkt]
+
+
 async def run_agent_iteration(
     run_id: str,
     iteration: int,
@@ -1424,19 +1565,22 @@ You are researching as of {backtest_end}. You do not know what happens after thi
         permission_mode="acceptEdits",
         max_turns=50,
     )
-    # Opus 4.7+ reject the legacy thinking.type='enabled' shape the CLI
-    # defaults to. Force adaptive thinking for 4.7/4.8 only; leave other
-    # models on their defaults so we don't alter working behavior.
+    # Opus 4.7+, Sonnet 5, and Fable 5 all reject the legacy
+    # thinking.type='enabled' shape the CLI defaults to. Force adaptive
+    # thinking for those; leave other models on their defaults so we don't
+    # alter working behavior. (Fable 5 additionally rejects
+    # thinking.type='disabled', so adaptive is the only valid override.)
     #
-    # Note: Opus 4.7's thinking blocks return with empty `thinking` text
-    # and a signature only (display defaults to "omitted" per-model).
-    # Anthropic's docs say passing display="summarized" unseals the text,
-    # but claude-agent-sdk 0.1.61's subprocess transport only reads
-    # `type` from this dict (see subprocess_cli.py:305-312) and the
-    # bundled CLI binary has no --display flag. Until the SDK plumbs
-    # this through, the value is not actually configurable here.
-    if resolved_model in ("claude-opus-4-7", "claude-opus-4-8"):
-        agent_opts["thinking"] = {"type": "adaptive"}
+    # display="summarized" unseals the reasoning text: these models default to
+    # "omitted" (their thinking blocks come back with a signature only and empty
+    # `thinking`), so without this the live activity shows no reasoning — only
+    # narrative + tool calls. Requires the plumbing added in claude-agent-sdk
+    # >=0.2 (forwards --thinking-display) + bundled CLI >=2.1.161; the container
+    # runs sdk 0.2.101 / CLI 2.1.177, so it's honored. Summarized is the only
+    # readable mode these models expose (no raw chain-of-thought).
+    if resolved_model in ("claude-opus-4-7", "claude-opus-4-8",
+                          "claude-sonnet-5", "claude-fable-5"):
+        agent_opts["thinking"] = {"type": "adaptive", "display": "summarized"}
 
     try:
         async for message in query(
@@ -1605,21 +1749,15 @@ You are researching as of {backtest_end}. You do not know what happens after thi
         )
         return {"decision": "discard", "error": "backtest_failed", "id": exp_id}
 
-    # Map alpha_ann_pct to the right benchmark based on run config
-    if alpha_benchmark == "sector" and "alpha_vs_sector_pct" in metrics:
-        metrics["alpha_ann_pct"] = metrics["alpha_vs_sector_pct"]
-    elif "alpha_vs_market_pct" in metrics:
-        metrics["alpha_ann_pct"] = metrics["alpha_vs_market_pct"]
-    # Mirror the same alpha mapping inside each eval window so per-window
-    # alpha_ann_pct is consistent with the agent's chosen benchmark.
+    # Map alpha_ann_pct / tracking_error_pct / information_ratio to the right
+    # benchmark based on run config (Alpha Benchmark selector).
+    _apply_benchmark_selector(metrics, alpha_benchmark)
+    # Mirror the same mapping inside each eval window so per-window agnostic
+    # metrics are consistent with the agent's chosen benchmark.
     if eval_data:
         for w in eval_data.get("windows", []):
-            wm = w.get("metrics", {})
-            if alpha_benchmark == "sector" and "alpha_vs_sector_pct" in wm:
-                wm["alpha_ann_pct"] = wm["alpha_vs_sector_pct"]
-            elif "alpha_vs_market_pct" in wm:
-                wm["alpha_ann_pct"] = wm["alpha_vs_market_pct"]
-        # Rebuild aggregated dict to reflect the alpha remap above.
+            _apply_benchmark_selector(w.get("metrics", {}), alpha_benchmark)
+        # Rebuild aggregated dict to reflect the remap above.
         eval_data["aggregated"] = _aggregate_window_metrics(eval_data["windows"])
 
     # Score — resolve the single scalar the agent climbs.

@@ -137,7 +137,7 @@ def get_experiment_history(run_id: str, limit: int = 20) -> list[dict]:
     rows = conn.execute(
         """SELECT id, iteration, thesis, assumptions, portfolio_config,
                   target_metric, target_aggregator, target_value, conditions_met,
-                  eval_metrics_json,
+                  eval_metrics_json, training_metrics_json,
                   sharpe_ratio, alpha_ann_pct, annualized_volatility_pct,
                   max_drawdown_pct, total_return_pct, annualized_return_pct,
                   decision, best_value_so_far, improvement_pct, error,

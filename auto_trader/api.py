@@ -24,15 +24,27 @@ from auto_trader.schema import (
 from auto_trader.runner import VALID_METRICS, METRIC_DIRECTION
 from auto_trader.events import tail as tail_events
 
+# Explicit benchmark variants hidden from the create-run metric/condition
+# dropdown: `tracking_error_pct` / `information_ratio` already auto-resolve to
+# the vs-sector or vs-market form per the sector focus, so exposing the explicit
+# pair is redundant. They stay valid (in VALID_METRICS) and are still computed +
+# shown in results — just not offered as a separate pick.
+_UI_HIDDEN_METRICS = {
+    "tracking_error_vs_market_pct", "tracking_error_vs_sector_pct",
+    "information_ratio_vs_market", "information_ratio_vs_sector",
+}
+
 # Auth dependency is injected when the router is mounted on the main app
 router = APIRouter(prefix="/auto-trader", tags=["Auto-Trader"])
 
 AVAILABLE_MODELS = [
     {"id": "haiku", "name": "Claude Haiku 4.5", "api_id": "claude-haiku-4-5-20251001", "speed": "fast", "cost": "$1/$5 per MTok", "description": "Fastest. ~2-3 min per experiment. Good for quick experiments."},
     {"id": "sonnet", "name": "Claude Sonnet 4.6", "api_id": "claude-sonnet-4-6", "speed": "medium", "cost": "$3/$15 per MTok", "description": "Best balance of speed and quality. ~5-10 min per experiment."},
+    {"id": "sonnet-5", "name": "Claude Sonnet 5", "api_id": "claude-sonnet-5", "speed": "medium", "cost": "$3/$15 per MTok", "description": "Sonnet 5. Near-Opus reasoning at Sonnet cost. Strong default for most experiments."},
     {"id": "opus", "name": "Claude Opus 4.6", "api_id": "claude-opus-4-6", "speed": "slow", "cost": "$5/$25 per MTok", "description": "Most intelligent (4.6). ~10-20 min per experiment. Deepest research."},
     {"id": "opus-4-7", "name": "Claude Opus 4.7", "api_id": "claude-opus-4-7", "speed": "slow", "cost": "$5/$25 per MTok", "description": "Opus 4.7. Stronger reasoning than 4.6 at similar speed."},
     {"id": "opus-4-8", "name": "Claude Opus 4.8", "api_id": "claude-opus-4-8", "speed": "slow", "cost": "$5/$25 per MTok", "description": "Latest Opus (4.8). Best reasoning available. ~10-20 min per experiment. Best for hardest research."},
+    {"id": "fable-5", "name": "Claude Fable 5", "api_id": "claude-fable-5", "speed": "slow", "cost": "$10/$50 per MTok", "description": "Most capable model available. Deepest research on the hardest problems; slowest and priciest. Requires org data retention >=30 days."},
 ]
 
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -444,8 +456,10 @@ async def get_config():
                  "alpha_ann_pct": "Higher = more excess return vs benchmark",
                  "annualized_volatility_pct": "Lower = less portfolio risk",
                  "max_drawdown_pct": "Less negative = smaller worst-case loss",
+                 "tracking_error_pct": "Active risk vs the benchmark (sector ETF if a sector is set, else S&P). Lower = tracks closer",
+                 "information_ratio": "Excess return per unit of active risk vs the benchmark. Higher = better",
              }.get(m, "")}
-            for m in VALID_METRICS
+            for m in VALID_METRICS if m not in _UI_HIDDEN_METRICS
         ],
         "sectors": [
             "Technology", "Healthcare", "Financial Services", "Energy",
