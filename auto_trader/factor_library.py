@@ -747,7 +747,7 @@ def _feature_card(
             ir = mu / sd if sd > 0 else 0.0
             lags = max(0, int(math.ceil(h / walk_step_td)) - 1)
             t_nw = _newey_west_tstat(ic_series, lags)
-            hit = float(np.nanmean(ic_series > 0))
+            hit = float(np.mean(ic_series[np.isfinite(ic_series)] > 0))
         else:
             mu = sd = ir = t_nw = hit = float("nan")
         ic_raw[h] = {
@@ -768,7 +768,7 @@ def _feature_card(
                 irn = mun / sdn if sdn > 0 else 0.0
                 lags_n = max(0, int(math.ceil(h / walk_step_td)) - 1)
                 tn = _newey_west_tstat(ic_series_n, lags_n)
-                hitn = float(np.nanmean(ic_series_n > 0))
+                hitn = float(np.mean(ic_series_n[np.isfinite(ic_series_n)] > 0))
             else:
                 mun = sdn = irn = tn = hitn = float("nan")
             ic_neut[h] = {
