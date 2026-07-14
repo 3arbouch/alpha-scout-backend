@@ -45,9 +45,16 @@ log() { echo "$(timestamp) $1"; }
 # ---------------------------------------------------------------------------
 
 run_data_refresh() {
-    log "[1/2] Refreshing all data (prices, fundamentals, earnings, macro, news → JSON + DB)..."
     cd "$SCRIPTS_DIR"
-    python3 daily_update.py 2>&1 || log "[1/2] WARNING: daily_update.py failed (continuing)"
+    if [ "${MARKET_SOURCE:-fetch}" = "replica" ]; then
+        # Consumer env: mirror the canonical prod market.db instead of fetching from FMP.
+        log "[1/2] Replicating market data from canonical source (MARKET_SOURCE=replica)..."
+        python3 market_sync.py 2>&1 || { log "[1/2] ERROR: market_sync.py failed (aborting refresh)"; return 1; }
+    else
+        # Producer env: fetch raw data from the vendor and rebuild features.
+        log "[1/2] Refreshing all data (prices, fundamentals, earnings, macro, news → JSON + DB)..."
+        python3 daily_update.py 2>&1 || log "[1/2] WARNING: daily_update.py failed (continuing)"
+    fi
 }
 
 run_evaluate() {
