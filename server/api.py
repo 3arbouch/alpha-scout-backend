@@ -903,6 +903,157 @@ async def get_growth(
 
 
 # ---------------------------------------------------------------------------
+# Factor catalog & per-stock factor values
+# ---------------------------------------------------------------------------
+# The registry (server/factors/) is the single source of truth for every
+# factor. Precomputed factors are materialized as columns in features_daily;
+# on-the-fly factors (rsi, drawdowns, volume) are computed here from the
+# symbol's price history via each FeatureDef's compute_series.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from server.factors import all_features as _all_features, get as _get_feature
+
+
+def _factor_meta(fd) -> dict:
+    """Serialize a FeatureDef for the catalog. Frontend uses category/unit to
+    group factors and label axes, materialization to know availability."""
+    return {
+        "name": fd.name,
+        "category": fd.category,
+        "unit": fd.unit,
+        "description": fd.description,
+        "materialization": fd.materialization,
+        "is_factor": fd.is_factor,
+        "deps": list(fd.deps),
+    }
+
+
+def _load_closes(symbol: str) -> list:
+    """Full ascending (date, close) history for a symbol — the input every
+    on-the-fly compute_series expects."""
+    with get_market_db() as conn:
+        rows = conn.execute(
+            "SELECT date, close FROM prices WHERE symbol=? AND close IS NOT NULL ORDER BY date",
+            (symbol,),
+        ).fetchall()
+    return [(r["date"], r["close"]) for r in rows]
+
+
+@app.get("/api/factors", dependencies=[Depends(verify_api_key)], tags=["Factors"])
+async def list_factors(
+    category: Optional[str] = Query(None, description="Filter by category, e.g. value, momentum, quality"),
+    factors_only: bool = Query(False, description="Only true ranking factors (is_factor=True)"),
+):
+    """The factor catalog — every factor's metadata, straight from the registry.
+    The frontend reads this to build the factor menu (grouped by category) and
+    to label each chart with the right unit."""
+    feats = _all_features()
+    if category:
+        feats = tuple(f for f in feats if f.category == category)
+    if factors_only:
+        feats = tuple(f for f in feats if f.is_factor)
+    return {
+        "total": len(feats),
+        "categories": sorted({f.category for f in _all_features()}),
+        "data": [_factor_meta(f) for f in feats],
+    }
+
+
+@app.get("/api/factors/{symbol}", dependencies=[Depends(verify_api_key)], tags=["Factors"])
+async def get_factor_snapshot(
+    symbol: str,
+    date: Optional[str] = Query(None, description="YYYY-MM-DD; default = latest available date"),
+):
+    """All factor values for one stock on a single date — a full cross-section
+    for a per-stock panel/radar. Precomputed factors come from features_daily;
+    on-the-fly factors are computed from price history at the same date."""
+    symbol = validate_symbol(symbol)
+    with get_market_db() as conn:
+        if date:
+            row = conn.execute(
+                "SELECT * FROM features_daily WHERE symbol=? AND date=?", (symbol, date)
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM features_daily WHERE symbol=? ORDER BY date DESC LIMIT 1", (symbol,)
+            ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"No factor data for {symbol}" + (f" on {date}" if date else ""))
+
+    row = dict(row)
+    target_date = row["date"]
+    values: dict = {}
+    otf = []
+    for f in _all_features():
+        if f.materialization == "precomputed":
+            values[f.name] = row.get(f.name)
+        else:
+            otf.append(f)
+
+    if otf:
+        closes = _load_closes(symbol)
+        for f in otf:
+            series = f.compute_series(symbol, closes) if closes else {}
+            values[f.name] = series.get(target_date)
+
+    return _sanitize_floats({"symbol": symbol, "date": target_date, "values": values})
+
+
+@app.get("/api/factors/{symbol}/{factor}", dependencies=[Depends(verify_api_key)], tags=["Factors"])
+async def get_factor_series(
+    symbol: str,
+    factor: str,
+    start: Optional[str] = Query(None, description="YYYY-MM-DD inclusive"),
+    end: Optional[str] = Query(None, description="YYYY-MM-DD inclusive"),
+    limit: int = Query(default=5000, le=20000, description="Most-recent N points if the range is larger"),
+):
+    """Historical series [{date, value}] for one factor on one stock — the core
+    per-stock chart. Precomputed factors read features_daily; on-the-fly factors
+    are computed from the symbol's price history."""
+    symbol = validate_symbol(symbol)
+    try:
+        fd = _get_feature(factor)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Unknown factor '{factor}'")
+
+    if fd.materialization == "precomputed":
+        conds = ["symbol = ?", f"{factor} IS NOT NULL"]  # factor is a registry-validated column name
+        params: list = [symbol]
+        if start:
+            conds.append("date >= ?")
+            params.append(start)
+        if end:
+            conds.append("date <= ?")
+            params.append(end)
+        where = " AND ".join(conds)
+        with get_market_db() as conn:
+            rows = conn.execute(
+                f"SELECT date, {factor} AS value FROM features_daily WHERE {where} ORDER BY date ASC",
+                params,
+            ).fetchall()
+        series = [{"date": r["date"], "value": r["value"]} for r in rows]
+    else:
+        closes = _load_closes(symbol)
+        computed = fd.compute_series(symbol, closes) if closes else {}
+        series = [
+            {"date": d, "value": v}
+            for d, v in sorted(computed.items())
+            if (not start or d >= start) and (not end or d <= end)
+        ]
+
+    if len(series) > limit:
+        series = series[-limit:]
+
+    return _sanitize_floats({
+        "symbol": symbol,
+        "factor": factor,
+        "unit": fd.unit,
+        "materialization": fd.materialization,
+        "count": len(series),
+        "series": series,
+    })
+
+
+# ---------------------------------------------------------------------------
 # Macro Tracker (SQLite-backed)
 # ---------------------------------------------------------------------------
 VALID_FRED_SERIES = {"BAMLH0A0HYM2", "T5YIFR", "DGS2", "DGS10", "FEDFUNDS"}
